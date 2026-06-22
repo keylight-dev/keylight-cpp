@@ -205,8 +205,14 @@ public:
             refresh_entitlement_cache_();
 
             // Deliver to message thread if a state-change callback is set.
-            juce::MessageManager::callAsync([this, newState]()
+            // Capture alive_ by value (copies the shared_ptr, keeping the
+            // flag alive even after ~Licensing runs) so the lambda can
+            // safely check whether this is still valid before touching members.
+            auto aliveCopy = alive_;
+            juce::MessageManager::callAsync([this, aliveCopy, newState]()
             {
+                if (!aliveCopy->load())  // Licensing destroyed; drop safely
+                    return;
                 if (onStateChanged)
                     onStateChanged(newState);
             });
@@ -220,13 +226,23 @@ public:
     // -----------------------------------------------------------------------
     ~Licensing()
     {
-        // Stop SDK auto-validation thread first (it may fire callbacks).
-        client_->stopAutoValidation();
+        // ① Signal immediately: any callAsync lambdas still queued on the
+        //   message thread will see alive_ == false and early-return without
+        //   touching this.  Must happen BEFORE we release any other resource.
+        alive_->store(false);
 
-        // Cancel subscription so callbacks can't fire after our members vanish.
+        // ② Drop the subscription so the background SDK thread stops firing
+        //   our state-change callback (and enqueueing new callAsync lambdas).
         subscription_ = keylight::Subscription{};
 
-        // Join any pending activate/validate/deactivate thread.
+        // ③ Stop SDK auto-validation thread (may fire a final callback; the
+        //   alive_ flag above makes any resulting callAsync a safe no-op).
+        client_->stopAutoValidation();
+
+        // ④ Join any pending activate/validate/deactivate worker thread.
+        //   These callAsync lambdas only capture result+cb, not this, so they
+        //   are safe even without the flag — but joining here keeps ordering
+        //   well-defined.
         join_worker_();
     }
 
@@ -340,6 +356,9 @@ public:
     ///
     /// If you gate on multiple entitlements, pre-cache each one in a separate
     /// std::atomic<bool> member via the subscription callback (see README).
+    // NOTE: noexcept / lock-free guarantee is for RELEASE builds.  In JUCE
+    // debug builds, juce::String comparison may invoke debug instrumentation
+    // that allocates; only the atomics themselves are unconditionally lock-free.
     bool hasFeature(const juce::String& feature) const noexcept
     {
         // Fast path for the canonical "pro" entitlement — atomic bool.
@@ -377,6 +396,13 @@ public:
     keylight::Client& underlying() { return *client_; }
 
 private:
+    // ── Alive flag (shared_ptr-to-atomic) ────────────────────────────────
+    // Set to false in the destructor BEFORE unsubscribing or joining threads
+    // so that any callAsync lambdas still queued on the message thread will
+    // no-op rather than dereference a dangling this.
+    std::shared_ptr<std::atomic<bool>> alive_ =
+        std::make_shared<std::atomic<bool>>(true);
+
     // ── Owned resources ───────────────────────────────────────────────────
     std::unique_ptr<JuceUrlTransport> transport_;
     keylight::FileStore               store_;
