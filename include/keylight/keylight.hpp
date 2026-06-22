@@ -1,7 +1,7 @@
 #pragma once
 #include "version.hpp"
-// #include "result.hpp"    // Task B+
-// #include "config.hpp"    // Task B+
+#include "result.hpp"
+#include "config.hpp"
 // #include "lease.hpp"     // Task B+
 // #include "verifier.hpp"  // Task B+
 // #include "transport.hpp" // Task B+
