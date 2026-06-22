@@ -1,0 +1,195 @@
+{
+  "version": 1,
+  "skewSeconds": 300,
+  "vectors": [
+    {
+      "name": "valid-active",
+      "lease": {
+        "kid": "k1",
+        "licenseKeyHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "instanceId": "00000000-0000-4000-8000-000000000001",
+        "issuedAt": 1781076246,
+        "expiresAt": 1781681046,
+        "status": "active",
+        "signature": "SUrg6IHJBkO4PB80hiwXhkCFgHTxp5Ao6i9fRnajIH3ws3E+F444xYUQL9UyJYMz4cC+6f8YDMfwrxIv1mQeBw==",
+        "entitlements": [
+          "pro"
+        ]
+      },
+      "trustedKeys": {
+        "k1": "8QkyJGwaIqAuN0jdsCnBtv3D9fylv4PHqCVufx7xje0="
+      },
+      "now": 1781076256,
+      "expect": {
+        "kidKnown": true,
+        "signatureValid": true,
+        "expired": false
+      }
+    },
+    {
+      "name": "valid-within-skew",
+      "lease": {
+        "kid": "k1",
+        "licenseKeyHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "instanceId": "00000000-0000-4000-8000-000000000001",
+        "issuedAt": 1781076246,
+        "expiresAt": 1781681046,
+        "status": "active",
+        "signature": "SUrg6IHJBkO4PB80hiwXhkCFgHTxp5Ao6i9fRnajIH3ws3E+F444xYUQL9UyJYMz4cC+6f8YDMfwrxIv1mQeBw==",
+        "entitlements": [
+          "pro"
+        ]
+      },
+      "trustedKeys": {
+        "k1": "8QkyJGwaIqAuN0jdsCnBtv3D9fylv4PHqCVufx7xje0="
+      },
+      "now": 1781681246,
+      "expect": {
+        "kidKnown": true,
+        "signatureValid": true,
+        "expired": false
+      }
+    },
+    {
+      "name": "expired-beyond-skew",
+      "lease": {
+        "kid": "k1",
+        "licenseKeyHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "instanceId": "00000000-0000-4000-8000-000000000001",
+        "issuedAt": 1781076246,
+        "expiresAt": 1781681046,
+        "status": "active",
+        "signature": "SUrg6IHJBkO4PB80hiwXhkCFgHTxp5Ao6i9fRnajIH3ws3E+F444xYUQL9UyJYMz4cC+6f8YDMfwrxIv1mQeBw==",
+        "entitlements": [
+          "pro"
+        ]
+      },
+      "trustedKeys": {
+        "k1": "8QkyJGwaIqAuN0jdsCnBtv3D9fylv4PHqCVufx7xje0="
+      },
+      "now": 1781681446,
+      "expect": {
+        "kidKnown": true,
+        "signatureValid": true,
+        "expired": true
+      }
+    },
+    {
+      "name": "fallback-status",
+      "lease": {
+        "kid": "k1",
+        "licenseKeyHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "instanceId": "00000000-0000-4000-8000-000000000001",
+        "issuedAt": 1781076246,
+        "expiresAt": 1781681046,
+        "status": "fallback",
+        "signature": "H/L/1y6x6Cg11Hle+6RNFioM9N6gFWGeR9tOORsNZlcL+kinqJdtb3T5dD2Irh5Q9bH1avSUQZGQXtkqaeEVDw==",
+        "entitlements": []
+      },
+      "trustedKeys": {
+        "k1": "8QkyJGwaIqAuN0jdsCnBtv3D9fylv4PHqCVufx7xje0="
+      },
+      "now": 1781076256,
+      "expect": {
+        "kidKnown": true,
+        "signatureValid": true,
+        "expired": false
+      }
+    },
+    {
+      "name": "expired-status",
+      "lease": {
+        "kid": "k1",
+        "licenseKeyHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "instanceId": "00000000-0000-4000-8000-000000000001",
+        "issuedAt": 1781076246,
+        "expiresAt": 1781681046,
+        "status": "expired",
+        "signature": "FO4clyjAnjZpPaV/eecMvjbUz28fslWVwIpAPwTvnGvCWW5mveKpjsAxDgxUP6PdPRIPblAMYrS/0d0vnc+FDA==",
+        "entitlements": []
+      },
+      "trustedKeys": {
+        "k1": "8QkyJGwaIqAuN0jdsCnBtv3D9fylv4PHqCVufx7xje0="
+      },
+      "now": 1781076256,
+      "expect": {
+        "kidKnown": true,
+        "signatureValid": true,
+        "expired": false
+      }
+    },
+    {
+      "name": "unknown-kid",
+      "lease": {
+        "kid": "k9",
+        "licenseKeyHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "instanceId": "00000000-0000-4000-8000-000000000001",
+        "issuedAt": 1781076246,
+        "expiresAt": 1781681046,
+        "status": "active",
+        "signature": "SUrg6IHJBkO4PB80hiwXhkCFgHTxp5Ao6i9fRnajIH3ws3E+F444xYUQL9UyJYMz4cC+6f8YDMfwrxIv1mQeBw==",
+        "entitlements": [
+          "pro"
+        ]
+      },
+      "trustedKeys": {
+        "k1": "8QkyJGwaIqAuN0jdsCnBtv3D9fylv4PHqCVufx7xje0="
+      },
+      "now": 1781076256,
+      "expect": {
+        "kidKnown": false,
+        "signatureValid": false,
+        "expired": false
+      }
+    },
+    {
+      "name": "wrong-signing-key",
+      "lease": {
+        "kid": "k1",
+        "licenseKeyHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "instanceId": "00000000-0000-4000-8000-000000000001",
+        "issuedAt": 1781076246,
+        "expiresAt": 1781681046,
+        "status": "active",
+        "signature": "ZNw6lIlwZfhHrq53wu+yok6U6UE+3t/EFgePO42KMyx5vpwPs96FBzuJuyU52+fODW1NVbK+t17hJNJTJI3bAw==",
+        "entitlements": [
+          "pro"
+        ]
+      },
+      "trustedKeys": {
+        "k1": "8QkyJGwaIqAuN0jdsCnBtv3D9fylv4PHqCVufx7xje0="
+      },
+      "now": 1781076256,
+      "expect": {
+        "kidKnown": true,
+        "signatureValid": false,
+        "expired": false
+      }
+    },
+    {
+      "name": "tampered-entitlements",
+      "lease": {
+        "kid": "k1",
+        "licenseKeyHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "instanceId": "00000000-0000-4000-8000-000000000001",
+        "issuedAt": 1781076246,
+        "expiresAt": 1781681046,
+        "status": "active",
+        "signature": "SUrg6IHJBkO4PB80hiwXhkCFgHTxp5Ao6i9fRnajIH3ws3E+F444xYUQL9UyJYMz4cC+6f8YDMfwrxIv1mQeBw==",
+        "entitlements": [
+          "pro",
+          "admin"
+        ]
+      },
+      "trustedKeys": {
+        "k1": "8QkyJGwaIqAuN0jdsCnBtv3D9fylv4PHqCVufx7xje0="
+      },
+      "now": 1781076256,
+      "expect": {
+        "kidKnown": true,
+        "signatureValid": false,
+        "expired": false
+      }
+    }
+  ]
+}
