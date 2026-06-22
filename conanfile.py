@@ -8,7 +8,7 @@ class KeylightConan(ConanFile):
     description = "Cryptographic licensing SDK for Apple platforms and beyond"
     homepage = "https://github.com/keylight-dev/keylight-cpp"
     url = "https://github.com/keylight-dev/keylight-cpp"
-    license = "proprietary"
+    license = "MIT"
 
     package_type = "header-library"
 
