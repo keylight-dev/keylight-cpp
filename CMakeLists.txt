@@ -43,6 +43,42 @@ if(KEYLIGHT_BUILD_HTTPLIB_TRANSPORT)
 endif()
 
 # ---------------------------------------------------------------------------
+# Demo — opt-in; requires the httplib transport (and thus OpenSSL).
+#   cmake -B build-demo -DKEYLIGHT_BUILD_DEMO=ON \
+#         -DOPENSSL_ROOT_DIR=/opt/homebrew/opt/openssl@3
+# Default cmake -B build is unaffected.
+# ---------------------------------------------------------------------------
+option(KEYLIGHT_BUILD_DEMO
+  "Build the Keylight Notes console demo (requires KEYLIGHT_BUILD_HTTPLIB_TRANSPORT + OpenSSL)"
+  OFF)
+
+if(KEYLIGHT_BUILD_DEMO)
+  # The demo always needs the httplib transport — force it on.
+  if(NOT KEYLIGHT_BUILD_HTTPLIB_TRANSPORT)
+    set(KEYLIGHT_BUILD_HTTPLIB_TRANSPORT ON CACHE BOOL "" FORCE)
+
+    # Duplicate the httplib-transport setup (guard skipped above because the
+    # option was OFF when evaluated; re-run here).
+    if(NOT DEFINED OPENSSL_ROOT_DIR AND EXISTS "/opt/homebrew/opt/openssl@3")
+      set(OPENSSL_ROOT_DIR "/opt/homebrew/opt/openssl@3")
+    endif()
+
+    find_package(OpenSSL REQUIRED)
+
+    add_library(keylight_httplib_transport INTERFACE)
+    target_link_libraries(keylight_httplib_transport INTERFACE
+      keylight OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_definitions(keylight_httplib_transport INTERFACE
+      CPPHTTPLIB_OPENSSL_SUPPORT
+      KEYLIGHT_BUILD_HTTPLIB_TRANSPORT)
+    target_include_directories(keylight_httplib_transport INTERFACE
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party>)
+  endif()
+
+  add_subdirectory(demo/notes)
+endif()
+
+# ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 option(KEYLIGHT_BUILD_TESTS "Build tests" ${PROJECT_IS_TOP_LEVEL})
