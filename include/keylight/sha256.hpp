@@ -2,6 +2,13 @@
 // Core transform adapted from Brad Conte's public-domain sha256.c
 // (https://github.com/B-Con/crypto-algorithms), CC0 / public domain.
 // Wrapped in namespace keylight; internals in anonymous namespace.
+//
+// PUBLIC UTILITY — standalone SHA-256 for integrators (e.g. hashing license
+// keys, building custom audit trails).  The core SDK verification path does
+// NOT use this header (Ed25519 uses SHA-512 internally); sha256.hpp is
+// therefore NOT part of keylight.hpp's include closure.
+// Include it directly when you need it:
+//   #include <keylight/sha256.hpp>
 #pragma once
 
 #include <array>

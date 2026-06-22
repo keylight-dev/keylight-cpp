@@ -1,6 +1,10 @@
 #pragma once
 // keylight/json.hpp — minimal header-only recursive-descent JSON reader
-// Namespace keylight; internals in anonymous namespace.
+// Namespace keylight; internals in keylight::json_detail (named namespace so
+// that JValue and Parser have external linkage and are the SAME type in every
+// translation unit — avoiding an ODR violation that arises when a public class
+// with external linkage stores a shared_ptr to a TU-local anonymous-namespace
+// type).
 // No external dependencies. Exception-free: errors propagate via Result<Json>.
 
 #include "result.hpp"
@@ -19,9 +23,9 @@ namespace keylight {
 class Json;
 
 // ---------------------------------------------------------------------------
-// Internal implementation — anonymous namespace
+// Internal implementation — named namespace (external linkage, ODR-safe)
 // ---------------------------------------------------------------------------
-namespace {
+namespace json_detail {
 
 // ---- Value storage --------------------------------------------------------
 
@@ -52,22 +56,22 @@ struct Parser {
     explicit Parser(const std::string& src)
         : p(src.data()), end(src.data() + src.size()) {}
 
-    bool eof() const { return p >= end; }
+    inline bool eof() const { return p >= end; }
 
-    void skip_ws() {
+    inline void skip_ws() {
         while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
             ++p;
     }
 
-    bool peek(char c) const { return !eof() && *p == c; }
+    inline bool peek(char c) const { return !eof() && *p == c; }
 
-    bool consume(char c) {
+    inline bool consume(char c) {
         if (!eof() && *p == c) { ++p; return true; }
         return false;
     }
 
     // Decode one \uXXXX code unit to UTF-8
-    bool hex4(uint32_t& out) {
+    inline bool hex4(uint32_t& out) {
         if (end - p < 4) return false;
         out = 0;
         for (int k = 0; k < 4; ++k) {
@@ -83,7 +87,7 @@ struct Parser {
         return true;
     }
 
-    void encode_utf8(uint32_t cp, std::string& out) {
+    inline void encode_utf8(uint32_t cp, std::string& out) {
         if (cp < 0x80) {
             out.push_back(static_cast<char>(cp));
         } else if (cp < 0x800) {
@@ -102,7 +106,7 @@ struct Parser {
     }
 
     // Parse a JSON string (cursor is past the opening '"')
-    bool parse_string(std::string& out) {
+    inline bool parse_string(std::string& out) {
         out.clear();
         while (!eof()) {
             char c = *p++;
@@ -146,7 +150,7 @@ struct Parser {
     }
 
     // Parse a number; cursor is on the first digit or '-'
-    bool parse_number(std::shared_ptr<JValue>& out) {
+    inline bool parse_number(std::shared_ptr<JValue>& out) {
         const char* start = p;
         bool neg = false;
         if (peek('-')) { neg = true; ++p; }
@@ -205,7 +209,7 @@ struct Parser {
         return true;
     }
 
-    bool parse_value(std::shared_ptr<JValue>& out) {
+    inline bool parse_value(std::shared_ptr<JValue>& out) {
         skip_ws();
         if (eof()) return false;
 
@@ -303,7 +307,7 @@ struct Parser {
     }
 };
 
-} // anonymous namespace
+} // namespace json_detail
 
 // ---------------------------------------------------------------------------
 // keylight::Json — public API
@@ -312,15 +316,15 @@ struct Parser {
 class Json {
 public:
     // Default-construct: null Json (used for missing keys)
-    Json() : val_(std::make_shared<JValue>()) {}
+    Json() : val_(std::make_shared<json_detail::JValue>()) {}
 
     // Parse JSON text; returns Result<Json> (never throws)
     static Result<Json> parse(const std::string& src) {
         if (src.empty()) {
             return Result<Json>::err({ErrorCode::BadResponse, "empty JSON input"});
         }
-        Parser parser(src);
-        std::shared_ptr<JValue> v;
+        json_detail::Parser parser(src);
+        std::shared_ptr<json_detail::JValue> v;
         if (!parser.parse_value(v)) {
             return Result<Json>::err({ErrorCode::BadResponse, "malformed JSON"});
         }
@@ -335,7 +339,7 @@ public:
 
     // Object member access; missing key → null Json
     Json operator[](const std::string& key) const {
-        if (val_->type == JType::Object) {
+        if (val_->type == json_detail::JType::Object) {
             auto it = val_->obj_map.find(key);
             if (it != val_->obj_map.end()) {
                 Json j;
@@ -348,7 +352,7 @@ public:
 
     // Array element access; out-of-range → null Json
     Json at(size_t i) const {
-        if (val_->type == JType::Array && i < val_->arr.size()) {
+        if (val_->type == json_detail::JType::Array && i < val_->arr.size()) {
             Json j;
             j.val_ = val_->arr[i];
             return j;
@@ -356,37 +360,37 @@ public:
         return Json{}; // null
     }
 
-    bool is_array() const { return val_->type == JType::Array; }
+    bool is_array() const { return val_->type == json_detail::JType::Array; }
 
     // Array: element count; Object: member count; others: 0
     size_t size() const {
-        if (val_->type == JType::Array)  return val_->arr.size();
-        if (val_->type == JType::Object) return val_->obj_map.size();
+        if (val_->type == json_detail::JType::Array)  return val_->arr.size();
+        if (val_->type == json_detail::JType::Object) return val_->obj_map.size();
         return 0;
     }
 
     std::string as_string() const {
-        if (val_->type == JType::String) return val_->s;
+        if (val_->type == json_detail::JType::String) return val_->s;
         return {};
     }
 
     int64_t as_int() const {
-        if (val_->type == JType::Int)    return val_->i;
-        if (val_->type == JType::Double) return static_cast<int64_t>(val_->d);
+        if (val_->type == json_detail::JType::Int)    return val_->i;
+        if (val_->type == json_detail::JType::Double) return static_cast<int64_t>(val_->d);
         return 0;
     }
 
     bool as_bool() const {
-        if (val_->type == JType::Bool) return val_->b;
+        if (val_->type == json_detail::JType::Bool) return val_->b;
         return false;
     }
 
     // Convenience: iterate an array of strings
     std::vector<std::string> as_string_array() const {
         std::vector<std::string> result;
-        if (val_->type == JType::Array) {
+        if (val_->type == json_detail::JType::Array) {
             for (const auto& elem : val_->arr) {
-                if (elem->type == JType::String) {
+                if (elem->type == json_detail::JType::String) {
                     result.push_back(elem->s);
                 } else {
                     result.push_back({});
@@ -398,14 +402,14 @@ public:
 
     // Return insertion-ordered member names of an object
     std::vector<std::string> keys() const {
-        if (val_->type == JType::Object) {
+        if (val_->type == json_detail::JType::Object) {
             return val_->obj_keys;
         }
         return {};
     }
 
 private:
-    std::shared_ptr<JValue> val_;
+    std::shared_ptr<json_detail::JValue> val_;
 };
 
 } // namespace keylight
