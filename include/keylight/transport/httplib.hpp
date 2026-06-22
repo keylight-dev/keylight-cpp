@@ -118,48 +118,32 @@ public:
 
         httplib::Result hl_res;
 
+        // Single dispatch helper — written once, reused for both SSL and plain
+        // clients.  Exactly one HTTP call fires per method; the old waterfall
+        // called cli.Post() first and then overwrote the result for PUT/PATCH,
+        // causing two round-trips and a stray POST to the server.
+        auto dispatch = [&](auto& cli) {
+            if      (method == "GET")    hl_res = cli.Get(pu.path, hl_headers);
+            else if (method == "DELETE") hl_res = cli.Delete(pu.path, hl_headers);
+            else if (method == "HEAD")   hl_res = cli.Head(pu.path, hl_headers);
+            else if (method == "PUT")    hl_res = cli.Put(pu.path, hl_headers, body, content_type);
+            else if (method == "PATCH")  hl_res = cli.Patch(pu.path, hl_headers, body, content_type);
+            else                         hl_res = cli.Post(pu.path, hl_headers, body, content_type);
+        };
+
         try {
             if (pu.is_https) {
                 httplib::SSLClient cli(pu.host, pu.port);
                 cli.set_follow_location(true);
                 cli.set_connection_timeout(10);
                 cli.set_read_timeout(30);
-
-                if (method == "GET" || method == "DELETE" || method == "HEAD") {
-                    if (method == "GET")
-                        hl_res = cli.Get(pu.path, hl_headers);
-                    else if (method == "DELETE")
-                        hl_res = cli.Delete(pu.path, hl_headers);
-                    else
-                        hl_res = cli.Head(pu.path, hl_headers);
-                } else {
-                    // POST, PUT, PATCH …
-                    hl_res = cli.Post(pu.path, hl_headers, body, content_type);
-                    if (method == "PUT")
-                        hl_res = cli.Put(pu.path, hl_headers, body, content_type);
-                    else if (method == "PATCH")
-                        hl_res = cli.Patch(pu.path, hl_headers, body, content_type);
-                }
+                dispatch(cli);
             } else {
                 httplib::Client cli(pu.host, pu.port);
                 cli.set_follow_location(true);
                 cli.set_connection_timeout(10);
                 cli.set_read_timeout(30);
-
-                if (method == "GET" || method == "DELETE" || method == "HEAD") {
-                    if (method == "GET")
-                        hl_res = cli.Get(pu.path, hl_headers);
-                    else if (method == "DELETE")
-                        hl_res = cli.Delete(pu.path, hl_headers);
-                    else
-                        hl_res = cli.Head(pu.path, hl_headers);
-                } else {
-                    hl_res = cli.Post(pu.path, hl_headers, body, content_type);
-                    if (method == "PUT")
-                        hl_res = cli.Put(pu.path, hl_headers, body, content_type);
-                    else if (method == "PATCH")
-                        hl_res = cli.Patch(pu.path, hl_headers, body, content_type);
-                }
+                dispatch(cli);
             }
         } catch (const std::exception& ex) {
             return Result<HttpResponse>::err(
