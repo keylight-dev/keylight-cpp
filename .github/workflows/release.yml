@@ -1,0 +1,107 @@
+# release.yml — triggered on version tags (v*) and workflow_dispatch.
+#
+# Distribution model for C++:
+#   C++ has no central package registry like crates.io, npm, or NuGet.
+#   Distribution is via git tag + CMake FetchContent + the keylight_single.hpp
+#   release artifact attached here. vcpkg/Conan registry submissions are
+#   out of scope for v1; when they land this workflow will gain a publish step.
+#
+# What this workflow does:
+#   1. Build + ctest matrix (Ubuntu / macOS / Windows) — conformance vectors run here.
+#   2. Regenerate keylight_single.hpp on Linux and verify it's in sync.
+#   3. Create a GitHub Release and attach keylight_single.hpp as an artifact.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.1.0)"
+        required: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: build + test on all three platforms
+  # The conformance vectors run as part of ctest — this is the gate.
+  # ---------------------------------------------------------------------------
+  build-and-test:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Test (conformance gate)
+        run: ctest --test-dir build --build-config Release --output-on-failure
+
+  # ---------------------------------------------------------------------------
+  # Job 2: verify single-header amalgamation is in sync, then publish a release
+  # Runs only after all build-and-test jobs pass.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish Release
+    needs: build-and-test
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write   # required to create GitHub Releases
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Regenerate keylight_single.hpp
+        run: python3 tools/amalgamate.py
+
+      - name: Verify amalgamation is in sync
+        run: |
+          git diff --exit-code keylight_single.hpp || {
+            echo ""
+            echo "ERROR: keylight_single.hpp is out of sync with the source headers."
+            echo "Run  python3 tools/amalgamate.py  locally and commit the result before tagging."
+            exit 1
+          }
+
+      - name: Determine tag name
+        id: tag
+        run: |
+          if [ -n "${{ github.ref_name }}" ] && [[ "${{ github.ref_name }}" == v* ]]; then
+            echo "name=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release and attach keylight_single.hpp
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.tag.outputs.name }}"
+          # Extract the CHANGELOG entry for this version as the release body.
+          # Captures lines between "## [${TAG#v}]" and the next "## [" heading.
+          NOTES=$(awk "/^## \[${TAG#v}\]/{found=1; next} found && /^## \[/{exit} found{print}" CHANGELOG.md)
+          if [ -z "$NOTES" ]; then
+            NOTES="See [CHANGELOG.md](CHANGELOG.md) for details."
+          fi
+
+          gh release create "$TAG" \
+            --title "Keylight C++ SDK ${TAG}" \
+            --notes "$NOTES" \
+            keylight_single.hpp

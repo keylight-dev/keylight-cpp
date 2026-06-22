@@ -1,4 +1,4 @@
-## [0.1.0] - unreleased
+## [0.1.0] - 2026-06-22
 
 ### Added
 - JUCE single-header adapter (`integrations/juce/KeylightJuce.h`):
