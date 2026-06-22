@@ -7,4 +7,4 @@
 #include "transport.hpp"
 // #include "transport/httplib.hpp" // opt-in: KEYLIGHT_BUILD_HTTPLIB_TRANSPORT
 #include "store.hpp"
-// #include "client.hpp"    // Task B+
+#include "client.hpp"

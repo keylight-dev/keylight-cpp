@@ -16,6 +16,7 @@ struct Config {
     std::string keyPrefix;
     int         trialDurationDays  = 0;
     std::string apiBaseUrl         = "https://api.keylight.dev";
+    std::string appVersion;        // optional; sent as telemetry in activate/validate
 };
 
 } // namespace keylight
