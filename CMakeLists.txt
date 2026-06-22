@@ -48,7 +48,11 @@ endif()
 option(KEYLIGHT_BUILD_TESTS "Build tests" ${PROJECT_IS_TOP_LEVEL})
 if(KEYLIGHT_BUILD_TESTS)
   enable_testing()
+
+  # Default test suite — all tests EXCEPT test_live.cpp (no network, no OpenSSL).
   file(GLOB KL_TESTS tests/test_*.cpp)
+  list(REMOVE_ITEM KL_TESTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_live.cpp")
+
   add_executable(keylight_tests ${KL_TESTS})
   target_link_libraries(keylight_tests PRIVATE keylight)
   target_include_directories(keylight_tests PRIVATE tests)
@@ -56,9 +60,9 @@ if(KEYLIGHT_BUILD_TESTS)
   set_tests_properties(keylight_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
   if(KEYLIGHT_BUILD_HTTPLIB_TRANSPORT)
-    # Reuse the same test binary but compiled with the httplib transport linked in.
-    # (Separate executable so default ctest stays zero-dep.)
-    add_executable(keylight_tests_httplib ${KL_TESTS})
+    # Httplib test suite: all default tests + test_live.cpp (needs OpenSSL + network).
+    # Separate executable so default ctest stays zero-dep.
+    add_executable(keylight_tests_httplib ${KL_TESTS} tests/test_live.cpp)
     target_link_libraries(keylight_tests_httplib PRIVATE keylight_httplib_transport)
     target_include_directories(keylight_tests_httplib PRIVATE tests)
     add_test(NAME keylight_tests_httplib COMMAND keylight_tests_httplib)
