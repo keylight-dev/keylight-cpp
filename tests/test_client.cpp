@@ -7,8 +7,10 @@
 #include "keylight/store.hpp"
 #include "keylight/transport.hpp"
 #include "keylight/json.hpp"
+#include <atomic>
 #include <string>
 #include <map>
+#include <vector>
 
 using namespace keylight;
 
@@ -324,4 +326,217 @@ TEST_CASE("Client: validate() sends license_key in request body") {
 
     // It must also still contain instance_id (regression guard)
     CHECK(body.find("\"instance_id\"") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// E2 helpers
+// ---------------------------------------------------------------------------
+
+// A transport that always fails with a network error — used to prove no
+// network call is made (or to simulate offline).
+class FailingTransport : public Transport {
+public:
+    mutable int call_count = 0;
+    Result<HttpResponse> request(
+        const std::string&,
+        const std::string&,
+        const std::map<std::string, std::string>&,
+        const std::string&) override
+    {
+        ++call_count;
+        return Result<HttpResponse>::err({ErrorCode::Network, "simulated network failure"});
+    }
+};
+
+// Persist a valid-active lease blob directly into the store, mimicking what
+// activate() would have written (format: {"lease":{...},"expiresAt":N,...}).
+// Also stores lastValidatedOnline (for offline-grace tests).
+static void seed_store_with_valid_lease(MemoryStore& store,
+                                        int64_t      now,
+                                        int64_t      expires_at = 1781681046LL,
+                                        int64_t      last_validated_online = 0)
+{
+    // Use same lease as ACTIVATE_RESPONSE
+    std::string blob = R"({"lease":{)"
+        R"("kid":"k1",)"
+        R"("licenseKeyHash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",)"
+        R"("instanceId":"00000000-0000-4000-8000-000000000001",)"
+        R"("issuedAt":1781076246,)"
+        "\"expiresAt\":" + std::to_string(expires_at) + R"(,)"
+        R"("status":"active",)"
+        R"("signature":"SUrg6IHJBkO4PB80hiwXhkCFgHTxp5Ao6i9fRnajIH3ws3E+F444xYUQL9UyJYMz4cC+6f8YDMfwrxIv1mQeBw==",)"
+        R"("entitlements":["pro"]})"
+        ",\"expiresAt\":" + std::to_string(expires_at) +
+        ",\"instanceId\":\"inst-abc\""
+        ",\"licenseKey\":\"XXXX-YYYY-ZZZZ-0001\"";
+
+    int64_t lvo = (last_validated_online == 0) ? now : last_validated_online;
+    blob += ",\"lastValidatedOnline\":" + std::to_string(lvo);
+    blob += "}";
+
+    store.save(blob);
+}
+
+// ---------------------------------------------------------------------------
+// E2 TEST CASES
+// ---------------------------------------------------------------------------
+
+TEST_CASE("E2: checkOnLaunch with cached valid lease → Licensed, NO network call") {
+    auto cfg = make_config();
+    FailingTransport transport;
+    MemoryStore      store;
+
+    // now = VALID_ACTIVE_NOW; lease expires at 1781681046 (well in the future)
+    // last_validated_online = now (freshly validated → debounce will skip refresh)
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW);
+
+    Client client(cfg, transport, store,
+                  []{ return VALID_ACTIVE_NOW; });
+
+    // Re-create the client so checkOnLaunch can load from store
+    // (the seeded store is already loaded on construction via refresh_state_from_store_)
+    // But we need to call checkOnLaunch explicitly.
+    auto r = client.checkOnLaunch();
+    REQUIRE(r.is_ok());
+    CHECK(r.value() == State::Licensed);
+
+    // Crucially: FailingTransport must NOT have been called
+    // (the lease is fresh — debounce should prevent the network call).
+    CHECK(transport.call_count == 0);
+}
+
+TEST_CASE("E2: checkOnLaunch with expired-beyond-grace lease → Expired") {
+    auto cfg = make_config();
+    FailingTransport transport; // network unavailable (past grace, no recovery)
+    MemoryStore   store;
+
+    // The valid-active conformance lease has expiresAt=1781681046.
+    // We set now = 1781681046 + 1 (1 second past expiry) so the signature
+    // still verifies (lease is authentic), but the lease is expired at 'now'.
+    // The lastValidatedOnline is set to VALID_ACTIVE_NOW so the offline grace
+    // (7d from last online validation) is NOT exceeded (now - lvo ≈ 7 days).
+    // Under these conditions the lease verifies as trusted but is expired → Expired.
+    int64_t lease_expires_at = 1781681046LL;
+    int64_t now = lease_expires_at + 1; // 1s after expiry
+
+    // Seed the store with the original (unmodified, valid-signature) lease.
+    // lastValidatedOnline = VALID_ACTIVE_NOW (≈ 7 days before now)
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW, lease_expires_at, VALID_ACTIVE_NOW);
+
+    Client client(cfg, transport, store, [now]{ return now; });
+
+    auto r = client.checkOnLaunch();
+    REQUIRE(r.is_ok());
+    // The lease is trusted but expired → State::Expired
+    CHECK(r.value() == State::Expired);
+}
+
+TEST_CASE("E2: refreshIfNeeded within offline grace keeps Licensed on network failure") {
+    auto cfg = make_config();
+    FailingTransport transport;
+    MemoryStore      store;
+
+    // last_validated_online = 8 hours ago (past debounce=5min, past stale=6h → refresh triggered)
+    // but within maxOfflineDays=7 days grace window
+    int64_t now = VALID_ACTIVE_NOW + 8 * 3600; // 8 hours later
+    int64_t last_lvo = VALID_ACTIVE_NOW;        // validated at t=0, 8h ago
+
+    // Lease expires at 1781681046 which is still in the future at 'now'
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW, 1781681046LL, last_lvo);
+
+    Client client(cfg, transport, store, [now]{ return now; });
+
+    // State from store (loaded on construction) should be Licensed
+    REQUIRE(client.state() == State::Licensed);
+
+    // refreshIfNeeded → network fails → but within grace window → stays Licensed
+    auto r = client.refreshIfNeeded();
+    REQUIRE(r.is_ok());
+    CHECK(r.value() == State::Licensed);
+
+    // Transport WAS called (refresh was attempted, it failed gracefully)
+    CHECK(transport.call_count > 0);
+
+    // State still Licensed (grace)
+    CHECK(client.state() == State::Licensed);
+}
+
+TEST_CASE("E2: on('change', cb) fires when state transitions") {
+    auto cfg = make_config();
+    FakeTransport  transport;
+    MemoryStore    store;
+
+    Client client(cfg, transport, store,
+                  []{ return VALID_ACTIVE_NOW; });
+
+    std::vector<State> received;
+    auto sub = client.on("change", [&](State s) {
+        received.push_back(s);
+    });
+
+    // Before activation: no transition has happened
+    CHECK(received.empty());
+
+    // Activate → state transitions Invalid → Licensed
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    REQUIRE(received.size() == 1);
+    CHECK(received[0] == State::Licensed);
+
+    // Deactivate → transitions Licensed → Invalid
+    transport.next_body = R"({"deactivated":true})";
+    REQUIRE(client.deactivate().is_ok());
+
+    REQUIRE(received.size() == 2);
+    CHECK(received[1] == State::Invalid);
+}
+
+TEST_CASE("E2: subscribe() fires on state changes") {
+    auto cfg = make_config();
+    FakeTransport  transport;
+    MemoryStore    store;
+
+    Client client(cfg, transport, store,
+                  []{ return VALID_ACTIVE_NOW; });
+
+    int call_count = 0;
+    State last_state = State::Invalid;
+    auto sub = client.subscribe([&](State s) {
+        ++call_count;
+        last_state = s;
+    });
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    CHECK(call_count == 1);
+    CHECK(last_state == State::Licensed);
+}
+
+TEST_CASE("E2: no spurious events on same-state transitions") {
+    auto cfg = make_config();
+    FakeTransport  transport;
+    MemoryStore    store;
+
+    // Pre-seed store so construction starts as Licensed
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW);
+
+    Client client(cfg, transport, store,
+                  []{ return VALID_ACTIVE_NOW; });
+
+    REQUIRE(client.state() == State::Licensed);
+
+    int call_count = 0;
+    auto sub = client.subscribe([&](State) { ++call_count; });
+
+    // Validate returns same Licensed state — no transition event
+    transport.next_status = 200;
+    transport.next_body   = VALIDATE_RESPONSE;
+    REQUIRE(client.validate().is_ok());
+    REQUIRE(client.state() == State::Licensed);
+
+    CHECK(call_count == 0);
 }
