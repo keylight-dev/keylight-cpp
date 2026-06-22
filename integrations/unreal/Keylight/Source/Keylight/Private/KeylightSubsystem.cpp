@@ -86,6 +86,13 @@ void UKeylightSubsystem::Configure(
 {
     // Rebuild transport / store / client on each Configure() call so the
     // subsystem can be reconfigured if needed (e.g. multi-step onboarding).
+    //
+    // NOTE: Re-configuring while an Activate() or Validate() is in-flight is
+    // unsupported. The in-flight background task holds a raw pointer to the
+    // *previous* Client_ instance; calling Configure() mid-flight resets
+    // Client_ and frees that object, leaving the background task with a
+    // dangling ClientPtr. Ensure any in-flight operations have completed
+    // (e.g. their delegates have fired) before calling Configure() again.
     if (Client_)
     {
         Client_->stopAutoValidation();
@@ -133,17 +140,14 @@ void UKeylightSubsystem::Activate(const FString& Key)
 
     // Capture key as std::string for the lambda (FString is not thread-safe).
     std::string StdKey(TCHAR_TO_UTF8(*Key));
-    // Raw pointer is safe: the subsystem outlives the async task (Deinitialize
-    // calls stopAutoValidation which joins the background thread, and the
-    // UGameInstance lifetime gates everything).
     keylight::Client* ClientPtr = Client_.Get();
 
-    // Capture 'this' for the game-thread dispatch; the subsystem is a UObject
-    // and will be alive when the game-thread task runs (UE GC is cooperative).
-    UKeylightSubsystem* Self = this;
+    // Use TWeakObjectPtr so the game-thread completion lambda does not dangle
+    // if the subsystem is GC'd or Deinitialize()'d before the task returns.
+    TWeakObjectPtr<UKeylightSubsystem> WeakThis(this);
 
     AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask,
-    [ClientPtr, StdKey, Self]()
+    [ClientPtr, StdKey, WeakThis]()
     {
         auto Result = ClientPtr->activate(StdKey);
 
@@ -156,10 +160,13 @@ void UKeylightSubsystem::Activate(const FString& Key)
                                 : FString(UTF8_TO_TCHAR(Result.error().message.c_str()));
 
         // Marshal to game thread before firing the Blueprint delegate.
+        // Result values are captured by value; WeakThis guards against UAF.
         AsyncTask(ENamedThreads::GameThread,
-        [Self, bSuccess, StateInt, Msg]()
+        [WeakThis, bSuccess, StateInt, Msg]()
         {
-            Self->OnActivateComplete.Broadcast(
+            UKeylightSubsystem* StrongThis = WeakThis.Get();
+            if (!StrongThis) return; // subsystem was GC'd/torn down; drop safely
+            StrongThis->OnActivateComplete.Broadcast(
                 bSuccess,
                 UKeylightSubsystem::ToUEState(StateInt),
                 Msg);
@@ -182,11 +189,11 @@ void UKeylightSubsystem::Validate()
         return;
     }
 
-    keylight::Client*    ClientPtr = Client_.Get();
-    UKeylightSubsystem*  Self      = this;
+    keylight::Client*                  ClientPtr = Client_.Get();
+    TWeakObjectPtr<UKeylightSubsystem> WeakThis(this);
 
     AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask,
-    [ClientPtr, Self]()
+    [ClientPtr, WeakThis]()
     {
         auto Result = ClientPtr->validate();
 
@@ -199,9 +206,11 @@ void UKeylightSubsystem::Validate()
                              : FString(UTF8_TO_TCHAR(Result.error().message.c_str()));
 
         AsyncTask(ENamedThreads::GameThread,
-        [Self, bSuccess, StateInt, Msg]()
+        [WeakThis, bSuccess, StateInt, Msg]()
         {
-            Self->OnValidateComplete.Broadcast(
+            UKeylightSubsystem* StrongThis = WeakThis.Get();
+            if (!StrongThis) return; // subsystem was GC'd/torn down; drop safely
+            StrongThis->OnValidateComplete.Broadcast(
                 bSuccess,
                 UKeylightSubsystem::ToUEState(StateInt),
                 Msg);
@@ -224,11 +233,11 @@ void UKeylightSubsystem::Deactivate()
         return;
     }
 
-    keylight::Client*    ClientPtr = Client_.Get();
-    UKeylightSubsystem*  Self      = this;
+    keylight::Client*                  ClientPtr = Client_.Get();
+    TWeakObjectPtr<UKeylightSubsystem> WeakThis(this);
 
     AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask,
-    [ClientPtr, Self]()
+    [ClientPtr, WeakThis]()
     {
         auto Result = ClientPtr->deactivate();
 
@@ -240,9 +249,11 @@ void UKeylightSubsystem::Deactivate()
                              : FString(UTF8_TO_TCHAR(Result.error().message.c_str()));
 
         AsyncTask(ENamedThreads::GameThread,
-        [Self, bSuccess, StateInt, Msg]()
+        [WeakThis, bSuccess, StateInt, Msg]()
         {
-            Self->OnDeactivateComplete.Broadcast(
+            UKeylightSubsystem* StrongThis = WeakThis.Get();
+            if (!StrongThis) return; // subsystem was GC'd/torn down; drop safely
+            StrongThis->OnDeactivateComplete.Broadcast(
                 bSuccess,
                 UKeylightSubsystem::ToUEState(StateInt),
                 Msg);
