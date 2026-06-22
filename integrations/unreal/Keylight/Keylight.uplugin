@@ -1,0 +1,24 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "0.1.0",
+  "FriendlyName": "Keylight",
+  "Description": "Keylight licensing SDK integration for Unreal Engine. Provides Blueprint-callable license activation, validation, and entitlement checks via UKeylightSubsystem, backed by FHttpModule (zero extra dependencies).",
+  "Category": "Licensing",
+  "CreatedBy": "Keylight",
+  "CreatedByURL": "https://keylight.dev",
+  "DocsURL": "https://docs.keylight.dev",
+  "MarketplaceURL": "",
+  "SupportURL": "https://keylight.dev",
+  "CanContainContent": false,
+  "IsBetaVersion": false,
+  "IsExperimentalVersion": false,
+  "Installed": false,
+  "Modules": [
+    {
+      "Name": "Keylight",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    }
+  ]
+}
