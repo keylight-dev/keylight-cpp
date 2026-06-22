@@ -25,3 +25,33 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+  amalgamation:
+    name: Single-header amalgamation check
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Regenerate keylight_single.hpp
+        run: python3 tools/amalgamate.py
+
+      - name: Check keylight_single.hpp is in sync with committed copy
+        run: |
+          git diff --exit-code keylight_single.hpp || {
+            echo ""
+            echo "ERROR: keylight_single.hpp is out of sync with the source headers."
+            echo "Run  python3 tools/amalgamate.py  and commit the result."
+            exit 1
+          }
+
+      - name: Compile standalone amalgamation test
+        run: |
+          c++ -std=c++17 -o test_amalgamation_standalone \
+              -I. tests/test_amalgamation.cpp && \
+          ./test_amalgamation_standalone
