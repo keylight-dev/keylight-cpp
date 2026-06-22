@@ -8,8 +8,10 @@
 #include "keylight/transport.hpp"
 #include "keylight/json.hpp"
 #include <atomic>
+#include <chrono>
 #include <string>
 #include <map>
+#include <thread>
 #include <vector>
 
 using namespace keylight;
@@ -539,4 +541,135 @@ TEST_CASE("E2: no spurious events on same-state transitions") {
     REQUIRE(client.state() == State::Licensed);
 
     CHECK(call_count == 0);
+}
+
+// ---------------------------------------------------------------------------
+// E3: opt-in background auto-validation
+// ---------------------------------------------------------------------------
+
+// A FakeTransport that counts calls atomically (safe for concurrent access).
+class CountingTransport : public Transport {
+public:
+    std::atomic<int> call_count{0};
+    int              next_status = 200;
+    std::string      next_body;
+
+    Result<HttpResponse> request(
+        const std::string&,
+        const std::string&,
+        const std::map<std::string, std::string>&,
+        const std::string&) override
+    {
+        ++call_count;
+        HttpResponse r;
+        r.status = next_status;
+        r.body   = next_body;
+        return Result<HttpResponse>::ok(r);
+    }
+};
+
+TEST_CASE("E3: startAutoValidation + stopAutoValidation cleanly joins") {
+    // No background thread without a stored license, so seed one first.
+    // We seed so that refreshIfNeeded fires (last_validated > stale threshold
+    // triggers a validate call on the thread). The transport responds with a
+    // stale-refresh-triggering clock: make the interval very short via the
+    // injected interval parameter (1 ms).
+    auto cfg = make_config();
+    cfg.autoValidationIntervalMs = 1; // 1 ms — test seam for fast iteration
+    CountingTransport transport;
+    MemoryStore       store;
+
+    // Seed with a stale last_validated_online (8h ago) so refreshIfNeeded
+    // will attempt a network call when the thread ticks.
+    int64_t now = VALID_ACTIVE_NOW + 8 * 3600;
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW, 1781681046LL, VALID_ACTIVE_NOW);
+    transport.next_status = 200;
+    transport.next_body   = VALIDATE_RESPONSE;
+
+    Client client(cfg, transport, store, [now]{ return now; });
+
+    // start → stop must return without hanging
+    client.startAutoValidation();
+    client.stopAutoValidation(); // must join cleanly (no hang)
+
+    // Idempotent: stopping again is a no-op
+    client.stopAutoValidation();
+}
+
+TEST_CASE("E3: no background thread without startAutoValidation") {
+    // Construct and immediately destroy — no thread must have been started.
+    // If a thread were running this would likely hang or crash on destruction
+    // of a joinable thread; the test itself serves as the check.
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    {
+        Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; });
+        // Do NOT call startAutoValidation.
+        // Scope exit: destructor must not hang or std::terminate.
+    }
+    CHECK(true); // reached here — no hang
+}
+
+TEST_CASE("E3: destructor stops running auto-validation cleanly") {
+    auto cfg = make_config();
+    cfg.autoValidationIntervalMs = 1; // fast tick
+    FakeTransport transport;
+    MemoryStore   store;
+
+    transport.next_status = 200;
+    transport.next_body   = VALIDATE_RESPONSE;
+
+    {
+        Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; });
+        client.startAutoValidation();
+        // Go out of scope without calling stopAutoValidation.
+        // Destructor must join the thread cleanly.
+    }
+    CHECK(true); // reached here — destructor did not hang/crash
+}
+
+TEST_CASE("E3: startAutoValidation is idempotent (double-start safe)") {
+    auto cfg = make_config();
+    cfg.autoValidationIntervalMs = 1;
+    FakeTransport transport;
+    MemoryStore   store;
+
+    transport.next_status = 200;
+    transport.next_body   = VALIDATE_RESPONSE;
+
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; });
+
+    client.startAutoValidation();
+    client.startAutoValidation(); // second call must be a no-op, not spawn a second thread
+    client.stopAutoValidation();
+}
+
+TEST_CASE("E3: worker invokes refreshIfNeeded at least once when stale") {
+    // Set up a stale store so that refreshIfNeeded() will fire a network call.
+    // Then start auto-validation, sleep briefly, stop, and check the transport
+    // was called.
+    auto cfg = make_config();
+    cfg.autoValidationIntervalMs = 5; // 5 ms — fast enough for the test
+    CountingTransport transport;
+    MemoryStore       store;
+
+    // Clock is 8h past last_validated_online → refresh will be triggered
+    int64_t now = VALID_ACTIVE_NOW + 8 * 3600;
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW, 1781681046LL, VALID_ACTIVE_NOW);
+    transport.next_status = 200;
+    transport.next_body   = VALIDATE_RESPONSE;
+
+    Client client(cfg, transport, store, [now]{ return now; });
+
+    client.startAutoValidation();
+
+    // Give the worker thread time to tick at least once (100 ms >> 5 ms interval)
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    client.stopAutoValidation();
+
+    // The worker must have called refreshIfNeeded at least once → transport hit
+    CHECK(transport.call_count >= 1);
 }

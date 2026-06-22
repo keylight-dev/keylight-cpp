@@ -17,6 +17,12 @@ struct Config {
     int         trialDurationDays  = 0;
     std::string apiBaseUrl         = "https://api.keylight.dev";
     std::string appVersion;        // optional; sent as telemetry in activate/validate
+
+    // Interval between background auto-validation ticks (milliseconds).
+    // Default is 30 minutes (1 800 000 ms).  Set a smaller value in tests
+    // as a deterministic seam — the background thread uses this as its
+    // interruptible wait timeout.
+    int autoValidationIntervalMs = 1'800'000; // 30 min
 };
 
 } // namespace keylight

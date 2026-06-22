@@ -23,6 +23,8 @@
 #include "json.hpp"
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <ctime>
 #include <future>
@@ -31,6 +33,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace keylight {
@@ -136,6 +139,12 @@ public:
     {
         // Prime state from persisted store (if any) on construction.
         refresh_state_from_store_();
+    }
+
+    // Destructor: stops and joins any running auto-validation thread so the
+    // thread cannot outlive the Client (no detached threads, no std::terminate).
+    ~Client() {
+        stopAutoValidation();
     }
 
     // ── Sync API ──────────────────────────────────────────────────────────
@@ -333,6 +342,53 @@ public:
                           [this]{ return deactivate(); });
     }
 
+    // ── Background auto-validation ────────────────────────────────────────
+
+    /// Spawn a single background thread that periodically calls
+    /// refreshIfNeeded() on the schedule configured by
+    /// cfg_.autoValidationIntervalMs.  Never started implicitly — the host
+    /// application must call this explicitly.
+    ///
+    /// Idempotent: calling startAutoValidation() while a thread is already
+    /// running is a no-op (the existing thread continues).
+    void startAutoValidation() {
+        std::lock_guard<std::mutex> lock(av_mutex_);
+        if (av_thread_.joinable()) return; // already running — no-op
+
+        av_stop_ = false;
+        av_thread_ = std::thread([this] {
+            auto interval = std::chrono::milliseconds(cfg_.autoValidationIntervalMs);
+            std::unique_lock<std::mutex> lk(av_mutex_);
+            while (!av_stop_) {
+                // Interruptible wait: wakes immediately on stopAutoValidation().
+                av_cv_.wait_for(lk, interval, [this]{ return av_stop_; });
+                if (av_stop_) break;
+                // Release the mutex while calling refreshIfNeeded so it can
+                // acquire cache_mutex_ / listeners_mutex_ without deadlock.
+                lk.unlock();
+                refreshIfNeeded();
+                lk.lock();
+            }
+        });
+    }
+
+    /// Signal the background thread to stop and join it.
+    /// Idempotent: safe to call when no thread is running.
+    /// Returns promptly — the thread wakes up via the condition variable
+    /// instead of blocking for the full interval.
+    void stopAutoValidation() {
+        std::thread to_join;
+        {
+            std::lock_guard<std::mutex> lock(av_mutex_);
+            if (!av_thread_.joinable()) return; // not running — no-op
+            av_stop_ = true;
+            av_cv_.notify_all();
+            to_join = std::move(av_thread_); // move out before unlocking
+        }
+        // Join outside the lock so the worker can re-acquire av_mutex_ to exit.
+        if (to_join.joinable()) to_join.join();
+    }
+
     // ── Launch / refresh API ──────────────────────────────────────────────
 
     /// Load the cached lease from the store, verify it offline, set state;
@@ -520,6 +576,16 @@ private:
     mutable std::mutex        listeners_mutex_;
     std::vector<Listener>     listeners_;
     uint64_t                  next_listener_id_ = 0;
+
+    // ── Background auto-validation ────────────────────────────────────────
+    // av_mutex_ guards av_stop_ and av_thread_.
+    // The worker holds a unique_lock<av_mutex_> for its wait/flag check,
+    // then RELEASES it before calling refreshIfNeeded() (which acquires
+    // cache_mutex_ / listeners_mutex_) to avoid deadlock.
+    std::mutex              av_mutex_;
+    std::condition_variable av_cv_;
+    bool                    av_stop_  = false;
+    std::thread             av_thread_;
 
     // ── Private helpers ───────────────────────────────────────────────────
 
