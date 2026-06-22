@@ -156,11 +156,11 @@ public:
         // Persist only trusted leases
         if (lease.has_value() && verifier_.verify(*lease, now_fn_()).is_trusted()) {
             std::string lease_json = lease_to_json_(*lease);
-            persist_({lease_json, expires_at, instance_id});
+            persist_({lease_json, expires_at, instance_id, key});
         } else if (!lease.has_value() && activated) {
             // Server said activated=true but sent no lease — treat as Licensed
             // without a local lease; persist what we have.
-            persist_({std::nullopt, expires_at, instance_id});
+            persist_({std::nullopt, expires_at, instance_id, key});
             new_state = State::Licensed;
         }
 
@@ -170,10 +170,12 @@ public:
 
     /// Validate the stored license online.  Returns the resulting State.
     Result<State> validate() {
-        // Need instance_id from store
-        std::string instance_id = load_instance_id_();
+        // Need license_key and instance_id from cache (Worker requires both)
+        std::string license_key  = load_license_key_();
+        std::string instance_id  = load_instance_id_();
 
         std::string body = build_json_({
+            {"license_key", json_str(license_key)},
             {"instance_id", json_str(instance_id)},
         }, true /*include telemetry*/);
 
@@ -252,9 +254,10 @@ public:
         // Clear in-memory cache
         {
             std::lock_guard<std::mutex> lock(cache_mutex_);
-            cached_lease_       = std::nullopt;
-            cached_expires_at_  = std::nullopt;
-            cached_instance_id_ = std::nullopt;
+            cached_lease_        = std::nullopt;
+            cached_expires_at_   = std::nullopt;
+            cached_instance_id_  = std::nullopt;
+            cached_license_key_  = std::nullopt;
         }
         state_.store(State::Invalid);
         return Result<void>::ok();
@@ -320,6 +323,7 @@ private:
     std::optional<Lease>             cached_lease_;
     std::optional<int64_t>           cached_expires_at_;
     std::optional<std::string>       cached_instance_id_;
+    std::optional<std::string>       cached_license_key_;
 
     // ── Private helpers ───────────────────────────────────────────────────
 
@@ -457,6 +461,10 @@ private:
             std::string v = j["instanceId"].as_string();
             if (!v.empty()) cached_instance_id_ = v;
         }
+        {
+            std::string v = j["licenseKey"].as_string();
+            if (!v.empty()) cached_license_key_ = v;
+        }
 
         // Don't hold mutex while computing state
         Lease lease_copy = *cached_lease_;
@@ -480,6 +488,7 @@ private:
         std::optional<std::string>       lease_json;
         std::optional<int64_t>           expires_at;
         std::optional<std::string>       instance_id;
+        std::optional<std::string>       license_key;
     };
 
     /// Write a blob to the store in the format we read back.
@@ -500,6 +509,11 @@ private:
         if (d.instance_id.has_value()) {
             if (blob.size() > 1) blob += ",";
             blob += "\"instanceId\":" + json_str(*d.instance_id);
+        }
+
+        if (d.license_key.has_value()) {
+            if (blob.size() > 1) blob += ",";
+            blob += "\"licenseKey\":" + json_str(*d.license_key);
         }
 
         blob += "}";
@@ -526,6 +540,9 @@ private:
             if (d.instance_id.has_value()) {
                 cached_instance_id_ = *d.instance_id;
             }
+            if (d.license_key.has_value()) {
+                cached_license_key_ = *d.license_key;
+            }
         }
     }
 
@@ -534,6 +551,15 @@ private:
         std::lock_guard<std::mutex> lock(cache_mutex_);
         if (cached_instance_id_.has_value()) {
             return *cached_instance_id_;
+        }
+        return "";
+    }
+
+    /// Load the stored license key from cache (or empty string if none).
+    std::string load_license_key_() const {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        if (cached_license_key_.has_value()) {
+            return *cached_license_key_;
         }
         return "";
     }

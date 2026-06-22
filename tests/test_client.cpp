@@ -13,19 +13,23 @@
 using namespace keylight;
 
 // ---------------------------------------------------------------------------
-// FakeTransport — returns a canned HTTP response
+// FakeTransport — returns a canned HTTP response; optionally captures the body
 // ---------------------------------------------------------------------------
 class FakeTransport : public Transport {
 public:
     int         next_status = 200;
     std::string next_body;
 
+    // After each request(), the request body is stored here.
+    std::string last_request_body;
+
     Result<HttpResponse> request(
         const std::string&,
         const std::string&,
         const std::map<std::string, std::string>&,
-        const std::string&) override
+        const std::string& body) override
     {
+        last_request_body = body;
         HttpResponse r;
         r.status = next_status;
         r.body   = next_body;
@@ -284,4 +288,40 @@ TEST_CASE("Client: state() is Invalid before any activation") {
 
     CHECK(client.state() == State::Invalid);
     CHECK(client.hasEntitlement("pro") == false);
+}
+
+TEST_CASE("Client: validate() sends license_key in request body") {
+    // Regression test: Worker's ValidateBodySchema requires both license_key
+    // and instance_id.  Before this fix validate() only sent instance_id,
+    // causing 4xx from the real API and silent stale state.
+    auto cfg = make_config();
+    FakeTransport  transport;
+    MemoryStore    store;
+
+    // Activate so the client has a stored license_key and instance_id
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+
+    Client client(cfg, transport, store,
+                  []{ return VALID_ACTIVE_NOW; });
+
+    const std::string TEST_KEY = "XXXX-YYYY-ZZZZ-0001";
+    REQUIRE(client.activate(TEST_KEY).is_ok());
+    REQUIRE(client.state() == State::Licensed);
+
+    // Now validate — capture the body sent to the transport
+    transport.next_body = VALIDATE_RESPONSE;
+    transport.last_request_body.clear();
+
+    auto vr = client.validate();
+    REQUIRE(vr.is_ok());
+    CHECK(vr.value() == State::Licensed);
+
+    // The captured body must contain "license_key":"XXXX-YYYY-ZZZZ-0001"
+    const std::string& body = transport.last_request_body;
+    CHECK(body.find("\"license_key\"") != std::string::npos);
+    CHECK(body.find(TEST_KEY) != std::string::npos);
+
+    // It must also still contain instance_id (regression guard)
+    CHECK(body.find("\"instance_id\"") != std::string::npos);
 }
