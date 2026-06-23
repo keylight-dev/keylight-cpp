@@ -39,7 +39,7 @@
 // include/keylight/version.hpp
 // ──────────────────────────────────────────────────────────────────────────
 
-#define KEYLIGHT_SDK_VERSION "0.1.0"
+#define KEYLIGHT_SDK_VERSION "0.1.1"
 
 // ──────────────────────────────────────────────────────────────────────────
 // include/keylight/result.hpp
