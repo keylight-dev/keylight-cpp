@@ -38,9 +38,12 @@
 // ---------------------------------------------------------------------------
 // JUCE headers (pulled in via AppConfig.h or module includes in your project)
 // ---------------------------------------------------------------------------
-#include <juce_core/juce_core.h> // juce::URL, juce::File, juce::Thread,
-                                  // juce::MemoryBlock, juce::MessageManager,
-                                  // juce::String
+#include <juce_core/juce_core.h>     // juce::URL, juce::File, juce::Thread,
+                                      // juce::MemoryBlock, juce::String
+#include <juce_events/juce_events.h>  // juce::MessageManager::callAsync
+                                      // (MessageManager lives in juce_events,
+                                      //  not juce_core — include it explicitly
+                                      //  so this header is self-contained)
 
 #include <atomic>
 #include <functional>
@@ -108,16 +111,20 @@ public:
         // Configure the input stream request.
         // numRedirectsToFollow = 5 (sensible default; api.keylight.dev doesn't
         // redirect, but guard against CDN/proxy chains).
-        juce::URL::InputStreamOptions opts(juce::URL::ParameterHandling::inAddress);
-        opts = opts.withExtraHeaders(extraHeaders)
-                   .withConnectionTimeoutMs(15000) // 15 s connect timeout
-                   .withNumRedirectsToFollow(5)
-                   .withHttpRequestCmd(juce::String(method.c_str()));
-
+        //
+        // NOTE: juce::URL::InputStreamOptions is NOT copy-assignable (its
+        // parameterHandling field is const), so the whole thing must be built
+        // in one chained expression — each withXxx() returns a fresh value.
         int statusCode = 0;
         juce::StringPairArray responseHeaders;
-        opts = opts.withStatusCode(&statusCode)
-                   .withResponseHeaders(&responseHeaders);
+        const juce::URL::InputStreamOptions opts =
+            juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inAddress)
+                .withExtraHeaders(extraHeaders)
+                .withConnectionTimeoutMs(15000) // 15 s connect timeout
+                .withNumRedirectsToFollow(5)
+                .withHttpRequestCmd(juce::String(method.c_str()))
+                .withStatusCode(&statusCode)
+                .withResponseHeaders(&responseHeaders);
 
         // Open the stream (blocks the background thread).
         std::unique_ptr<juce::InputStream> stream(

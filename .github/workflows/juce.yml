@@ -1,0 +1,65 @@
+name: JUCE adapter
+
+# Proves integrations/juce/KeylightJuce.h compiles and links against a real
+# JUCE toolchain on every push — across Linux/macOS/Windows and both JUCE 7
+# and JUCE 8. Replaces the manual "compile it in a real plugin" verification.
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "integrations/juce/**"
+      - "include/**"
+      - ".github/workflows/juce.yml"
+  pull_request:
+    paths:
+      - "integrations/juce/**"
+      - "include/**"
+      - ".github/workflows/juce.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.os }} · JUCE ${{ matrix.juce }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # JUCE 8.0.6 (current generation) on all three OSes, plus the JUCE 7.0.12
+        # floor on Linux + Windows. JUCE 7 on the newest macOS is deliberately
+        # skipped: JUCE 7's juceaide uses CGWindowListCreateImage, obsoleted in
+        # the macOS 15 SDK — a stale-JUCE-vs-new-SDK toolchain issue, not an
+        # adapter issue (JUCE 8 already covers macOS here).
+        include:
+          - { os: ubuntu-latest,  juce: "8.0.6" }
+          - { os: macos-latest,   juce: "8.0.6" }
+          - { os: windows-latest, juce: "8.0.6" }
+          - { os: ubuntu-latest,  juce: "7.0.12" }
+          - { os: windows-latest, juce: "7.0.12" }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # JUCE's juce_core/juce_events need X11 + assorted dev libs to link on Linux.
+      - name: Install JUCE Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libx11-dev libxext-dev libxinerama-dev libxrandr-dev libxcursor-dev \
+            libfreetype6-dev libfontconfig1-dev libasound2-dev libcurl4-openssl-dev
+
+      - name: Configure
+        run: >
+          cmake -B build integrations/juce/citest
+          -DCMAKE_BUILD_TYPE=Release
+          -DKEYLIGHT_JUCE_TAG=${{ matrix.juce }}
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      # Offline smoke test: constructs Licensing and asserts the audio-thread-safe
+      # API behaves (no network, no display). Run via CTest so the binary path is
+      # generator-agnostic across Linux/macOS/Windows.
+      - name: Smoke test
+        run: ctest --test-dir build --build-config Release --output-on-failure

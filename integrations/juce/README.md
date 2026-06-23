@@ -4,10 +4,12 @@ Adds Keylight license management to your JUCE VST/AU/AAX plugin with zero
 extra dependencies.  Networking goes through JUCE's own `juce::URL` and
 `juce::InputStream`; no OpenSSL, no cpp-httplib, nothing extra to vendor.
 
-> **Manual verification pending:** the adapter is written against the JUCE 7/8
-> public API and has been self-reviewed for correctness, but it has not yet
-> been compiled inside a real JUCE plugin project.  A manual Projucer/CMake
-> build is required before shipping (see [Verification](#verification) below).
+> **Compile-verified in CI; live round-trip still manual.** Every push builds
+> this adapter against real JUCE (7.0.12 **and** 8.0.6) on Linux/macOS/Windows
+> via `.github/workflows/juce.yml`, and runs an offline smoke test of the
+> audio-thread-safe API. What CI does *not* yet cover: building a real VST/AU
+> plugin with it and a live `activate → Licensed` round-trip against the API
+> (see [Verification](#verification) below).
 
 ---
 
@@ -17,7 +19,7 @@ extra dependencies.  Networking goes through JUCE's own `juce::URL` and
 |-------------------|-------------------------------------|
 | JUCE              | 7.x or 8.x                         |
 | C++ standard      | C++17                               |
-| JUCE modules      | `juce_core` (URL, File, Thread, MessageManager) |
+| JUCE modules      | `juce_core` (URL, File, Thread), `juce_events` (MessageManager) |
 | Keylight C++ SDK  | any version after 0.1.0             |
 | Target platforms  | macOS, Windows, Linux (any platform juce::URL supports) |
 
@@ -254,7 +256,9 @@ Override by passing a `storePath` to the `Licensing` constructor.
 
 ## Verification
 
-> **Manual verification pending** — compile in a JUCE 7/8 plugin project.
+> **Compiled in CI** (`.github/workflows/juce.yml`) against JUCE 7.0.12 and
+> 8.0.6 on Linux/macOS/Windows, with an offline smoke test of the query API
+> (`integrations/juce/citest/`). A live plugin round-trip is still manual.
 
 The adapter code is written against the JUCE 7/8 public API
 (`juce::URL`, `juce::URL::InputStreamOptions`, `juce::File::getSpecialLocation`,
