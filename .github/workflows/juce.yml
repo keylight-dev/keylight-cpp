@@ -22,6 +22,13 @@ jobs:
   build:
     name: ${{ matrix.os }} · JUCE ${{ matrix.juce }}
     runs-on: ${{ matrix.os }}
+    # Use bash on every OS (Git Bash ships on the Windows runner). PowerShell —
+    # the Windows default — mangles `-DKEYLIGHT_JUCE_TAG=8.0.6` into `8`, which
+    # git then rejects as an invalid ref. bash keeps the command identical
+    # across Linux/macOS/Windows.
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
