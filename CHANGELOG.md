@@ -1,3 +1,19 @@
+## [0.1.2] - 2026-06-23
+
+### Fixed
+- **Unreal Engine plugin now compiles on clang targets (macOS/Linux/iOS/Android).**
+  `Keylight.Build.cs` built the module with C++ exceptions disabled, but the
+  SDK's `FileStore` (which the plugin's `UELicenseStore` wraps) catches
+  `std::filesystem_error` around its atomic-rename writes. Clang rejected this
+  with "cannot use 'try' with exceptions disabled". The module now sets
+  `bEnableExceptions = true` (RTTI stays off; the SDK uses neither
+  `dynamic_cast` nor `typeid`). The public SDK API remains exception-free.
+- **Unreal plugin: safe teardown of the licensing client.** `UKeylightSubsystem`
+  now declares an out-of-line destructor so its `TUniquePtr` members (holding
+  forward-declared SDK types) are destroyed where those types are complete —
+  guaranteeing `~Client()` runs (joining the background auto-validation thread)
+  instead of being silently skipped against an incomplete type.
+
 ## [0.1.1] - 2026-06-23
 
 ### Fixed

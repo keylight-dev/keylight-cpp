@@ -73,10 +73,16 @@ public class Keylight : ModuleRules
         // std::filesystem on POSIX).  UE 5.x defaults to C++17; this is explicit.
         CppStandard = CppStandardVersion.Cpp17;
 
-        // Silence MSVC warnings about std::string in exported classes.
-        // The SDK headers are consumed only within this module, so dllexport
-        // boundary concerns do not apply.
-        bEnableExceptions = false;
+        // The keylight SDK's FileStore (store.hpp) wraps its atomic-rename
+        // writes in try/catch around std::filesystem_error, so this module MUST
+        // be built with C++ exceptions enabled. Without it, clang-based UE
+        // targets (macOS, Linux, iOS, Android) fail to compile with
+        // "cannot use 'try' with exceptions disabled". The SDK's *public* API is
+        // still exception-free (Result<T,Error>); only the on-disk store throws
+        // internally and catches it before returning.
+        bEnableExceptions = true;
+
+        // The SDK uses no dynamic_cast / typeid, so RTTI can stay disabled.
         bUseRTTI = false;
     }
 }

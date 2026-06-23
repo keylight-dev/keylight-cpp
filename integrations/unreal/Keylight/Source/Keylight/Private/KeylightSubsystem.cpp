@@ -56,6 +56,10 @@ private:
 // UKeylightSubsystem implementation
 // ---------------------------------------------------------------------------
 
+// Defaulted here (not in the header) so the TUniquePtr members are destroyed
+// where keylight::Client / Transport / LicenseStore are complete types.
+UKeylightSubsystem::~UKeylightSubsystem() = default;
+
 void UKeylightSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
     Super::Initialize(Collection);

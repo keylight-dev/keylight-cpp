@@ -58,6 +58,16 @@ class KEYLIGHT_API UKeylightSubsystem : public UGameInstanceSubsystem
     GENERATED_BODY()
 
 public:
+    /**
+     * Destructor — declared here but defined (defaulted) out-of-line in the
+     * .cpp so the TUniquePtr members below (which hold forward-declared SDK
+     * types) are destroyed where their full definitions are visible. Without
+     * this, the implicit destructor could be instantiated against incomplete
+     * types, silently skipping ~Client() (which joins the auto-validation
+     * thread) or failing the build under warnings-as-errors.
+     */
+    virtual ~UKeylightSubsystem() override;
+
     // ── UGameInstanceSubsystem ────────────────────────────────────────────
 
     /** Called by UE when the subsystem is created (game instance starts). */

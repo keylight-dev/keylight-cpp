@@ -3,5 +3,5 @@
 #include "keylight/version.hpp"
 
 TEST_CASE("sdk version is set") {
-    CHECK(std::string(KEYLIGHT_SDK_VERSION) == "0.1.1");
+    CHECK(std::string(KEYLIGHT_SDK_VERSION) == "0.1.2");
 }
