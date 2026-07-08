@@ -103,7 +103,7 @@ static void test_config_construction() {
     cfg.tenantId  = "test-tenant";
     cfg.productId = "test-product";
     cfg.sdkKey    = "sdk_test_key";
-    assert(cfg.maxOfflineDays == 7);
+    assert(cfg.maxOfflineDays == 15);
     assert(cfg.apiBaseUrl == "https://api.keylight.dev");
     std::cout << "  Config construction: ok\n";
 }
