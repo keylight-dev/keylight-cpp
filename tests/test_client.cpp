@@ -146,6 +146,15 @@ static const std::string REVOKED_VALIDATE_RESPONSE = R"({
   }
 })";
 
+// A REAL revoke / deactivated-instance response, exactly as the production
+// worker sends it: HTTP 422, `{"error": "..."}`, NO `lease` field, NO `valid`
+// field at all. Before the 422-decodable fix, Client::validate() /
+// validate_and_reconcile_() short-circuited on `resp.status != 200` and
+// treated this as a transient failure, silently keeping the old cached
+// "active" lease — the revoke was never enforced.
+static const std::string REAL_REVOKE_422_RESPONSE =
+    R"({"error":"Instance not found or deactivated"})";
+
 // ---------------------------------------------------------------------------
 // Helpers to build test Client
 // ---------------------------------------------------------------------------
@@ -483,6 +492,68 @@ TEST_CASE("E2: checkOnLaunch catches a dashboard revoke even with a fresh cached
     CHECK(client.state() == State::Expired);
 
     // The revoke must be caught on THIS launch, not several hours later.
+    CHECK(transport.call_count == 1);
+}
+
+TEST_CASE("E4: checkOnLaunch enforces a REAL revoke — HTTP 422, no lease, no 'valid' field") {
+    // This is the exact shape the production worker sends for a dashboard
+    // revoke / deactivated instance: HTTP 422, `{"error": "..."}`, no lease,
+    // no `valid` field at all (unlike REVOKED_VALIDATE_RESPONSE above, which
+    // is a synthetic 200 + trusted "expired"-status lease). Before the fix,
+    // `validate()`/`validate_and_reconcile_` short-circuited on
+    // `resp.status != 200` BEFORE parsing the body, so this response was
+    // swallowed as "transient" and the cached "active" lease was kept —
+    // the revoke was never enforced and state() stayed Licensed.
+    auto cfg = make_config();
+    CountingTransport transport;
+    MemoryStore       store;
+
+    // Seed a cached, currently-valid "active" lease (as if activated earlier).
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW);
+
+    transport.next_status = 422;
+    transport.next_body   = REAL_REVOKE_422_RESPONSE;
+
+    Client client(cfg, transport, store,
+                  []{ return VALID_ACTIVE_NOW; });
+    REQUIRE(client.state() == State::Licensed);
+
+    auto r = client.checkOnLaunch();
+    REQUIRE(r.is_ok());
+    CHECK(r.value() == State::Invalid);
+    CHECK(client.state() == State::Invalid);
+    CHECK(transport.call_count == 1);
+
+    // The stale lease must actually be cleared from the store — not just
+    // masked in memory — so a later relaunch doesn't resurrect Licensed from
+    // a stored blob that still contains the revoked lease.
+    Client relaunched(cfg, transport, store,
+                       []{ return VALID_ACTIVE_NOW; });
+    CHECK(relaunched.state() == State::Invalid);
+}
+
+TEST_CASE("E4: checkOnLaunch with a 422 + expired lease keeps the lease (Expired, not wiped)") {
+    // Distinguish the two 422 shapes: when the server DOES send a lease
+    // (status "expired"/"fallback" — the license itself is stale, not
+    // revoked), that lease must be stored/kept, not discarded, so state()
+    // resolves to Expired off real data.
+    auto cfg = make_config();
+    CountingTransport transport;
+    MemoryStore       store;
+
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW);
+
+    transport.next_status = 422;
+    transport.next_body   = REVOKED_VALIDATE_RESPONSE; // valid:false + trusted "expired"-status lease
+
+    Client client(cfg, transport, store,
+                  []{ return VALID_ACTIVE_NOW; });
+    REQUIRE(client.state() == State::Licensed);
+
+    auto r = client.checkOnLaunch();
+    REQUIRE(r.is_ok());
+    CHECK(r.value() == State::Expired);
+    CHECK(client.state() == State::Expired);
     CHECK(transport.call_count == 1);
 }
 

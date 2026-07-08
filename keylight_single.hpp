@@ -1714,6 +1714,16 @@ public:
         }
         const auto& resp = hr.value();
         if (resp.status != 200) {
+            // 422 is the worker's definitive-rejection status for /validate
+            // (revoke, deactivated instance, expired/fallback lease) — parse
+            // the body instead of treating it as transient. Any other
+            // non-200 status keeps the existing state (unchanged behavior).
+            if (resp.status == 422) {
+                auto rejected = handle_validate_rejection_(resp.body, now_fn_());
+                if (rejected.has_value()) {
+                    return Result<State>::ok(*rejected);
+                }
+            }
             return Result<State>::ok(state_.load());
         }
 
@@ -2084,6 +2094,101 @@ private:
         // clang-format on
     }
 
+    /// Handle a 422 response body from the /validate endpoint — the worker's
+    /// status for a definitive rejection (revoke, deactivated instance, or a
+    /// genuinely stale license). Real 422 payloads take two shapes:
+    ///   - `{"lease": {...}, ...}` — the license itself is stale (lease
+    ///     status "expired"/"fallback"); the lease is still signed and must
+    ///     be trusted/persisted so state() resolves Expired/Limited off it,
+    ///     exactly like a 200 response with a non-"active" lease.
+    ///   - `{"error": "..."}` with NO `lease` field at all — a genuine
+    ///     revoke / "instance not found or deactivated". There is nothing
+    ///     to trust here: the previously-cached "active" lease must be
+    ///     cleared so state() can no longer resolve Licensed off stale data
+    ///     (leaving it in place is exactly the bug this method fixes).
+    /// Returns std::nullopt if the body could not be decoded at all — the
+    /// caller then falls back to treating this like a transient failure
+    /// (network hiccup / non-JSON body), never mutating stored state.
+    /// Mirrors keylight-js Client.validate()'s 422-decodable handling.
+    std::optional<State> handle_validate_rejection_(const std::string& body, int64_t now) {
+        auto jr = Json::parse(body);
+        if (!jr.is_ok()) {
+            return std::nullopt; // undecodable — treat as transient
+        }
+        const Json& j = jr.value();
+
+        auto lease_node = j["lease"];
+        if (lease_node.size() > 0) {
+            auto lr = Lease::from_json(lease_node);
+            if (lr.is_ok()) {
+                const Lease& lease = lr.value();
+                if (verifier_.verify(lease, now).is_trusted()) {
+                    std::string lease_json = lease_to_json_(lease);
+                    std::optional<std::string> iid;
+                    {
+                        std::lock_guard<std::mutex> lock(cache_mutex_);
+                        iid = cached_instance_id_;
+                    }
+                    std::optional<int64_t> expires_at;
+                    {
+                        int64_t v = j["license_expires_at"].as_int();
+                        if (v != 0) expires_at = v;
+                    }
+                    persist_({lease_json, expires_at, iid});
+                    save_last_validated_online_(now);
+                }
+                State new_state = resolve_from_lease_(lease);
+                set_state_(new_state);
+                return new_state;
+            }
+            // Malformed lease payload inside a definitive-rejection response —
+            // cannot be trusted either way; fall through and treat it like the
+            // no-lease deny path rather than silently keeping stale state.
+        }
+
+        // Definitive rejection with no (usable) lease — a real revoke.
+        clear_lease_();
+        set_state_(State::Invalid);
+        return State::Invalid;
+    }
+
+    /// Clear the stored trusted lease (used when a 422 definitively rejects
+    /// with no lease at all — a real revoke / deactivated instance). Keeps
+    /// license_key/instance_id/lastValidatedOnline intact — only the lease
+    /// itself is removed, so a later refresh_state_from_store_() (e.g. next
+    /// process launch) sees no cached lease and resolves Invalid instead of
+    /// trusting the last-known "active" data. Mirrors keylight-js's
+    /// `del(ACCOUNT.LEASE)` in the no-lease rejection branch of validate().
+    void clear_lease_() {
+        std::optional<std::string> instance_id, license_key;
+        std::optional<int64_t>     expires_at;
+        int64_t                    last_lvo = 0;
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            cached_lease_ = std::nullopt;
+            instance_id   = cached_instance_id_;
+            license_key   = cached_license_key_;
+            expires_at    = cached_expires_at_;
+            last_lvo      = cached_last_validated_online_;
+        }
+
+        // Rebuild the on-disk blob without a "lease" key, preserving every
+        // other field we still have cached.
+        std::string blob = "{";
+        bool first = true;
+        auto append = [&](const std::string& kv) {
+            if (!first) blob += ",";
+            blob += kv;
+            first = false;
+        };
+        if (expires_at.has_value())  append("\"expiresAt\":" + std::to_string(*expires_at));
+        if (instance_id.has_value()) append("\"instanceId\":" + json_str(*instance_id));
+        if (license_key.has_value()) append("\"licenseKey\":" + json_str(*license_key));
+        if (last_lvo != 0)           append("\"lastValidatedOnline\":" + std::to_string(last_lvo));
+        blob += "}";
+        store_.save(blob);
+    }
+
     // Derive State from an optional (possibly-null) lease using current clock.
     State resolve_from_lease_(const std::optional<Lease>& lease) const {
         if (!lease.has_value()) {
@@ -2314,7 +2419,17 @@ private:
         }
         const auto& resp = hr.value();
         if (resp.status != 200) {
-            // HTTP error — treat like network failure for grace purposes
+            // 422 is the worker's definitive-rejection status for /validate
+            // (revoke, deactivated instance, expired/fallback lease) — parse
+            // the body instead of treating it as transient/offline-graceable.
+            // Any other non-200 status (or an undecodable 422 body) falls
+            // through to the existing offline-grace handling below.
+            if (resp.status == 422) {
+                auto rejected = handle_validate_rejection_(resp.body, now);
+                if (rejected.has_value()) {
+                    return Result<State>::ok(*rejected);
+                }
+            }
             return apply_offline_grace_(before, now, last_lvo);
         }
 
