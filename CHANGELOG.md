@@ -1,3 +1,12 @@
+## [0.1.3] - 2026-07-08
+
+### Fixed
+
+- **Revocation now enforced; offline use bounded to 15 days.** Launch always performs a
+  server `validate`, so a dashboard revoke/expiry takes effect on the next launch. A real
+  HTTP 422 revoke response is decoded and enforced instead of being swallowed as a transient
+  failure. The default `max_offline_days` is 15.
+
 ## [0.1.2] - 2026-06-23
 
 ### Fixed
