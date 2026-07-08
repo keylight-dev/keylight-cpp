@@ -232,7 +232,7 @@ struct Config {
     // Map of keyId → base64-encoded Ed25519 public key (32 bytes)
     std::map<std::string, std::string> trustedKeys;
 
-    int         maxOfflineDays     = 7;
+    int         maxOfflineDays     = 15;
     std::string keyPrefix;
     int         trialDurationDays  = 0;
     std::string apiBaseUrl         = "https://api.keylight.dev";
@@ -1859,19 +1859,20 @@ public:
     // ── Launch / refresh API ──────────────────────────────────────────────
 
     /// Load the cached lease from the store, verify it offline, set state;
-    /// then call refreshIfNeeded() (which may hit the network if stale/near-expiry).
-    /// If there is no cached lease, state stays as-is (Invalid/initial).
-    /// Ported from keylight-rust check_on_launch() and keylight-csharp CheckOnLaunchAsync().
+    /// then ALWAYS perform a server validate() round-trip — never gated by
+    /// the in-session staleness timer. A revoke/expiry on the dashboard must
+    /// land on the very next launch, not lag behind the 5min/6h/24h cadence
+    /// that refreshIfNeeded() uses for long-running hosts between launches.
+    /// If there is no cached lease, state stays as-is (Invalid/initial) and
+    /// no network call is made (nothing to revalidate).
+    /// A transient/network failure does not mutate state beyond the existing
+    /// offline-grace bound (see apply_offline_grace_).
+    /// Ported from keylight-rust check_on_launch() and keylight-csharp CheckOnLaunchAsync(),
+    /// updated per the cross-SDK revocation/offline-bound parity design (2026-07-08).
     Result<State> checkOnLaunch() {
         // The cache is already primed on construction via refresh_state_from_store_().
-        // Call refreshIfNeeded to make a network call if the cached data is stale.
         if (has_stored_license_()) {
-            auto r = refreshIfNeeded();
-            if (!r.is_ok()) {
-                // If refreshIfNeeded fails hard (non-network), propagate.
-                // Network failures are handled inside refreshIfNeeded (grace).
-                return r;
-            }
+            return validate_and_reconcile_();
         }
         return Result<State>::ok(state_.load());
     }
@@ -1880,6 +1881,8 @@ public:
     /// If a refresh is due, calls validate(); otherwise returns current state.
     /// On a network failure within maxOfflineDays grace window, keeps Licensed.
     /// Ported from keylight-rust refresh_if_needed() and keylight-csharp RefreshIfNeededAsync().
+    /// This in-session cadence is unchanged by the always-validate-on-launch
+    /// fix: it still governs long-running hosts between launches.
     Result<State> refreshIfNeeded() {
         if (!has_stored_license_()) {
             return Result<State>::ok(state_.load());
@@ -1912,58 +1915,7 @@ public:
             return Result<State>::ok(state_.load());
         }
 
-        // Attempt network refresh via validate()
-        State before = state_.load();
-        auto hr = transport_.request("POST", api_url_("validate"),
-                                     json_headers_(),
-                                     build_validate_body_());
-        if (!hr.is_ok()) {
-            // Network failure — apply offline grace
-            return apply_offline_grace_(before, now, last_lvo);
-        }
-        const auto& resp = hr.value();
-        if (resp.status != 200) {
-            // HTTP error — treat like network failure for grace purposes
-            return apply_offline_grace_(before, now, last_lvo);
-        }
-
-        // Parse and apply the validate response
-        auto jr = Json::parse(resp.body);
-        if (!jr.is_ok()) {
-            return apply_offline_grace_(before, now, last_lvo);
-        }
-        const Json& j = jr.value();
-
-        std::optional<Lease> lease;
-        auto lease_node = j["lease"];
-        if (lease_node.size() > 0) {
-            auto lr = Lease::from_json(lease_node);
-            if (lr.is_ok()) {
-                lease = lr.value();
-            }
-        }
-
-        std::optional<int64_t> expires_at;
-        {
-            int64_t v = j["license_expires_at"].as_int();
-            if (v != 0) expires_at = v;
-        }
-
-        if (lease.has_value() && verifier_.verify(*lease, now_fn_()).is_trusted()) {
-            std::string lease_json = lease_to_json_(*lease);
-            std::optional<std::string> iid;
-            {
-                std::lock_guard<std::mutex> lock(cache_mutex_);
-                iid = cached_instance_id_;
-            }
-            persist_({lease_json, expires_at, iid});
-            // Update last_validated_online timestamp
-            save_last_validated_online_(now);
-        }
-
-        State new_state = resolve_from_lease_(lease);
-        set_state_(new_state);
-        return Result<State>::ok(new_state);
+        return validate_and_reconcile_();
     }
 
     // ── Events API ────────────────────────────────────────────────────────
@@ -2338,6 +2290,71 @@ private:
             {"license_key", json_str(load_license_key_())},
             {"instance_id", json_str(load_instance_id_())},
         }, true);
+    }
+
+    /// Perform a single live validate() round-trip against the server and
+    /// reconcile the result, applying the offline-grace bound on any
+    /// transient failure (network error, non-200, or unparseable body).
+    /// Shared by refreshIfNeeded() (gated by the debounce/stale/near-expiry
+    /// timer) and checkOnLaunch() (called unconditionally — no gating).
+    /// Extracted verbatim from the former refreshIfNeeded() body so both
+    /// call sites keep identical reconcile/grace semantics.
+    Result<State> validate_and_reconcile_() {
+        int64_t now      = now_fn_();
+        int64_t last_lvo = load_last_validated_online_();
+
+        // Attempt network refresh via validate()
+        State before = state_.load();
+        auto hr = transport_.request("POST", api_url_("validate"),
+                                     json_headers_(),
+                                     build_validate_body_());
+        if (!hr.is_ok()) {
+            // Network failure — apply offline grace
+            return apply_offline_grace_(before, now, last_lvo);
+        }
+        const auto& resp = hr.value();
+        if (resp.status != 200) {
+            // HTTP error — treat like network failure for grace purposes
+            return apply_offline_grace_(before, now, last_lvo);
+        }
+
+        // Parse and apply the validate response
+        auto jr = Json::parse(resp.body);
+        if (!jr.is_ok()) {
+            return apply_offline_grace_(before, now, last_lvo);
+        }
+        const Json& j = jr.value();
+
+        std::optional<Lease> lease;
+        auto lease_node = j["lease"];
+        if (lease_node.size() > 0) {
+            auto lr = Lease::from_json(lease_node);
+            if (lr.is_ok()) {
+                lease = lr.value();
+            }
+        }
+
+        std::optional<int64_t> expires_at;
+        {
+            int64_t v = j["license_expires_at"].as_int();
+            if (v != 0) expires_at = v;
+        }
+
+        if (lease.has_value() && verifier_.verify(*lease, now_fn_()).is_trusted()) {
+            std::string lease_json = lease_to_json_(*lease);
+            std::optional<std::string> iid;
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                iid = cached_instance_id_;
+            }
+            persist_({lease_json, expires_at, iid});
+            // Update last_validated_online timestamp
+            save_last_validated_online_(now);
+        }
+
+        State new_state = resolve_from_lease_(lease);
+        set_state_(new_state);
+        return Result<State>::ok(new_state);
     }
 
     /// Apply offline grace logic when a network call fails.
