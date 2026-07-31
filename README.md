@@ -326,6 +326,24 @@ The conformance suite runs as part of the CI matrix on Ubuntu, macOS, and Window
 | C# (.NET/Godot/Unity) | Available | [keylight-csharp](https://github.com/keylight-dev/keylight-csharp) |
 | C++ (this repo) | Available | [keylight-cpp](https://github.com/keylight-dev/keylight-cpp) |
 
+## About Keylight
+
+Keylight is the licensing layer for desktop apps. You keep your own Stripe account,
+your own pricing, and your own customers — Keylight issues the licenses and tells your
+app who is allowed to run it.
+
+- **License keys** issued automatically when a payment completes
+- **Device activations** with limits you set, and self-serve deactivation
+- **Offline validation** — signed Ed25519 leases your app verifies locally
+- **Feature entitlements** signed into the lease, so tiers work offline too
+
+[keylight.dev](https://keylight.dev) · [Documentation](https://docs.keylight.dev) · [Pricing](https://keylight.dev/pricing)
+
+### Further reading
+
+- [Offline Licensing for Your VST/AU Plugin Without a Backend](https://keylight.dev/blog/audio-plugin-licensing-cpp)
+- [License Your Unreal Engine Game Offline in an Afternoon](https://keylight.dev/blog/unreal-engine-game-licensing-cpp)
+
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
