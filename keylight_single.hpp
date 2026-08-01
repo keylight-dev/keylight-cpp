@@ -41,6 +41,10 @@
 
 #define KEYLIGHT_SDK_VERSION "0.1.2"
 
+// Identifies this SDK to the backend, sent as `sdk` alongside `platform`.
+// Server cap is 16 characters (zod `z.string().max(16)`).
+#define KEYLIGHT_SDK_ID "cpp"
+
 // ──────────────────────────────────────────────────────────────────────────
 // include/keylight/result.hpp
 // ──────────────────────────────────────────────────────────────────────────
@@ -2085,7 +2089,7 @@ private:
     }
 
     // Build JSON object string from key→pre-encoded-value pairs.
-    // If include_telemetry is true, appends sdk_version and platform.
+    // If include_telemetry is true, appends sdk_version, platform and sdk.
     std::string build_json_(
         std::vector<std::pair<std::string, std::string>> fields,
         bool include_telemetry) const
@@ -2093,6 +2097,10 @@ private:
         if (include_telemetry) {
             fields.push_back({"sdk_version", json_str(KEYLIGHT_SDK_VERSION)});
             fields.push_back({"platform",    json_str(detail::current_platform())});
+            // `platform` cannot identify the SDK: this one, Rust and C# all send
+            // the same canonical macos/windows/linux tokens, so the server used
+            // to label every C++ device "Rust". Identify ourselves explicitly.
+            fields.push_back({"sdk",         json_str(KEYLIGHT_SDK_ID)});
             if (!cfg_.appVersion.empty()) {
                 fields.push_back({"app_version", json_str(cfg_.appVersion)});
             }
