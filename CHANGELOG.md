@@ -1,3 +1,20 @@
+## [0.1.3] - 2026-08-01
+
+### Fixed
+
+- **Revocation now enforced; offline use bounded to 15 days.** Launch always performs a
+  server `validate`, so a dashboard revoke/expiry takes effect on the next launch. A real
+  HTTP 422 revoke response is decoded and enforced instead of being swallowed as a transient
+  failure. The default `max_offline_days` is 15.
+
+### Added
+
+- **The SDK now identifies itself on the wire.** `activate` and `validate` send
+  `sdk: "cpp"` alongside the existing `platform` field. `platform` reports the
+  operating system and nothing more — it is identical across the C++, Rust and C#
+  SDKs, so it could not say which SDK a device was running. No API change and
+  nothing to do in your code.
+
 ## [0.1.2] - 2026-06-23
 
 ### Fixed

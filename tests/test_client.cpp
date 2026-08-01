@@ -125,6 +125,36 @@ static const std::string VALIDATE_RESPONSE = R"({
   }
 })";
 
+// A validate response representing a server-side revoke/expire caught
+// on the next launch: signature verifies (kid "k1", same conformance
+// vector's public key), and the lease's own expiresAt has NOT yet passed,
+// but the server-assigned status is no longer "active" — this is the
+// "expired-status" vector from tests/fixtures/vectors.json. resolve_from_lease_
+// maps any trusted, non-"active" status to State::Expired, which is the
+// "deny" outcome the revocation-parity design calls for.
+static const std::string REVOKED_VALIDATE_RESPONSE = R"({
+  "valid": false,
+  "lease": {
+    "kid": "k1",
+    "licenseKeyHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "instanceId": "00000000-0000-4000-8000-000000000001",
+    "issuedAt": 1781076246,
+    "expiresAt": 1781681046,
+    "status": "expired",
+    "signature": "FO4clyjAnjZpPaV/eecMvjbUz28fslWVwIpAPwTvnGvCWW5mveKpjsAxDgxUP6PdPRIPblAMYrS/0d0vnc+FDA==",
+    "entitlements": []
+  }
+})";
+
+// A REAL revoke / deactivated-instance response, exactly as the production
+// worker sends it: HTTP 422, `{"error": "..."}`, NO `lease` field, NO `valid`
+// field at all. Before the 422-decodable fix, Client::validate() /
+// validate_and_reconcile_() short-circuited on `resp.status != 200` and
+// treated this as a transient failure, silently keeping the old cached
+// "active" lease — the revoke was never enforced.
+static const std::string REAL_REVOKE_422_RESPONSE =
+    R"({"error":"Instance not found or deactivated"})";
+
 // ---------------------------------------------------------------------------
 // Helpers to build test Client
 // ---------------------------------------------------------------------------
@@ -350,6 +380,30 @@ public:
     }
 };
 
+// A FakeTransport that counts calls atomically (safe for concurrent access).
+// Defined here (rather than only in the E3 section below) so E2 tests can
+// assert the network WAS called (as opposed to FailingTransport, which
+// proves failure-handling, or FakeTransport, which doesn't count calls).
+class CountingTransport : public Transport {
+public:
+    std::atomic<int> call_count{0};
+    int              next_status = 200;
+    std::string      next_body;
+
+    Result<HttpResponse> request(
+        const std::string&,
+        const std::string&,
+        const std::map<std::string, std::string>&,
+        const std::string&) override
+    {
+        ++call_count;
+        HttpResponse r;
+        r.status = next_status;
+        r.body   = next_body;
+        return Result<HttpResponse>::ok(r);
+    }
+};
+
 // Persist a valid-active lease blob directly into the store, mimicking what
 // activate() would have written (format: {"lease":{...},"expiresAt":N,...}).
 // Also stores lastValidatedOnline (for offline-grace tests).
@@ -383,28 +437,192 @@ static void seed_store_with_valid_lease(MemoryStore& store,
 // E2 TEST CASES
 // ---------------------------------------------------------------------------
 
-TEST_CASE("E2: checkOnLaunch with cached valid lease → Licensed, NO network call") {
+TEST_CASE("E2: checkOnLaunch with cached valid lease → still validates online (no debounce skip)") {
+    // Per the cross-SDK revocation/offline-bound parity design (2026-07-08),
+    // checkOnLaunch must ALWAYS perform a server round-trip so a dashboard
+    // revoke lands on the next launch — it must NOT delegate to
+    // refreshIfNeeded()'s staleness gate (5min debounce / 6h stale / 24h
+    // near-expiry), which would skip the network call entirely for a fresh
+    // cached lease and let a revoke lag for hours.
     auto cfg = make_config();
-    FailingTransport transport;
-    MemoryStore      store;
+    CountingTransport transport;
+    MemoryStore       store;
 
     // now = VALID_ACTIVE_NOW; lease expires at 1781681046 (well in the future)
-    // last_validated_online = now (freshly validated → debounce will skip refresh)
+    // last_validated_online = now (freshly validated — this is exactly the
+    // case the OLD refreshIfNeeded-delegating checkOnLaunch would debounce).
     seed_store_with_valid_lease(store, VALID_ACTIVE_NOW);
+
+    transport.next_status = 200;
+    transport.next_body   = VALIDATE_RESPONSE;
 
     Client client(cfg, transport, store,
                   []{ return VALID_ACTIVE_NOW; });
 
-    // Re-create the client so checkOnLaunch can load from store
-    // (the seeded store is already loaded on construction via refresh_state_from_store_)
-    // But we need to call checkOnLaunch explicitly.
     auto r = client.checkOnLaunch();
     REQUIRE(r.is_ok());
     CHECK(r.value() == State::Licensed);
 
-    // Crucially: FailingTransport must NOT have been called
-    // (the lease is fresh — debounce should prevent the network call).
-    CHECK(transport.call_count == 0);
+    // Crucially: the transport MUST have been called exactly once, even
+    // though the cached lease was validated online "just now".
+    CHECK(transport.call_count == 1);
+}
+
+TEST_CASE("E2: checkOnLaunch catches a dashboard revoke even with a fresh cached lease") {
+    // Server-side revoke/expire represented as a trusted, signed lease whose
+    // status is no longer "active" (conformance vector "expired-status" from
+    // tests/fixtures/vectors.json — signature verifies, but the lease's own
+    // expiresAt has not yet passed; the server-side status is what changed).
+    auto cfg = make_config();
+    CountingTransport transport;
+    MemoryStore       store;
+
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW);
+
+    transport.next_status = 200;
+    transport.next_body   = REVOKED_VALIDATE_RESPONSE;
+
+    Client client(cfg, transport, store,
+                  []{ return VALID_ACTIVE_NOW; });
+    REQUIRE(client.state() == State::Licensed);
+
+    auto r = client.checkOnLaunch();
+    REQUIRE(r.is_ok());
+    CHECK(r.value() == State::Expired);
+    CHECK(client.state() == State::Expired);
+
+    // The revoke must be caught on THIS launch, not several hours later.
+    CHECK(transport.call_count == 1);
+}
+
+TEST_CASE("E4: checkOnLaunch enforces a REAL revoke — HTTP 422, no lease, no 'valid' field") {
+    // This is the exact shape the production worker sends for a dashboard
+    // revoke / deactivated instance: HTTP 422, `{"error": "..."}`, no lease,
+    // no `valid` field at all (unlike REVOKED_VALIDATE_RESPONSE above, which
+    // is a synthetic 200 + trusted "expired"-status lease). Before the fix,
+    // `validate()`/`validate_and_reconcile_` short-circuited on
+    // `resp.status != 200` BEFORE parsing the body, so this response was
+    // swallowed as "transient" and the cached "active" lease was kept —
+    // the revoke was never enforced and state() stayed Licensed.
+    auto cfg = make_config();
+    CountingTransport transport;
+    MemoryStore       store;
+
+    // Seed a cached, currently-valid "active" lease (as if activated earlier).
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW);
+
+    transport.next_status = 422;
+    transport.next_body   = REAL_REVOKE_422_RESPONSE;
+
+    Client client(cfg, transport, store,
+                  []{ return VALID_ACTIVE_NOW; });
+    REQUIRE(client.state() == State::Licensed);
+
+    auto r = client.checkOnLaunch();
+    REQUIRE(r.is_ok());
+    CHECK(r.value() == State::Invalid);
+    CHECK(client.state() == State::Invalid);
+    CHECK(transport.call_count == 1);
+
+    // The stale lease must actually be cleared from the store — not just
+    // masked in memory — so a later relaunch doesn't resurrect Licensed from
+    // a stored blob that still contains the revoked lease.
+    Client relaunched(cfg, transport, store,
+                       []{ return VALID_ACTIVE_NOW; });
+    CHECK(relaunched.state() == State::Invalid);
+}
+
+TEST_CASE("E4: checkOnLaunch with a 422 + expired lease keeps the lease (Expired, not wiped)") {
+    // Distinguish the two 422 shapes: when the server DOES send a lease
+    // (status "expired"/"fallback" — the license itself is stale, not
+    // revoked), that lease must be stored/kept, not discarded, so state()
+    // resolves to Expired off real data.
+    auto cfg = make_config();
+    CountingTransport transport;
+    MemoryStore       store;
+
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW);
+
+    transport.next_status = 422;
+    transport.next_body   = REVOKED_VALIDATE_RESPONSE; // valid:false + trusted "expired"-status lease
+
+    Client client(cfg, transport, store,
+                  []{ return VALID_ACTIVE_NOW; });
+    REQUIRE(client.state() == State::Licensed);
+
+    auto r = client.checkOnLaunch();
+    REQUIRE(r.is_ok());
+    CHECK(r.value() == State::Expired);
+    CHECK(client.state() == State::Expired);
+    CHECK(transport.call_count == 1);
+}
+
+TEST_CASE("E2: checkOnLaunch with a transient failure keeps access within the offline cap") {
+    auto cfg = make_config(); // maxOfflineDays default (15)
+    FailingTransport transport;
+    MemoryStore      store;
+
+    // Validated online 10 days ago: past the OLD default cap (7 days) but
+    // within the NEW default cap (15 days) — this is the case that
+    // specifically exercises the 7→15 bump, not just "grace exists".
+    int64_t now      = 1781681046LL - 3600;  // 1h before the lease's own expiry
+    int64_t last_lvo = now - 10LL * 86400;
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW, 1781681046LL, last_lvo);
+
+    Client client(cfg, transport, store, [now]{ return now; });
+    REQUIRE(client.state() == State::Licensed);
+
+    auto r = client.checkOnLaunch();
+    REQUIRE(r.is_ok());
+    CHECK(r.value() == State::Licensed);
+    CHECK(client.state() == State::Licensed);
+
+    // The network WAS attempted (checkOnLaunch always validates); it just
+    // failed transiently and must not deny access within the cap.
+    CHECK(transport.call_count == 1);
+}
+
+TEST_CASE("E2: checkOnLaunch denies once offline past maxOfflineDays (15)") {
+    auto cfg = make_config(); // default maxOfflineDays == 15
+    FailingTransport transport;
+    MemoryStore      store;
+
+    // now stays before the lease's own expiresAt (1781681046) so this
+    // exercises the offline-cap path, not a raw lease-expiry downgrade.
+    int64_t now      = 1781681046LL - 3600;       // 1h before natural expiry
+    int64_t last_lvo = now - 16LL * 86400;         // last validated 16 days ago
+
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW, 1781681046LL, last_lvo);
+
+    Client client(cfg, transport, store, [now]{ return now; });
+    REQUIRE(client.state() == State::Licensed);
+
+    auto r = client.checkOnLaunch();
+    REQUIRE(r.is_ok());
+    CHECK(r.value() == State::Expired);
+    CHECK(client.state() == State::Expired);
+}
+
+TEST_CASE("E2: checkOnLaunch with maxOfflineDays disabled never denies for age") {
+    auto cfg = make_config();
+    cfg.maxOfflineDays = 0; // 0 == cap disabled (uncapped offline), per existing convention
+    FailingTransport transport;
+    MemoryStore      store;
+
+    // Validated online ~1000 days ago — would fail any normal cap, but the
+    // cap is disabled so age alone must never cause a denial.
+    int64_t now      = 1781681046LL - 3600; // still before the lease's own expiresAt
+    int64_t last_lvo = now - 1000LL * 86400;
+
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW, 1781681046LL, last_lvo);
+
+    Client client(cfg, transport, store, [now]{ return now; });
+    REQUIRE(client.state() == State::Licensed);
+
+    auto r = client.checkOnLaunch();
+    REQUIRE(r.is_ok());
+    CHECK(r.value() == State::Licensed);
+    CHECK(client.state() == State::Licensed);
 }
 
 TEST_CASE("E2: checkOnLaunch with expired-beyond-grace lease → Expired") {
@@ -546,27 +764,7 @@ TEST_CASE("E2: no spurious events on same-state transitions") {
 // ---------------------------------------------------------------------------
 // E3: opt-in background auto-validation
 // ---------------------------------------------------------------------------
-
-// A FakeTransport that counts calls atomically (safe for concurrent access).
-class CountingTransport : public Transport {
-public:
-    std::atomic<int> call_count{0};
-    int              next_status = 200;
-    std::string      next_body;
-
-    Result<HttpResponse> request(
-        const std::string&,
-        const std::string&,
-        const std::map<std::string, std::string>&,
-        const std::string&) override
-    {
-        ++call_count;
-        HttpResponse r;
-        r.status = next_status;
-        r.body   = next_body;
-        return Result<HttpResponse>::ok(r);
-    }
-};
+// CountingTransport is defined in the E2 helpers section above.
 
 TEST_CASE("E3: startAutoValidation + stopAutoValidation cleanly joins") {
     // No background thread without a stored license, so seed one first.
