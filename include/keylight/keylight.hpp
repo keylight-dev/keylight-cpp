@@ -2,6 +2,7 @@
 #include "version.hpp"
 #include "result.hpp"
 #include "config.hpp"
+#include "device_info.hpp"
 #include "lease.hpp"
 #include "verifier.hpp"
 #include "transport.hpp"

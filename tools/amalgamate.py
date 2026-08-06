@@ -16,8 +16,11 @@ Algorithm:
      inlined content.
   4. Skip #include directives that reference already-visited headers, and skip
      transport/httplib.hpp entirely (it requires OpenSSL).
-  5. Hoist all system includes (#include <...>) to the top, de-duplicated and
-     sorted, so they appear before any code.
+  5. Hoist all TOP-LEVEL system includes (#include <...>) to the top,
+     de-duplicated and sorted, so they appear before any code.  System
+     includes nested inside a preprocessor conditional (#if/#ifdef/#ifndef)
+     are platform-gated — hoisting them would, say, pull <windows.h> into a
+     macOS build — so those are left inline exactly where they were.
   6. Emit a single #pragma once + generated-file banner at the very top.
 """
 
@@ -56,6 +59,9 @@ RE_PRAGMA_ONCE = re.compile(r'^\s*#\s*pragma\s+once\s*$')
 RE_GUARD_IFNDEF  = re.compile(r'^\s*#\s*ifndef\s+\w+\s*$')
 RE_GUARD_DEFINE  = re.compile(r'^\s*#\s*define\s+\w+\s*$')
 RE_ENDIF         = re.compile(r'^\s*#\s*endif\s*(?://.*)?$')
+# Preprocessor conditional open/close — used to detect platform-gated includes.
+RE_COND_OPEN     = re.compile(r'^\s*#\s*(if|ifdef|ifndef)\b')
+RE_COND_CLOSE    = re.compile(r'^\s*#\s*endif\b')
 
 # ── State ───────────────────────────────────────────────────────────────────
 
@@ -160,12 +166,25 @@ def process_file(path: Path) -> None:
     # but don't emit the include lines themselves.
     # Build the list of "output lines" for this file.
     output_lines: list[str] = []
+    cond_depth = 0
 
     for line in lines:
+        # Track preprocessor conditional nesting so platform-gated includes
+        # can be recognised and left in place.
+        if RE_COND_OPEN.match(line):
+            cond_depth += 1
+        elif RE_COND_CLOSE.match(line) and cond_depth > 0:
+            cond_depth -= 1
+
         # Check for system include
         m = RE_SYSTEM.match(line)
         if m:
             token = m.group(1)
+            if cond_depth > 0:
+                # Platform-gated (e.g. <windows.h> behind #if defined(_WIN32)).
+                # Hoisting it would break every other platform — keep it inline.
+                output_lines.append(line)
+                continue
             if token not in system_seen:
                 system_seen.add(token)
                 system_includes.append(token)

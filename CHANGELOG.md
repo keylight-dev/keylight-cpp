@@ -1,3 +1,16 @@
+## [Unreleased]
+
+### Added
+
+- **Coarse device telemetry.** `activate` and `validate` now also send `cpu_cores`
+  and `memory` alongside the existing `platform` / `sdk` / `sdk_version` fields, so
+  the dashboard can show what class of machine your customers run on. Both are
+  **buckets**, never the real numbers — `cpu_cores` is one of `1-2`, `3-4`, `5-8`,
+  `9-16`, `17+` and `memory` is one of `<4GB`, `4-8GB`, `8-16GB`, `16-32GB`,
+  `32-64GB`, `64GB+`. The exact core count and exact RAM size never leave the
+  machine. Both fields are optional and omitted when the platform cannot report
+  them. No API change and nothing to do in your code.
+
 ## [0.1.3] - 2026-08-01
 
 ### Fixed

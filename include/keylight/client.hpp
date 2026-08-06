@@ -14,6 +14,7 @@
 //                guarded by a mutex.
 
 #include "config.hpp"
+#include "device_info.hpp"
 #include "lease.hpp"
 #include "result.hpp"
 #include "store.hpp"
@@ -581,7 +582,8 @@ private:
     }
 
     // Build JSON object string from key→pre-encoded-value pairs.
-    // If include_telemetry is true, appends sdk_version, platform and sdk.
+    // If include_telemetry is true, appends sdk_version, platform, sdk,
+    // app_version and the coarse cpu_cores / memory buckets.
     std::string build_json_(
         std::vector<std::pair<std::string, std::string>> fields,
         bool include_telemetry) const
@@ -595,6 +597,17 @@ private:
             fields.push_back({"sdk",         json_str(KEYLIGHT_SDK_ID)});
             if (!cfg_.appVersion.empty()) {
                 fields.push_back({"app_version", json_str(cfg_.appVersion)});
+            }
+            // Coarse device buckets. Never the raw core count or byte count —
+            // see device_info.hpp for the cross-SDK bucket contract. Omitted
+            // entirely when the platform cannot report the value.
+            const char* cores = detail::cpu_cores_bucket(detail::detect_cpu_cores());
+            if (cores[0] != '\0') {
+                fields.push_back({"cpu_cores", json_str(cores)});
+            }
+            const char* mem = detail::memory_bucket(detail::detect_physical_memory_bytes());
+            if (mem[0] != '\0') {
+                fields.push_back({"memory", json_str(mem)});
             }
         }
 
