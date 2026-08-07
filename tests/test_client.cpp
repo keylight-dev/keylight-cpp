@@ -361,6 +361,91 @@ TEST_CASE("Client: validate() sends license_key in request body") {
 }
 
 // ---------------------------------------------------------------------------
+// Device telemetry — cpu_cores / memory ride the SAME payload as sdk/platform
+// ---------------------------------------------------------------------------
+static bool body_has_legal_bucket(const std::string& body,
+                                  const std::string& field,
+                                  const std::vector<std::string>& allowed) {
+    const std::string needle = "\"" + field + "\":\"";
+    auto pos = body.find(needle);
+    if (pos == std::string::npos) return false;
+    auto start = pos + needle.size();
+    auto end   = body.find('"', start);
+    if (end == std::string::npos) return false;
+    const std::string value = body.substr(start, end - start);
+    for (const auto& a : allowed) if (a == value) return true;
+    return false;
+}
+
+TEST_CASE("Client: activate() sends cpu_cores and memory buckets") {
+    auto cfg = make_config();
+    FakeTransport  transport;
+    MemoryStore    store;
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; });
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    const std::string& body = transport.last_request_body;
+    // Existing telemetry must still be there (additive-only guard).
+    CHECK(body.find("\"platform\"")    != std::string::npos);
+    CHECK(body.find("\"sdk\"")         != std::string::npos);
+    CHECK(body.find("\"sdk_version\"") != std::string::npos);
+
+    CHECK(body_has_legal_bucket(body, "cpu_cores",
+                                {"1-2", "3-4", "5-8", "9-16", "17+"}));
+    CHECK(body_has_legal_bucket(body, "memory",
+                                {"<4GB", "4-8GB", "8-16GB",
+                                 "16-32GB", "32-64GB", "64GB+"}));
+}
+
+TEST_CASE("Client: validate() sends cpu_cores and memory buckets") {
+    auto cfg = make_config();
+    FakeTransport  transport;
+    MemoryStore    store;
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; });
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    transport.next_body = VALIDATE_RESPONSE;
+    transport.last_request_body.clear();
+    REQUIRE(client.validate().is_ok());
+
+    const std::string& body = transport.last_request_body;
+    CHECK(body_has_legal_bucket(body, "cpu_cores",
+                                {"1-2", "3-4", "5-8", "9-16", "17+"}));
+    CHECK(body_has_legal_bucket(body, "memory",
+                                {"<4GB", "4-8GB", "8-16GB",
+                                 "16-32GB", "32-64GB", "64GB+"}));
+}
+
+TEST_CASE("Client: raw core count and raw byte count never reach the wire") {
+    // Fingerprinting guard: only the coarse bucket may cross the wire.
+    auto cfg = make_config();
+    FakeTransport  transport;
+    MemoryStore    store;
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; });
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    const std::string& body = transport.last_request_body;
+    const uint64_t raw_bytes = keylight::detail::detect_physical_memory_bytes();
+    if (raw_bytes != 0) {
+        CHECK(body.find(std::to_string(raw_bytes)) == std::string::npos);
+    }
+    // A bucket string is never a bare number, so a numeric cpu_cores value
+    // would have to appear as "cpu_cores":<digits> — assert it does not.
+    CHECK(body.find("\"cpu_cores\":\"") != std::string::npos);
+    CHECK(body.find("\"memory\":\"")    != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
 // E2 helpers
 // ---------------------------------------------------------------------------
 
