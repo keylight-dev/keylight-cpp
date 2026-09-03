@@ -408,6 +408,13 @@ inline constexpr size_t OS_VERSION_MAX = 32;
 // dropped; a run over the server's cap is REJECTED rather than truncated —
 // truncation would mint a fake version bucket out of a client bug.
 //
+// A patch zero is NOT stripped: "15.0" is sent as "15.0". keylight-rust sends
+// `sw_vers -productVersion` verbatim, and keylight-swift drops the patch
+// component only when it is zero AND there are three components — so macOS
+// 15.0 is "15.0" in all three SDKs. Stripping it here would be the one client
+// reporting "15" and would split a single population across two dashboard
+// buckets on every x.0 release.
+//
 // Pure. Mirrors keylight-rust telemetry::dotted_numeric.
 inline std::string dotted_numeric(const std::string& raw) {
     size_t start = raw.find_first_of("0123456789");
@@ -422,14 +429,6 @@ inline std::string dotted_numeric(const std::string& raw) {
 
     std::string v = raw.substr(start, end - start);
     while (!v.empty() && v.back() == '.') v.pop_back();
-
-    // Drop a trailing ".0" for parity with the Swift SDK, which does this
-    // before sending. The server does NOT normalize it away, so without this
-    // the same Mac reports "15.5" from Swift and "15.5.0" from C++ and the
-    // dashboard's OS breakdown splits one population across two buckets.
-    if (v.size() >= 2 && v.compare(v.size() - 2, 2, ".0") == 0) {
-        v.erase(v.size() - 2);
-    }
 
     if (v.empty() || v.size() > OS_VERSION_MAX) return {};
 

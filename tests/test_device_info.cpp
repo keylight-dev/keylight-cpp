@@ -109,9 +109,8 @@ TEST_CASE("device_info: dotted_numeric extracts the first well-formed run") {
 
     // macOS sysctl is already clean.
     CHECK(dotted_numeric("15.5") == "15.5");
-    // A Linux kernel release carries a suffix. The trailing ".0" is then
-    // dropped by the patch-zero rule below, so this lands on "6.8".
-    CHECK(dotted_numeric("6.8.0-45-generic") == "6.8");
+    // A Linux kernel release carries a suffix; only the leading run is kept.
+    CHECK(dotted_numeric("6.8.0-45-generic") == "6.8.0");
     // Windows wraps the number in prose that may be localized.
     CHECK(dotted_numeric("Microsoft Windows [Version 10.0.22631.3737]")
           == "10.0.22631.3737");
@@ -119,18 +118,21 @@ TEST_CASE("device_info: dotted_numeric extracts the first well-formed run") {
     CHECK(dotted_numeric("15.") == "15");
 }
 
-TEST_CASE("device_info: a trailing patch zero is dropped to match the Swift SDK") {
+TEST_CASE("device_info: a patch zero is preserved, matching Rust and Swift") {
     using keylight::detail::dotted_numeric;
 
-    // The SERVER does not strip a patch zero — "15.5.0" stays "15.5.0". The
-    // Swift SDK strips it before sending. If C++ did not, the same Mac would
-    // land in two different os_version buckets depending on which SDK the app
-    // was built with, which makes the dashboard's OS breakdown meaningless.
-    CHECK(dotted_numeric("15.5.0")  == "15.5");
-    CHECK(dotted_numeric("14.0")    == "14");
-    // Only a trailing zero, and only one: 10.0.19045 is a real Windows build.
+    // The macOS read (`kern.osproductversion`) returns exactly the string
+    // `sw_vers -productVersion` prints, which is the value keylight-rust
+    // sends verbatim. keylight-swift drops the patch component only when it
+    // is zero AND there are three components, so macOS 15.0 reaches the
+    // server as "15.0" there too. Stripping a trailing ".0" here would put
+    // C++ on "15" while Rust and Swift sent "15.0" — it splits one
+    // population across two os_version buckets on every x.0 release, which
+    // is the opposite of the parity it was meant to buy.
+    CHECK(dotted_numeric("15.5.0")     == "15.5.0");
+    CHECK(dotted_numeric("14.0")       == "14.0");
     CHECK(dotted_numeric("10.0.19045") == "10.0.19045");
-    CHECK(dotted_numeric("6.8.0-45-generic") == "6.8");
+    CHECK(dotted_numeric("6.8.0-45-generic") == "6.8.0");
 }
 
 TEST_CASE("device_info: dotted_numeric rejects rather than repairs") {
