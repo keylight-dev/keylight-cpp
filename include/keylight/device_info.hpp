@@ -28,11 +28,16 @@
 #if defined(__APPLE__)
 #  include <sys/types.h>
 #  include <sys/sysctl.h>
+#  include <unistd.h>
 #elif defined(_WIN32) || defined(_WIN64)
 #  include <windows.h>
 #else
 #  include <unistd.h>
+#  include <sys/utsname.h>
 #endif
+
+#include <cctype>
+#include <string>
 
 namespace keylight {
 namespace detail {
@@ -103,6 +108,113 @@ inline const char* current_arch() {
 #else
     return "";
 #endif
+}
+
+// Server cap for os_version (zod `z.string().max(32)`).
+inline constexpr size_t OS_VERSION_MAX = 32;
+
+// Extract the first dotted-numeric run (\d+(\.\d+)*) from a raw OS string.
+//
+// Handles every shape the per-OS reads produce: the macOS sysctl is already
+// clean ("15.5"), a Linux kernel release carries a suffix ("6.8.0-45-generic"),
+// and the Windows version is assembled from three numbers. A trailing dot is
+// dropped; a run over the server's cap is REJECTED rather than truncated —
+// truncation would mint a fake version bucket out of a client bug.
+//
+// Pure. Mirrors keylight-rust telemetry::dotted_numeric.
+inline std::string dotted_numeric(const std::string& raw) {
+    size_t start = raw.find_first_of("0123456789");
+    if (start == std::string::npos) return {};
+
+    size_t end = start;
+    while (end < raw.size()) {
+        unsigned char c = static_cast<unsigned char>(raw[end]);
+        if (!std::isdigit(c) && raw[end] != '.') break;
+        ++end;
+    }
+
+    std::string v = raw.substr(start, end - start);
+    while (!v.empty() && v.back() == '.') v.pop_back();
+
+    // Drop a trailing ".0" for parity with the Swift SDK, which does this
+    // before sending. The server does NOT normalize it away, so without this
+    // the same Mac reports "15.5" from Swift and "15.5.0" from C++ and the
+    // dashboard's OS breakdown splits one population across two buckets.
+    if (v.size() >= 2 && v.compare(v.size() - 2, 2, ".0") == 0) {
+        v.erase(v.size() - 2);
+    }
+
+    if (v.empty() || v.size() > OS_VERSION_MAX) return {};
+
+    // Every dot-separated component must be non-empty. The scan above already
+    // guarantees each character is a digit or a dot, so this is the only
+    // remaining way to be malformed ("1..2").
+    size_t i = 0;
+    while (i <= v.size()) {
+        size_t dot  = v.find('.', i);
+        size_t stop = (dot == std::string::npos) ? v.size() : dot;
+        if (stop == i) return {};
+        if (dot == std::string::npos) break;
+        i = dot + 1;
+    }
+    return v;
+}
+
+// Raw per-platform OS version read. NEVER spawns a process: this SDK ships
+// inside JUCE plugins and Unreal, and a sandboxed AU/VST3 host may block
+// process spawn. keylight-rust shells out to `sw_vers` / `cmd /c ver`; this is
+// the same output by a different mechanism. Returns "" on any failure.
+inline std::string read_os_version_raw() {
+#if defined(__APPLE__)
+    char   buf[64];
+    size_t len = sizeof(buf);
+    if (::sysctlbyname("kern.osproductversion", buf, &len, nullptr, 0) != 0) {
+        return {};
+    }
+    // sysctlbyname reports the length INCLUDING the NUL terminator.
+    return std::string(buf, len > 0 ? len - 1 : 0);
+#elif defined(_WIN32) || defined(_WIN64)
+    // GetVersionEx lies for unmanifested apps; RtlGetVersion does not. The
+    // struct is declared locally so this header needs no <winternl.h> — the
+    // layout is RTL_OSVERSIONINFOW's, which is ABI-stable.
+    struct KlOsVersionInfoW {
+        ULONG dwOSVersionInfoSize;
+        ULONG dwMajorVersion;
+        ULONG dwMinorVersion;
+        ULONG dwBuildNumber;
+        ULONG dwPlatformId;
+        WCHAR szCSDVersion[128];
+    };
+    using RtlGetVersionFn = LONG(WINAPI*)(KlOsVersionInfoW*);
+
+    HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll) return {};
+    auto fn = reinterpret_cast<RtlGetVersionFn>(
+        reinterpret_cast<void*>(::GetProcAddress(ntdll, "RtlGetVersion")));
+    if (!fn) return {};
+
+    KlOsVersionInfoW vi{};
+    vi.dwOSVersionInfoSize = sizeof(vi);
+    if (fn(&vi) != 0) return {};
+    return std::to_string(vi.dwMajorVersion) + "." +
+           std::to_string(vi.dwMinorVersion) + "." +
+           std::to_string(vi.dwBuildNumber);
+#else
+    // Kernel release ("6.8.0-45-generic") — the one version every Linux has.
+    // Distro versions live in /etc/os-release but are not comparable across
+    // distros, and the kernel is what OS-level behavior actually tracks.
+    struct utsname u{};
+    if (::uname(&u) != 0) return {};
+    return std::string(u.release);
+#endif
+}
+
+// Normalized OS version, or "" when the platform read fails or yields nothing
+// dotted-numeric. Read once per process — the value cannot change while the
+// app runs, and on Windows this costs a GetProcAddress.
+inline std::string detect_os_version() {
+    static const std::string cached = dotted_numeric(read_os_version_raw());
+    return cached;
 }
 
 } // namespace detail

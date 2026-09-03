@@ -103,3 +103,50 @@ TEST_CASE("device_info: current_arch is non-empty on the CI architectures") {
     CHECK(std::string(keylight::detail::current_arch()).empty() == false);
 #endif
 }
+
+TEST_CASE("device_info: dotted_numeric extracts the first well-formed run") {
+    using keylight::detail::dotted_numeric;
+
+    // macOS sysctl is already clean.
+    CHECK(dotted_numeric("15.5") == "15.5");
+    // A Linux kernel release carries a suffix. The trailing ".0" is then
+    // dropped by the patch-zero rule below, so this lands on "6.8".
+    CHECK(dotted_numeric("6.8.0-45-generic") == "6.8");
+    // Windows wraps the number in prose that may be localized.
+    CHECK(dotted_numeric("Microsoft Windows [Version 10.0.22631.3737]")
+          == "10.0.22631.3737");
+    // A trailing dot is dropped rather than sent.
+    CHECK(dotted_numeric("15.") == "15");
+}
+
+TEST_CASE("device_info: a trailing patch zero is dropped to match the Swift SDK") {
+    using keylight::detail::dotted_numeric;
+
+    // The SERVER does not strip a patch zero — "15.5.0" stays "15.5.0". The
+    // Swift SDK strips it before sending. If C++ did not, the same Mac would
+    // land in two different os_version buckets depending on which SDK the app
+    // was built with, which makes the dashboard's OS breakdown meaningless.
+    CHECK(dotted_numeric("15.5.0")  == "15.5");
+    CHECK(dotted_numeric("14.0")    == "14");
+    // Only a trailing zero, and only one: 10.0.19045 is a real Windows build.
+    CHECK(dotted_numeric("10.0.19045") == "10.0.19045");
+    CHECK(dotted_numeric("6.8.0-45-generic") == "6.8");
+}
+
+TEST_CASE("device_info: dotted_numeric rejects rather than repairs") {
+    using keylight::detail::dotted_numeric;
+
+    CHECK(dotted_numeric("").empty());
+    CHECK(dotted_numeric("no digits here").empty());
+    // An empty component is malformed, not something to patch up.
+    CHECK(dotted_numeric("1..2").empty());
+    // Over the server's 32-char cap: rejected, never truncated. Truncating
+    // would mint a fake version bucket out of a client bug.
+    CHECK(dotted_numeric("1.2.3.4.5.6.7.8.9.10.11.12.13.14.15.16").empty());
+}
+
+TEST_CASE("device_info: detect_os_version is dotted-numeric or empty") {
+    std::string v = keylight::detail::detect_os_version();
+    CHECK(v == keylight::detail::dotted_numeric(v));
+    CHECK(v.size() <= 32);
+}
