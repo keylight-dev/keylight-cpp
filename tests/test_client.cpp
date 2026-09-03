@@ -1255,7 +1255,10 @@ TEST_CASE("Client: a lease older than maxOfflineDays does not survive a relaunch
     FailingTransport offline;
     Client relaunched(cfg, offline, store, [&]{ return three_days_later; });
 
-    CHECK(relaunched.state() != State::Licensed);
+    // Exactly Expired: `!= Licensed` would also pass for Invalid, Trial or
+    // FreeTier, and a lease aged out of the offline bound is not the same
+    // outcome as a lease that never verified.
+    CHECK(relaunched.state() == State::Expired);
 }
 
 TEST_CASE("Client: a lease within maxOfflineDays survives a relaunch") {
