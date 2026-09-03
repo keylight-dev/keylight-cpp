@@ -475,6 +475,48 @@ inline std::string detect_os_version() {
     return cached;
 }
 
+// Longest instance_name this SDK will send. The server schema is
+// `z.string().min(1)` with no maximum, so this cap is ours: a hostname is
+// user-controlled input and an unbounded one has no business on the wire.
+inline constexpr size_t INSTANCE_NAME_MAX = 64;
+
+// Strip control characters, trim trailing spaces, cap the length. Pure.
+inline std::string sanitize_instance_name(std::string s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        unsigned char u = static_cast<unsigned char>(c);
+        if (u >= 0x20 && u != 0x7f) out += c;
+    }
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    if (out.size() > INSTANCE_NAME_MAX) out.resize(INSTANCE_NAME_MAX);
+    return out;
+}
+
+// Best-effort human-readable machine name for the activation's instance_name.
+// This is what a customer sees in their device list, so a real hostname beats
+// a constant. Returns "" on failure; the caller supplies the fallback.
+inline std::string detect_machine_name() {
+#if defined(_WIN32) || defined(_WIN64)
+    wchar_t buf[MAX_COMPUTERNAME_LENGTH + 1];
+    DWORD   len = static_cast<DWORD>(sizeof(buf) / sizeof(buf[0]));
+    if (!::GetComputerNameW(buf, &len)) return {};
+    // Hostnames are ASCII in practice; anything outside it is dropped rather
+    // than mangled into a lossy multi-byte guess.
+    std::string out;
+    for (DWORD i = 0; i < len; ++i) {
+        wchar_t c = buf[i];
+        if (c > 0 && c < 128) out += static_cast<char>(c);
+    }
+    return sanitize_instance_name(out);
+#else
+    char buf[256];
+    if (::gethostname(buf, sizeof(buf)) != 0) return {};
+    buf[sizeof(buf) - 1] = '\0';
+    return sanitize_instance_name(std::string(buf));
+#endif
+}
+
 } // namespace detail
 } // namespace keylight
 
@@ -2231,9 +2273,15 @@ public:
     /// State::Invalid is returned (no exception thrown).
     Result<State> activate(const std::string& key) {
         // Build activate request body
+        // A real hostname, not a constant: this string is what the customer
+        // sees in their device list. "device" survives only as the fallback
+        // when the platform read fails.
+        std::string instance_name = detail::detect_machine_name();
+        if (instance_name.empty()) instance_name = "device";
+
         std::vector<std::pair<std::string, std::string>> fields{
             {"license_key",   json_str(key)},
-            {"instance_name", json_str("device")},
+            {"instance_name", json_str(instance_name)},
         };
         append_attribution_fields_(fields, /*include_instance_id=*/true);
         std::string body = build_json_(std::move(fields), true /*telemetry*/);
@@ -2904,6 +2952,18 @@ private:
             const char* mem = detail::memory_bucket(detail::detect_physical_memory_bytes());
             if (mem[0] != '\0') {
                 fields.push_back({"memory", json_str(mem)});
+            }
+            // Phase-3 device dimensions. Both are omitted entirely when the
+            // platform cannot report them — never a placeholder. device_class
+            // is deliberately absent: the server derives it, and inventing one
+            // here would fight that.
+            std::string osv = detail::detect_os_version();
+            if (!osv.empty()) {
+                fields.push_back({"os_version", json_str(osv)});
+            }
+            const char* arch = detail::current_arch();
+            if (arch[0] != '\0') {
+                fields.push_back({"arch", json_str(arch)});
             }
         }
 

@@ -209,9 +209,15 @@ public:
     /// State::Invalid is returned (no exception thrown).
     Result<State> activate(const std::string& key) {
         // Build activate request body
+        // A real hostname, not a constant: this string is what the customer
+        // sees in their device list. "device" survives only as the fallback
+        // when the platform read fails.
+        std::string instance_name = detail::detect_machine_name();
+        if (instance_name.empty()) instance_name = "device";
+
         std::vector<std::pair<std::string, std::string>> fields{
             {"license_key",   json_str(key)},
-            {"instance_name", json_str("device")},
+            {"instance_name", json_str(instance_name)},
         };
         append_attribution_fields_(fields, /*include_instance_id=*/true);
         std::string body = build_json_(std::move(fields), true /*telemetry*/);

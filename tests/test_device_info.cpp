@@ -150,3 +150,13 @@ TEST_CASE("device_info: detect_os_version is dotted-numeric or empty") {
     CHECK(v == keylight::detail::dotted_numeric(v));
     CHECK(v.size() <= 32);
 }
+
+TEST_CASE("device_info: sanitize_instance_name strips control chars and caps length") {
+    using keylight::detail::sanitize_instance_name;
+
+    CHECK(sanitize_instance_name("studio-imac") == "studio-imac");
+    CHECK(sanitize_instance_name("name\twith\nctl") == "namewithctl");
+    CHECK(sanitize_instance_name("trailing   ") == "trailing");
+    CHECK(sanitize_instance_name(std::string(200, 'x')).size() == 64);
+    CHECK(sanitize_instance_name("").empty());
+}

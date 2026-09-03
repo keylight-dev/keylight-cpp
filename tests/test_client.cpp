@@ -1027,3 +1027,24 @@ TEST_CASE("Client: activate sends os_version and arch when detectable") {
     // device_class is NEVER sent from this SDK: the server derives it.
     CHECK(body.find("\"device_class\"") == std::string::npos);
 }
+
+TEST_CASE("Client: activate sends a real instance_name, not the literal 'device'") {
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; });
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    CHECK(transport.last_request_body.find("\"instance_name\"") != std::string::npos);
+
+    // On any machine that can report a hostname the field must carry it.
+    // "device" survives only as the fallback when the read fails, so this
+    // asserts against the machine's actual name rather than a fixed string.
+    std::string host = keylight::detail::detect_machine_name();
+    if (!host.empty()) {
+        CHECK(transport.last_request_body.find(host) != std::string::npos);
+    }
+}

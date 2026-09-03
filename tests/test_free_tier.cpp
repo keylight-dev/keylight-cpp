@@ -631,5 +631,13 @@ TEST_CASE("Attribution: activate still sends its original fields") {
     const auto* call = transport.last_call_for("activate");
     REQUIRE(call != nullptr);
     CHECK(call->body.find("\"license_key\":\"KL-TEST-KEY\"") != std::string::npos);
-    CHECK(call->body.find("\"instance_name\":\"device\"")    != std::string::npos);
+    CHECK(call->body.find("\"instance_name\"") != std::string::npos);
+
+    // instance_name now carries the real machine name; "device" survives
+    // only as the fallback when the platform read fails. Assert against the
+    // detected value at runtime rather than a fixed string (see
+    // keylight::detail::detect_machine_name).
+    std::string host = keylight::detail::detect_machine_name();
+    std::string expected_name = host.empty() ? "device" : host;
+    CHECK(call->body.find("\"instance_name\":\"" + expected_name + "\"") != std::string::npos);
 }
