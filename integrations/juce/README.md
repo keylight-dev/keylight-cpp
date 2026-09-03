@@ -161,18 +161,19 @@ cfg.freeTierEnabled = true;
 ...
 switch (licensing.state())
 {
-    case keylight::State::Licensed: /* everything */            break;
+    case keylight::State::Licensed: /* everything */             break;
     case keylight::State::Trial:    /* everything, time-boxed */ break;
+    case keylight::State::Limited:  /* degraded, not locked */   break;
     case keylight::State::FreeTier: /* reduced feature set */    break;
     case keylight::State::Expired:
     case keylight::State::Invalid:  /* paywall */                break;
 }
 ```
 
-**`State::FreeTier` is a new enumerator.** An exhaustive `switch` over
-`keylight::State` compiled with `-Werror=switch` will stop building until you
-add the case. It is appended after `Invalid`, so the existing values do not
-renumber.
+**`State::FreeTier` and `State::Limited` are new enumerators.** An exhaustive
+`switch` over `keylight::State` compiled with `-Werror=switch` will stop
+building until you add both cases. They are appended after `Invalid`, so the
+existing values do not renumber.
 
 #### The keyless beacon
 

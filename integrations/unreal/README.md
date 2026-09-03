@@ -180,8 +180,13 @@ KL->Client_->startAutoValidation();  // internal — see note below
 | `Configure()`                        | Game thread only     |
 | `Activate()` / `Validate()` / `Deactivate()` | Game thread (returns immediately, dispatches async) |
 | `OnActivateComplete` delegate fires  | **Game thread** always |
-| `GetState()`                         | Any thread (atomic read) |
+| `GetState()`                         | Any thread (atomic reads, no lock) |
 | `HasEntitlement()`                   | Any thread (mutex-guarded read) |
+
+`GetState()` forwards to `keylight::Client::state()`, which is `noexcept` and
+calls the clock function the `Client` was constructed with. The default
+(`std::time`) is non-throwing, non-blocking and allocation-free; if you supply
+your own it must be too, or the "any thread" guarantee no longer holds.
 
 `FHttpTransport::request()` is called on a UE background worker thread and
 blocks that thread (via `FEvent::Wait()`) until the HTTP response arrives.

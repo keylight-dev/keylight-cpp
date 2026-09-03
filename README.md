@@ -21,8 +21,8 @@ Licensing shouldn't mean bolting a heavyweight, phone-home-or-die SDK onto your 
   network round-trip to gate a feature, no lockout when the machine is offline.
 - **Tamper-resistant by design.** Entitlements live *inside* the signature; a forged or hand-edited
   lease can't pass verification without the tenant's private key.
-- **Audio-thread safe.** `state()` reads a `std::atomic` — safe to call from JUCE audio callbacks
-  or game-thread hot paths with no lock taken.
+- **Audio-thread safe.** `state()` reads atomics only — safe to call from JUCE audio callbacks
+  or game-thread hot paths with no lock taken and nothing allocated.
 - **One SDK family.** Verifies licenses identically to the Swift, Rust, JavaScript, and C# SDKs,
   proven by shared conformance vectors.
 - **Header-only core.** Drop in `keylight_single.hpp` or use CMake FetchContent — zero mandatory
@@ -160,7 +160,7 @@ int main() {
         // seat locked to this device
     }
 
-    // 7. Gate features on entitlements — reads std::atomic, audio-thread safe.
+    // 7. Gate features on entitlements — mutex-guarded, NOT audio-thread safe.
     if (client.hasEntitlement("pro")) {
         // unlock pro features
     }
@@ -232,7 +232,7 @@ Compiles against JUCE 7 and JUCE 8 with zero extra dependencies beyond `juce_cor
 |--------|-------------|
 | `activate(key) → Result<State>` | Activates a key on this device. Verifies the returned lease before persisting. |
 | `validate() → Result<State>` | Re-checks the stored license online. Network failures are non-fatal (grace window applies). |
-| `deactivate() → Result<void>` | Releases the seat and clears local license state, even if the network call fails. |
+| `deactivate() → Result<void>` | Releases the seat and clears local license state. The local cache is cleared either way, but a server rejection is returned as an error: the seat is still consumed and only you can decide to retry. |
 | `refreshIfNeeded() → Result<State>` | Validates only if due (debounce 5 min, stale 6 h, within 24 h of expiry). With no stored license it re-resolves the local trial offline. Safe to call often. |
 | `checkOnLaunch() → Result<State>` | Revalidates a stored license; otherwise resolves the persisted local trial offline. Never starts a trial. |
 | `startTrial() → Result<State>` | Explicitly begins the local trial (idempotent; never restarts one). No network call. |
@@ -242,25 +242,32 @@ Compiles against JUCE 7 and JUCE 8 with zero extra dependencies beyond `juce_cor
 ## License States
 
 `state()` resolves a single high-level status from the cached, Ed25519-verified lease (no network
-call). It reads a `std::atomic<State>` and is safe to call from any thread.
+call). It reads atomics only and is safe to call from any thread.
 
 | State | Meaning |
 |-------|---------|
 | `Licensed` | Current, signature-valid `active` lease. |
 | `Trial` | No license, but a local trial is active. |
-| `Expired` | Trusted lease expired, or lease status is `"fallback"` / `"expired"`. |
-| `Invalid` | No trusted lease, no active trial, and no free tier. |
+| `Limited` | Trusted lease with status `"fallback"`: the server could not mint a full lease, so run degraded rather than locked. |
+| `Expired` | Trusted lease expired, or lease status is `"expired"`. |
+| `Invalid` | No trusted lease, no active trial, and no free tier. Also what `state()` reports when the system clock has been rolled back more than an hour since the last server contact. |
 | `FreeTier` | No license and no active trial, but `freeTierEnabled` is set. Also where an **elapsed** trial and a `deactivate()` land. |
 
 ```cpp
 switch (client.state()) {
-    case keylight::State::Licensed: /* full access */    break;
-    case keylight::State::Trial:    /* show trial UI */  break;
+    case keylight::State::Licensed: /* full access */      break;
+    case keylight::State::Trial:    /* show trial UI */    break;
+    case keylight::State::Limited:  /* degraded, not locked */ break;
     case keylight::State::FreeTier: /* reduced features */ break;
     case keylight::State::Expired:
-    case keylight::State::Invalid:  /* prompt activate */ break;
+    case keylight::State::Invalid:  /* prompt activate */  break;
 }
 ```
+
+`state()` is `noexcept` and audio-thread safe, and it calls the clock function you pass to the
+`Client` constructor. If you supply your own, it must be non-throwing, non-blocking and
+allocation-free — an exception escaping it is `std::terminate`, on whichever thread called
+`state()`. The default (`std::time`) already satisfies this.
 
 ## Trials
 
@@ -297,8 +304,8 @@ Rules the state machine guarantees:
   instantiate a plugin without the user ever asking for a trial.
 - **`startTrial()` is idempotent.** An existing start timestamp is never
   overwritten, so an elapsed trial cannot be restarted.
-- **A running trial elapses on its own.** `state()` is an atomic read, so it
-  never recomputes; `checkOnLaunch()` and `refreshIfNeeded()` re-resolve the
+- **A running trial elapses on its own.** `state()` reads a cached snapshot, so
+  it never recomputes; `checkOnLaunch()` and `refreshIfNeeded()` re-resolve the
   trial (offline, no request) and notify subscribers, and
   `startAutoValidation()` ticks the latter for long-running hosts.
 - **Paid licensing always wins.** Activating during a trial resolves
