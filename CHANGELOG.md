@@ -1,3 +1,58 @@
+## [0.1.6] - 2026-09-03
+
+### Added
+
+- **Free tier.** Set `Config::freeTierEnabled` and a device with no license and
+  no active trial resolves the new `State::FreeTier` instead of `Invalid`.
+  Resolution order is: valid paid license → active trial → free tier → elapsed
+  trial → `Invalid`, matching `keylight-rust`'s `resolve_state()`.
+- **`Client::reportKeylessState(KeylessState)`** — the anonymous keyless
+  beacon, powering the *trials started → converted / in free tier / expired*
+  funnel. Debounced to one request per 24 hours per state, with a state change
+  always sending. The debounce is armed only on HTTP 200, so a failed beacon
+  retries rather than suppressing reporting for a day. Fire-and-forget: errors
+  are swallowed and the resolved state never changes. Blocking — never call it
+  from an audio thread.
+- **`KeylessState`** (`Trial` / `FreeTier` / `Expired`) with the wire strings
+  `trial` / `free_tier` / `expired`, shared with every other Keylight SDK.
+- **`Client::freeTierInstanceId()`** — a random, persisted, per-install id used
+  for anonymous reporting. `startTrial()` now mints one too, so a trial that
+  converts to paid can be attributed.
+- **`machine_hash`** — where the OS exposes a stable machine identifier, a
+  one-way SHA-256 of it is attached to the keyless beacon and to
+  `activate`/`validate`, so a device that converts is counted once rather than
+  twice. Read via IOKit on macOS, the registry on Windows and `/etc/machine-id`
+  on Linux. Where no such identifier exists the field is omitted entirely — a
+  random value is never substituted. `deactivate` sends neither field.
+- **JUCE:** `Licensing::reportKeylessState()`, and automatic reporting on every
+  state transition. The core SDK never reports on its own.
+
+### Changed
+
+- **`State::FreeTier` is a new enumerator.** An exhaustive `switch` over
+  `keylight::State` compiled with `-Werror=switch` will not build until you add
+  the case. It is appended after `Invalid`, so existing enumerator values do not
+  change.
+- **With `freeTierEnabled`, an elapsed trial now resolves `FreeTier` rather than
+  `Expired`,** and `deactivate()` lands on `FreeTier` rather than the paywall.
+  Products leaving the flag at its `false` default are unaffected.
+- **The core now links two system frameworks** — IOKit + CoreFoundation on
+  macOS, advapi32 on Windows, nothing on Linux — to read the machine
+  identifier. CMake adds them automatically; single-header users must add the
+  link line themselves. There are still no third-party dependencies.
+
+### Fixed
+
+- **`tests/test_amalgamation.cpp` was passing vacuously in any build defining
+  `NDEBUG`.** It checks everything with bare `assert()`, so a Release build
+  compiled every check away. CI builds Debug and was genuinely asserting, but
+  the release workflow builds Release — the release gate had been weaker than
+  the PR gate. Now immune to `NDEBUG`.
+- **`demo/notes` reported `"Unknown"` for new license states.** No compiler
+  warning flags were configured at all, so a missing `switch` case was silent.
+  `-Wall -Wswitch-enum` is now enabled on this repo's own targets (never on the
+  `keylight` INTERFACE target, which would force flags onto consumers).
+
 ## [0.1.5] - 2026-09-03
 
 ### Fixed

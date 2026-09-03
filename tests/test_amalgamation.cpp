@@ -18,6 +18,7 @@
 #undef NDEBUG
 #include <cassert>
 #include <iostream>
+#include <optional>
 #include <string>
 
 // ---------------------------------------------------------------------------
@@ -28,19 +29,23 @@ struct FakeTransport : keylight::Transport {
     std::string canned_body;
     int         canned_status = 200;
 
-    // Headers of the most recent request (used by the SDK-key auth check).
+    // The most recent request (used by the SDK-key auth and keyless checks).
     std::map<std::string, std::string> last_headers;
+    std::string                        last_url;
+    std::string                        last_body;
 
     explicit FakeTransport(std::string body = "{}", int status = 200)
         : canned_body(std::move(body)), canned_status(status) {}
 
     keylight::Result<keylight::HttpResponse> request(
         const std::string& /*method*/,
-        const std::string& /*url*/,
+        const std::string& url,
         const std::map<std::string, std::string>& headers,
-        const std::string& /*body*/) override
+        const std::string& body) override
     {
         last_headers = headers;
+        last_url     = url;
+        last_body    = body;
         keylight::HttpResponse resp;
         resp.status = canned_status;
         resp.body   = canned_body;
@@ -189,6 +194,40 @@ static void test_sdk_key_header() {
     std::cout << "  X-Keylight-SDK-Key header: ok\n";
 }
 
+static void test_free_tier_and_keyless() {
+    keylight::Config cfg;
+    cfg.tenantId        = "testco";
+    cfg.productId       = "testapp";
+    cfg.sdkKey          = "sdk_live_single_header";
+    cfg.freeTierEnabled = true;
+
+    FakeTransport transport(R"({})");
+    FakeStore     store;
+
+    // Injected hardware id so the canonical cross-SDK vector is reachable from
+    // the shipped single header, not just the split headers.
+    keylight::Client client(
+        cfg, transport, store,
+        []{ return static_cast<int64_t>(1781076256LL); },
+        []() -> std::optional<std::string> { return std::string("hardware-1"); });
+
+    auto launched = client.checkOnLaunch();
+    assert(launched.is_ok() && "checkOnLaunch must succeed");
+    assert(launched.value() == keylight::State::FreeTier &&
+           "free tier enabled with no licence must resolve FreeTier");
+
+    client.reportKeylessState(keylight::KeylessState::FreeTier);
+    assert(transport.last_url.find("/testco/testapp/keyless") != std::string::npos &&
+           "beacon must POST to the keyless route");
+    assert(transport.last_body.find("\"state\":\"free_tier\"") != std::string::npos &&
+           "beacon must carry the free_tier wire string");
+    assert(transport.last_body.find(
+               "8e8871112f28cabda180ada131d0b4f4f07c72fb47c5d884edbe32812885b22a")
+           != std::string::npos && "beacon must carry the canonical machine_hash");
+
+    std::cout << "  Free tier + keyless beacon: ok\n";
+}
+
 static void test_local_trial() {
     keylight::Config cfg;
     cfg.tenantId          = "acme";
@@ -249,6 +288,7 @@ int main() {
     test_client_initial_state();
     test_sdk_key_header();
     test_local_trial();
+    test_free_tier_and_keyless();
     test_json_parse();
 
     std::cout << "test_amalgamation: ALL PASSED\n";

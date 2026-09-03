@@ -11,7 +11,7 @@ plugins, and audio tools with online activation and offline Ed25519 license veri
 > **In one line:** a software-licensing SDK for C++ — license-key activation and validation,
 > entitlement/feature gating, trials, and tamper-resistant **offline license verification** (signed
 > `v3` lease, Ed25519 + clock-skew tolerance) for desktop apps, Unreal Engine 5 plugins, and
-> JUCE audio applications. Header-only core, C++17, no mandatory external dependencies.
+> JUCE audio applications. Header-only core, C++17, no third-party dependencies.
 
 ## Why Keylight
 
@@ -59,14 +59,18 @@ include(FetchContent)
 FetchContent_Declare(
   keylight
   GIT_REPOSITORY https://github.com/keylight-dev/keylight-cpp.git
-  GIT_TAG        v0.1.5
+  GIT_TAG        v0.1.6
 )
 FetchContent_MakeAvailable(keylight)
 
 target_link_libraries(my_app PRIVATE keylight::keylight)
 ```
 
-The core library (`keylight::keylight`) is interface-only — **no external dependencies**. To enable
+The core library (`keylight::keylight`) is interface-only and pulls in **no third-party
+dependencies**. It does link two system frameworks so it can read the OS machine identifier for
+free-tier device de-duplication: **IOKit + CoreFoundation** on macOS and **advapi32** on Windows
+(nothing on Linux). CMake adds these for you. If you use the
+[single header](#single-header-drop-in) you must add that link line yourself. To enable
 the bundled [cpp-httplib](https://github.com/yhirose/cpp-httplib) transport (requires OpenSSL):
 
 ```cmake
@@ -104,7 +108,7 @@ vcpkg install "keylight[httplib-transport]"
 ### Conan
 
 ```bash
-conan install keylight/0.1.5@
+conan install keylight/0.1.6@
 ```
 
 > Conan Center submission is planned for a future release.
@@ -245,12 +249,14 @@ call). It reads a `std::atomic<State>` and is safe to call from any thread.
 | `Licensed` | Current, signature-valid `active` lease. |
 | `Trial` | No license, but a local trial is active. |
 | `Expired` | Trusted lease expired, or lease status is `"fallback"` / `"expired"`. |
-| `Invalid` | No trusted lease and no active trial. |
+| `Invalid` | No trusted lease, no active trial, and no free tier. |
+| `FreeTier` | No license and no active trial, but `freeTierEnabled` is set. Also where an **elapsed** trial and a `deactivate()` land. |
 
 ```cpp
 switch (client.state()) {
     case keylight::State::Licensed: /* full access */    break;
     case keylight::State::Trial:    /* show trial UI */  break;
+    case keylight::State::FreeTier: /* reduced features */ break;
     case keylight::State::Expired:
     case keylight::State::Invalid:  /* prompt activate */ break;
 }
@@ -310,6 +316,46 @@ State priority: valid paid license → active local trial → elapsed local tria
 > trial is a convenience, and a backwards clock jump is clamped rather than
 > credited.
 
+## Free Tier
+
+Set `freeTierEnabled` and a device with no license and no active trial resolves
+`State::FreeTier` rather than `Invalid`:
+
+```cpp
+cfg.freeTierEnabled = true;
+```
+
+Resolution order is: valid paid license → active trial → free tier → elapsed trial → `Invalid`.
+Two consequences, both matching the Rust and Swift SDKs:
+
+- An **elapsed** trial resolves `FreeTier`, not `Expired` — a lapsed trial drops to the free tier
+  rather than the paywall.
+- `deactivate()` lands on `FreeTier` for the same reason. Releasing a paid seat returns the user to
+  the tier they are still entitled to.
+
+### The keyless beacon
+
+`reportKeylessState()` sends an anonymous funnel signal so Keylight can show *trials started →
+converted / in free tier / expired*:
+
+```cpp
+client.reportKeylessState(keylight::KeylessState::FreeTier);  // or ::Trial / ::Expired
+```
+
+- **Nothing calls it for you.** `checkOnLaunch()` still makes no network request when no license is
+  stored, so a DAW scanning your plugin does not phone home. The
+  [JUCE adapter](integrations/juce/README.md) opts in on your behalf and reports on every state
+  transition; the core never does.
+- **Debounced** to one request per 24 hours per state; a state *change* always sends. The debounce
+  is recorded only on HTTP 200, so a failed beacon retries instead of going quiet for a day.
+- **Fire-and-forget.** Errors are swallowed, nothing is thrown, and the resolved state is unchanged.
+- **Blocking** — never call it from an audio thread.
+
+What it sends: a random per-install id (`freeTierInstanceId()`, persisted alongside the lease), the
+state string, and — only where the OS exposes a stable machine identifier — `machine_hash`, a
+one-way SHA-256 of it. Never a license key, never a raw device id. Where no such identifier exists
+the field is omitted entirely rather than substituting a random value.
+
 ## Entitlements
 
 Entitlements are feature keys carried inside the signed lease and checked offline:
@@ -350,6 +396,7 @@ Populate a `keylight::Config` struct:
 | `maxOfflineDays` | `int` | `7` | Offline grace window since last online validation. Set `0` to run offline as long as the lease itself is current. |
 | `keyPrefix` | `std::string` | — | Client-side key-format check (e.g. `"PROD"`). |
 | `trialDurationDays` | `int` | `0` | Local trial length in days (0 = trials disabled). See [Trials](#trials). |
+| `freeTierEnabled` | `bool` | `false` | Resolve `State::FreeTier` instead of `Invalid`/`Expired` when there is no license and no active trial. See [Free Tier](#free-tier). |
 | `apiBaseUrl` | `std::string` | `https://api.keylight.dev` | Keylight API base URL. |
 | `appVersion` | `std::string` | — | Reported in activation/validation telemetry. |
 | `autoValidationIntervalMs` | `int` | `1800000` | Background auto-validation interval (ms); used only when `startAutoValidation()` is called. |

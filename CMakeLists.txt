@@ -66,7 +66,10 @@ if(KEYLIGHT_BUILD_HTTPLIB_TRANSPORT)
   target_compile_definitions(keylight_httplib_transport INTERFACE
     CPPHTTPLIB_OPENSSL_SUPPORT
     KEYLIGHT_BUILD_HTTPLIB_TRANSPORT)
-  target_include_directories(keylight_httplib_transport INTERFACE
+  # SYSTEM so the vendored cpp-httplib header does not emit warnings under the
+  # -Wswitch-enum we enable on our own targets. It is third-party code; we do
+  # not police its switches.
+  target_include_directories(keylight_httplib_transport SYSTEM INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party>)
 endif()
 

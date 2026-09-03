@@ -30,6 +30,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -39,7 +40,7 @@
 // include/keylight/version.hpp
 // ──────────────────────────────────────────────────────────────────────────
 
-#define KEYLIGHT_SDK_VERSION "0.1.5"
+#define KEYLIGHT_SDK_VERSION "0.1.6"
 
 // Identifies this SDK to the backend, sent as `sdk` alongside `platform`.
 // Server cap is 16 characters (zod `z.string().max(16)`).
@@ -239,6 +240,10 @@ struct Config {
     int         maxOfflineDays     = 15;
     std::string keyPrefix;
     int         trialDurationDays  = 0;
+    // Free tier: when true, a device with no license and no active trial
+    // resolves State::FreeTier instead of Invalid/Expired.  Parity with
+    // keylight-rust Config::free_tier_enabled.
+    bool        freeTierEnabled    = false;
     std::string apiBaseUrl         = "https://api.keylight.dev";
     std::string appVersion;        // optional; sent as telemetry in activate/validate
 
@@ -1582,6 +1587,333 @@ inline std::string default_store_path(const Config& cfg) {
 } // namespace keylight
 
 // ──────────────────────────────────────────────────────────────────────────
+// include/keylight/sha256.hpp
+// ──────────────────────────────────────────────────────────────────────────
+
+// Keylight SHA-256 — header-only, zero external dependencies.
+// Core transform adapted from Brad Conte's public-domain sha256.c
+// (https://github.com/B-Con/crypto-algorithms), CC0 / public domain.
+// Wrapped in namespace keylight; internals in anonymous namespace.
+//
+// PUBLIC UTILITY — standalone SHA-256 for integrators (e.g. hashing license
+// keys, building custom audit trails).  The core SDK verification path does
+// NOT use this header (Ed25519 uses SHA-512 internally); sha256.hpp is
+// therefore NOT part of keylight.hpp's include closure.
+// Include it directly when you need it:
+//   #include <keylight/sha256.hpp>
+
+
+namespace keylight {
+
+namespace {
+
+// ── SHA-256 constants ─────────────────────────────────────────────────────────
+
+static const uint32_t kK[64] = {
+    0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u,
+    0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
+    0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u,
+    0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u,
+    0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu,
+    0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau,
+    0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u,
+    0xc6e00bf3u, 0xd5a79147u, 0x06ca6351u, 0x14292967u,
+    0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu, 0x53380d13u,
+    0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u,
+    0xa2bfe8a1u, 0xa81a664bu, 0xc24b8b70u, 0xc76c51a3u,
+    0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u,
+    0x19a4c116u, 0x1e376c08u, 0x2748774cu, 0x34b0bcb5u,
+    0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu, 0x682e6ff3u,
+    0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u,
+    0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u,
+};
+
+// ── Bit-manipulation helpers ──────────────────────────────────────────────────
+
+inline uint32_t rotr32(uint32_t x, unsigned n) noexcept {
+    return (x >> n) | (x << (32u - n));
+}
+
+inline uint32_t ch(uint32_t e, uint32_t f, uint32_t g) noexcept {
+    return (e & f) ^ (~e & g);
+}
+
+inline uint32_t maj(uint32_t a, uint32_t b, uint32_t c) noexcept {
+    return (a & b) ^ (a & c) ^ (b & c);
+}
+
+inline uint32_t ep0(uint32_t a) noexcept {
+    return rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22);
+}
+
+inline uint32_t ep1(uint32_t e) noexcept {
+    return rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25);
+}
+
+inline uint32_t sig0(uint32_t x) noexcept {
+    return rotr32(x, 7) ^ rotr32(x, 18) ^ (x >> 3);
+}
+
+inline uint32_t sig1(uint32_t x) noexcept {
+    return rotr32(x, 17) ^ rotr32(x, 19) ^ (x >> 10);
+}
+
+// ── SHA-256 context ───────────────────────────────────────────────────────────
+
+struct Sha256Ctx {
+    uint8_t  data[64];
+    uint32_t datalen;
+    uint64_t bitlen;
+    uint32_t state[8];
+};
+
+inline void sha256_init(Sha256Ctx& ctx) noexcept {
+    ctx.datalen = 0;
+    ctx.bitlen  = 0;
+    ctx.state[0] = 0x6a09e667u;
+    ctx.state[1] = 0xbb67ae85u;
+    ctx.state[2] = 0x3c6ef372u;
+    ctx.state[3] = 0xa54ff53au;
+    ctx.state[4] = 0x510e527fu;
+    ctx.state[5] = 0x9b05688cu;
+    ctx.state[6] = 0x1f83d9abu;
+    ctx.state[7] = 0x5be0cd19u;
+}
+
+inline void sha256_transform(Sha256Ctx& ctx, const uint8_t* data) noexcept {
+    uint32_t a, b, c, d, e, f, g, h, t1, t2, m[64];
+
+    for (unsigned i = 0, j = 0; i < 16; ++i, j += 4)
+        m[i] = (static_cast<uint32_t>(data[j    ]) << 24)
+              | (static_cast<uint32_t>(data[j + 1]) << 16)
+              | (static_cast<uint32_t>(data[j + 2]) <<  8)
+              |  static_cast<uint32_t>(data[j + 3]);
+
+    for (unsigned i = 16; i < 64; ++i)
+        m[i] = sig1(m[i - 2]) + m[i - 7] + sig0(m[i - 15]) + m[i - 16];
+
+    a = ctx.state[0]; b = ctx.state[1]; c = ctx.state[2]; d = ctx.state[3];
+    e = ctx.state[4]; f = ctx.state[5]; g = ctx.state[6]; h = ctx.state[7];
+
+    for (unsigned i = 0; i < 64; ++i) {
+        t1 = h + ep1(e) + ch(e, f, g) + kK[i] + m[i];
+        t2 = ep0(a) + maj(a, b, c);
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
+    }
+
+    ctx.state[0] += a; ctx.state[1] += b; ctx.state[2] += c; ctx.state[3] += d;
+    ctx.state[4] += e; ctx.state[5] += f; ctx.state[6] += g; ctx.state[7] += h;
+}
+
+inline void sha256_update(Sha256Ctx& ctx, const uint8_t* data, size_t len) noexcept {
+    for (size_t i = 0; i < len; ++i) {
+        ctx.data[ctx.datalen++] = data[i];
+        if (ctx.datalen == 64) {
+            sha256_transform(ctx, ctx.data);
+            ctx.bitlen += 512;
+            ctx.datalen = 0;
+        }
+    }
+}
+
+inline void sha256_final(Sha256Ctx& ctx, uint8_t* hash) noexcept {
+    uint32_t i = ctx.datalen;
+
+    // Pad message
+    if (ctx.datalen < 56) {
+        ctx.data[i++] = 0x80u;
+        while (i < 56) ctx.data[i++] = 0x00u;
+    } else {
+        ctx.data[i++] = 0x80u;
+        while (i < 64) ctx.data[i++] = 0x00u;
+        sha256_transform(ctx, ctx.data);
+        for (unsigned k = 0; k < 56; ++k) ctx.data[k] = 0x00u;
+    }
+
+    // Append bit length (big-endian)
+    ctx.bitlen += static_cast<uint64_t>(ctx.datalen) * 8u;
+    ctx.data[63] = static_cast<uint8_t>( ctx.bitlen        & 0xffu);
+    ctx.data[62] = static_cast<uint8_t>((ctx.bitlen >>  8) & 0xffu);
+    ctx.data[61] = static_cast<uint8_t>((ctx.bitlen >> 16) & 0xffu);
+    ctx.data[60] = static_cast<uint8_t>((ctx.bitlen >> 24) & 0xffu);
+    ctx.data[59] = static_cast<uint8_t>((ctx.bitlen >> 32) & 0xffu);
+    ctx.data[58] = static_cast<uint8_t>((ctx.bitlen >> 40) & 0xffu);
+    ctx.data[57] = static_cast<uint8_t>((ctx.bitlen >> 48) & 0xffu);
+    ctx.data[56] = static_cast<uint8_t>((ctx.bitlen >> 56) & 0xffu);
+    sha256_transform(ctx, ctx.data);
+
+    // Produce big-endian digest bytes
+    for (unsigned j = 0; j < 4; ++j) {
+        hash[     j] = static_cast<uint8_t>((ctx.state[0] >> (24 - j * 8)) & 0xffu);
+        hash[ 4 + j] = static_cast<uint8_t>((ctx.state[1] >> (24 - j * 8)) & 0xffu);
+        hash[ 8 + j] = static_cast<uint8_t>((ctx.state[2] >> (24 - j * 8)) & 0xffu);
+        hash[12 + j] = static_cast<uint8_t>((ctx.state[3] >> (24 - j * 8)) & 0xffu);
+        hash[16 + j] = static_cast<uint8_t>((ctx.state[4] >> (24 - j * 8)) & 0xffu);
+        hash[20 + j] = static_cast<uint8_t>((ctx.state[5] >> (24 - j * 8)) & 0xffu);
+        hash[24 + j] = static_cast<uint8_t>((ctx.state[6] >> (24 - j * 8)) & 0xffu);
+        hash[28 + j] = static_cast<uint8_t>((ctx.state[7] >> (24 - j * 8)) & 0xffu);
+    }
+}
+
+static const char kHexChars[] = "0123456789abcdef";
+
+} // anonymous namespace
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+/// Hash `len` bytes at `data`; return raw 32-byte digest.
+inline std::array<uint8_t, 32> sha256_bytes(const uint8_t* data, size_t len) noexcept {
+    Sha256Ctx ctx;
+    sha256_init(ctx);
+    sha256_update(ctx, data, len);
+    std::array<uint8_t, 32> digest{};
+    sha256_final(ctx, digest.data());
+    return digest;
+}
+
+/// Hash a UTF-8 string; return 64-char lowercase hex digest.
+inline std::string sha256_hex(const std::string& input) {
+    auto digest = sha256_bytes(
+        reinterpret_cast<const uint8_t*>(input.data()), input.size());
+    std::string hex;
+    hex.reserve(64);
+    for (uint8_t byte : digest) {
+        hex += kHexChars[(byte >> 4) & 0xfu];
+        hex += kHexChars[ byte       & 0xfu];
+    }
+    return hex;
+}
+
+} // namespace keylight
+
+// ──────────────────────────────────────────────────────────────────────────
+// include/keylight/machine_id.hpp
+// ──────────────────────────────────────────────────────────────────────────
+
+// keylight/machine_id.hpp — device identity for the anonymous keyless beacon.
+//
+// Ported from keylight-rust keylight/src/machine.rs and
+//            keylight/src/store/device.rs
+//
+// `machine_hash` lets the server dedupe keyless/free-tier devices by a *true*
+// OS/hardware identifier instead of a random per-install id.  It is only ever
+// computed from a real hardware id — callers MUST omit the field entirely when
+// read_hardware_id() returns nullopt.  Substituting a random fallback would
+// defeat the cross-install dedup the hash exists for.
+
+
+
+#if defined(__APPLE__)
+#  include <CoreFoundation/CoreFoundation.h>
+#  include <IOKit/IOKitLib.h>
+#elif defined(_WIN32)
+#  include <windows.h>
+#else
+#  include <fstream>
+#  include <sstream>
+#endif
+
+namespace keylight {
+namespace detail {
+
+/// sha256("keylight-keyless-machine-v1|{tenant}|{product}|{stable_id}"),
+/// lowercase hex.  Must match byte-for-byte across all Keylight SDKs.
+inline std::string machine_hash(const std::string& tenant_id,
+                                const std::string& product_id,
+                                const std::string& stable_id)
+{
+    return sha256_hex("keylight-keyless-machine-v1|" + tenant_id + "|" +
+                      product_id + "|" + stable_id);
+}
+
+#if !defined(__APPLE__) && !defined(_WIN32)
+/// Read a file and trim surrounding whitespace; nullopt when missing or blank.
+inline std::optional<std::string> read_file_trimmed_(const char* path) {
+    std::ifstream f(path);
+    if (!f) return std::nullopt;
+    std::stringstream ss;
+    ss << f.rdbuf();
+    std::string s = ss.str();
+    const char* ws = " \t\n\r\f\v";
+    const auto  b  = s.find_first_not_of(ws);
+    if (b == std::string::npos) return std::nullopt;
+    const auto e = s.find_last_not_of(ws);
+    return s.substr(b, e - b + 1);
+}
+#endif
+
+/// True OS/hardware machine id, or nullopt when the platform has none.
+/// NEVER returns a random fallback — see the header comment.
+inline std::optional<std::string> read_hardware_id() {
+#if defined(__APPLE__)
+    // MACH_PORT_NULL selects the default port on every macOS version, which
+    // sidesteps the kIOMasterPortDefault -> kIOMainPortDefault rename in the
+    // macOS 12 SDK.
+    io_service_t svc = IOServiceGetMatchingService(
+        MACH_PORT_NULL, IOServiceMatching("IOPlatformExpertDevice"));
+    if (!svc) return std::nullopt;
+    CFTypeRef prop = IORegistryEntryCreateCFProperty(
+        svc, CFSTR("IOPlatformUUID"), kCFAllocatorDefault, 0);
+    IOObjectRelease(svc);
+    if (!prop) return std::nullopt;
+    std::optional<std::string> out;
+    if (CFGetTypeID(prop) == CFStringGetTypeID()) {
+        char buf[128] = {0};
+        if (CFStringGetCString(static_cast<CFStringRef>(prop), buf, sizeof(buf),
+                               kCFStringEncodingUTF8) && buf[0] != '\0') {
+            out = std::string(buf);
+        }
+    }
+    CFRelease(prop);
+    return out;
+
+#elif defined(_WIN32)
+    // RRF_SUBKEY_WOW6464KEY forces the 64-bit registry view.  Without it a
+    // 32-bit plugin host is redirected and reads a DIFFERENT MachineGuid than
+    // the other SDKs, silently breaking the cross-SDK hash.
+    char  buf[256];
+    DWORD size = sizeof(buf);
+    const LSTATUS rc = ::RegGetValueA(
+        HKEY_LOCAL_MACHINE,
+        "SOFTWARE\\Microsoft\\Cryptography",
+        "MachineGuid",
+        RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY,
+        nullptr, buf, &size);
+    if (rc != ERROR_SUCCESS || buf[0] == '\0') return std::nullopt;
+    return std::string(buf);
+
+#else
+    if (auto v = read_file_trimmed_("/etc/machine-id")) return v;
+    return read_file_trimmed_("/var/lib/dbus/machine-id");
+#endif
+}
+
+/// RFC 4122 version-4 UUID.  Used for the anonymous free-tier instance id.
+inline std::string uuid_v4() {
+    static thread_local std::mt19937 gen{std::random_device{}()};
+    std::uniform_int_distribution<unsigned> dist(0, 255);
+
+    uint8_t b[16];
+    for (auto& x : b) x = static_cast<uint8_t>(dist(gen));
+    b[6] = static_cast<uint8_t>((b[6] & 0x0f) | 0x40);  // version 4
+    b[8] = static_cast<uint8_t>((b[8] & 0x3f) | 0x80);  // variant
+
+    static const char* kHex = "0123456789abcdef";
+    std::string out;
+    out.reserve(36);
+    for (int i = 0; i < 16; ++i) {
+        if (i == 4 || i == 6 || i == 8 || i == 10) out += '-';
+        out += kHex[(b[i] >> 4) & 0x0f];
+        out += kHex[ b[i]       & 0x0f];
+    }
+    return out;
+}
+
+} // namespace detail
+} // namespace keylight
+
+// ──────────────────────────────────────────────────────────────────────────
 // include/keylight/client.hpp
 // ──────────────────────────────────────────────────────────────────────────
 
@@ -1611,6 +1943,9 @@ enum class State {
     Trial,      // no license; within trial window
     Expired,    // trusted lease expired, or license status "expired"/"fallback"
     Invalid,    // no trusted lease, no active trial
+    FreeTier,   // no license and no trial, but the product offers a free tier.
+                // Appended last on purpose: renumbering the values above would
+                // break any integrator that persisted a State as an integer.
 };
 
 // ---------------------------------------------------------------------------
@@ -1625,6 +1960,26 @@ enum class TrialStatus {
     Active,     // within trialDurationDays of the persisted start
     Expired,    // the trial window has elapsed
 };
+
+// ---------------------------------------------------------------------------
+// KeylessState — what the anonymous keyless beacon reports (mirrors
+// keylight-rust KeylessState).  The wire strings are fixed by the server and
+// shared with every other Keylight SDK.
+// ---------------------------------------------------------------------------
+enum class KeylessState {
+    Trial,
+    FreeTier,
+    Expired,
+};
+
+inline const char* keyless_state_wire(KeylessState s) {
+    switch (s) {
+        case KeylessState::Trial:    return "trial";
+        case KeylessState::FreeTier: return "free_tier";
+        case KeylessState::Expired:  return "expired";
+    }
+    return "expired";
+}
 
 // ---------------------------------------------------------------------------
 // compile-time platform string (matches Rust telemetry.rs)
@@ -1699,7 +2054,8 @@ public:
     // Production constructor — clock defaults to real wall clock.
     Client(Config cfg, Transport& transport, LicenseStore& store)
         : Client(std::move(cfg), transport, store,
-                 []{ return static_cast<int64_t>(std::time(nullptr)); })
+                 []{ return static_cast<int64_t>(std::time(nullptr)); },
+                 []{ return detail::read_hardware_id(); })
     {}
 
     // Testable constructor — inject a deterministic clock.
@@ -1708,10 +2064,25 @@ public:
            Transport&               transport,
            LicenseStore&            store,
            std::function<int64_t()> now_fn)
+        : Client(std::move(cfg), transport, store, std::move(now_fn),
+                 []{ return detail::read_hardware_id(); })
+    {}
+
+    // Testable constructor — inject a deterministic clock AND hardware id.
+    // hardware_id_fn() returns the true OS/hardware id, or nullopt when the
+    // platform has none.  It must NEVER return a random per-install value:
+    // machine_hash exists to dedupe a device across reinstalls, and a random
+    // fallback would defeat exactly that.
+    Client(Config                                      cfg,
+           Transport&                                  transport,
+           LicenseStore&                               store,
+           std::function<int64_t()>                    now_fn,
+           std::function<std::optional<std::string>()> hardware_id_fn)
         : cfg_(std::move(cfg))
         , transport_(transport)
         , store_(store)
         , now_fn_(std::move(now_fn))
+        , hardware_id_fn_(std::move(hardware_id_fn))
         , verifier_(cfg_.trustedKeys)
         , state_(State::Invalid)
     {
@@ -1732,10 +2103,12 @@ public:
     /// State::Invalid is returned (no exception thrown).
     Result<State> activate(const std::string& key) {
         // Build activate request body
-        std::string body = build_json_({
+        std::vector<std::pair<std::string, std::string>> fields{
             {"license_key",   json_str(key)},
             {"instance_name", json_str("device")},
-        }, true /*include telemetry*/);
+        };
+        append_attribution_fields_(fields, /*include_instance_id=*/true);
+        std::string body = build_json_(std::move(fields), true /*telemetry*/);
 
         std::string url = api_url_("activate");
         auto hr = transport_.request("POST", url, json_headers_(), body);
@@ -1813,10 +2186,15 @@ public:
         std::string license_key  = load_license_key_();
         std::string instance_id  = load_instance_id_();
 
-        std::string body = build_json_({
+        std::vector<std::pair<std::string, std::string>> fields{
             {"license_key", json_str(license_key)},
             {"instance_id", json_str(instance_id)},
-        }, true /*include telemetry*/);
+        };
+        // machine_hash only — the free-tier id belongs on activate, which is
+        // where a conversion is actually recorded (keylight-rust does the same;
+        // deactivate gets neither, it already identifies the device).
+        append_attribution_fields_(fields, /*include_instance_id=*/false);
+        std::string body = build_json_(std::move(fields), true /*telemetry*/);
 
         std::string url = api_url_("validate");
         auto hr = transport_.request("POST", url, json_headers_(), body);
@@ -1937,6 +2315,82 @@ public:
     /// calling this again (or by deactivating a paid license and re-calling).
     /// No-op when trials are disabled (Config::trialDurationDays <= 0).
     /// Performs store I/O — never call this from an audio thread.
+    /// Anonymous, per-install identifier for keyless/free-tier reporting.
+    /// Minted on first use and persisted; never derived from a licence or from
+    /// hardware.  Returns an empty string only when the store write fails.
+    /// Mirrors keylight-rust free_tier_instance_id().
+    std::string freeTierInstanceId() {
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            if (cached_free_tier_instance_id_.has_value()) {
+                return *cached_free_tier_instance_id_;
+            }
+            cached_free_tier_instance_id_ = detail::uuid_v4();
+        }
+        if (!save_cache_().is_ok()) {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            cached_free_tier_instance_id_.reset();
+            return {};
+        }
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        return *cached_free_tier_instance_id_;
+    }
+
+    /// Anonymous keyless/free-tier beacon.  Fire-and-forget: every error is
+    /// swallowed, nothing is thrown, and the resolved state never changes.
+    /// Debounced to once per 24h per state — a state *change* always sends.
+    ///
+    /// Nothing calls this for you.  keylight-rust behaves the same way: the
+    /// core never emits network traffic the integrator did not ask for, which
+    /// is what keeps checkOnLaunch() free of network I/O while a DAW scans the
+    /// plugin.  The JUCE adapter wires it to state transitions for you.
+    ///
+    /// Blocking network call — never invoke it from an audio thread.
+    void reportKeylessState(KeylessState state) {
+        const std::string wire = keyless_state_wire(state);
+
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            const bool changed =
+                !cached_keyless_last_state_.has_value() ||
+                *cached_keyless_last_state_ != wire;
+            const bool within_24h =
+                cached_last_keyless_ping_at_ != 0 &&
+                (now_fn_() - cached_last_keyless_ping_at_) < 86400;
+            if (!changed && within_24h) {
+                return;
+            }
+        }
+
+        const std::string instance = freeTierInstanceId();
+        if (instance.empty()) {
+            return;   // could not persist an id; nothing to report under
+        }
+
+        std::vector<std::pair<std::string, std::string>> fields{
+            {"instance_id", json_str(instance)},
+            {"state",       json_str(wire)},
+        };
+        if (auto hash = machine_hash_()) {
+            fields.push_back({"machine_hash", json_str(*hash)});
+        }
+
+        auto hr = transport_.request("POST", api_url_("keyless"),
+                                     json_headers_(),
+                                     build_json_(std::move(fields), true));
+        // Arm the debounce ONLY on a real 200.  A failed beacon must not
+        // suppress reporting for a day (keylight-rust does the same).
+        if (!hr.is_ok() || hr.value().status != 200) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            cached_keyless_last_state_   = wire;
+            cached_last_keyless_ping_at_ = now_fn_();
+        }
+        (void)save_cache_();
+    }
+
     Result<State> startTrial() {
         if (cfg_.trialDurationDays <= 0) {
             // Trials disabled — nothing is persisted and no state changes.
@@ -1954,6 +2408,9 @@ public:
         if (started) {
             save_cache_();
         }
+        // Attribution: a trial that later converts must carry the same
+        // anonymous id the keyless beacon reported it under.
+        freeTierInstanceId();
 
         State new_state = resolve_current_state_();
         set_state_(new_state);
@@ -2193,6 +2650,7 @@ private:
     Transport&               transport_;
     LicenseStore&            store_;
     std::function<int64_t()> now_fn_;
+    std::function<std::optional<std::string>()> hardware_id_fn_;
     Verifier                 verifier_;
 
     // ── State ─────────────────────────────────────────────────────────────
@@ -2208,6 +2666,10 @@ private:
     int64_t                          cached_last_validated_online_ = 0;
     // Epoch seconds when the local trial was started (nullopt = never started).
     std::optional<int64_t>           cached_trial_start_;
+    std::optional<std::string>       cached_free_tier_instance_id_;
+    std::optional<std::string>       cached_hardware_id_;
+    std::optional<std::string>       cached_keyless_last_state_;
+    int64_t                          cached_last_keyless_ping_at_ = 0;
 
     // ── Event listeners ───────────────────────────────────────────────────
     struct Listener {
@@ -2485,6 +2947,20 @@ private:
                 int64_t v = j["trialStart"].as_int();
                 if (v != 0) cached_trial_start_ = v;
             }
+            {
+                // Anonymous free-tier instance id (see freeTierInstanceId()).
+                std::string fid = j["freeTierInstanceId"].as_string();
+                if (!fid.empty()) cached_free_tier_instance_id_ = fid;
+            }
+            {
+                std::string hw = j["cachedHardwareId"].as_string();
+                if (!hw.empty()) cached_hardware_id_ = hw;
+            }
+            {
+                std::string kls = j["keylessLastState"].as_string();
+                if (!kls.empty()) cached_keyless_last_state_ = kls;
+                cached_last_keyless_ping_at_ = j["lastKeylessPingAt"].as_int();
+            }
         }
 
         State paid = State::Invalid;
@@ -2515,22 +2991,90 @@ private:
         return static_cast<int64_t>(cfg_.trialDurationDays) - days_elapsed;
     }
 
-    /// Apply the local-trial fallback to a state resolved from paid licensing.
-    /// Priority: valid paid license → active trial → elapsed trial → Invalid.
-    /// Only an otherwise-unusable (Invalid) paid state consults the trial, so
-    /// paid licensing — including a paid Expired — always wins, mirroring
-    /// keylight-rust's resolve_state() (`had_license` short-circuits the trial).
+    // ── Device identity helpers ───────────────────────────────────────────
+
+    /// Append the anonymous free-tier id (only if one already exists — never
+    /// mint one here) and machine_hash to an outgoing body.  Mirrors
+    /// keylight-rust, which attaches both to activate and machine_hash to
+    /// validate, so a device converting from free tier to paid is counted once
+    /// rather than twice.
+    void append_attribution_fields_(
+        std::vector<std::pair<std::string, std::string>>& fields,
+        bool include_instance_id)
+    {
+        if (include_instance_id) {
+            std::optional<std::string> id;
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                id = cached_free_tier_instance_id_;
+            }
+            if (id.has_value() && !id->empty()) {
+                fields.push_back({"free_tier_instance_id", json_str(*id)});
+            }
+        }
+        if (auto hash = machine_hash_()) {
+            fields.push_back({"machine_hash", json_str(*hash)});
+        }
+    }
+
+
+    /// The true hardware id: read live, written through to the store on
+    /// success, falling back to the last cached value when a live read fails.
+    /// Keeps machine_hash stable across a transient IOKit/registry failure.
+    /// NO random fallback — nullopt means "omit machine_hash entirely".
+    std::optional<std::string> cached_hardware_id_value_() {
+        std::optional<std::string> live =
+            hardware_id_fn_ ? hardware_id_fn_() : std::nullopt;
+        if (live.has_value() && !live->empty()) {
+            bool changed = false;
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                if (cached_hardware_id_ != live) {
+                    cached_hardware_id_ = live;
+                    changed = true;
+                }
+            }
+            if (changed) (void)save_cache_();
+            return live;
+        }
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        if (cached_hardware_id_.has_value() && !cached_hardware_id_->empty()) {
+            return cached_hardware_id_;
+        }
+        return std::nullopt;
+    }
+
+    /// Cross-SDK machine_hash from the cached hardware id, if any.
+    std::optional<std::string> machine_hash_() {
+        auto hw = cached_hardware_id_value_();
+        if (!hw.has_value()) return std::nullopt;
+        return detail::machine_hash(cfg_.tenantId, cfg_.productId, *hw);
+    }
+
+    /// Apply the local-trial and free-tier fallbacks to a state resolved from
+    /// paid licensing.
+    /// Priority: valid paid licence → active trial → free tier → elapsed trial
+    /// → Invalid.  Only an otherwise-unusable (Invalid) paid state consults the
+    /// trial, so paid licensing — including a paid Expired — always wins,
+    /// mirroring keylight-rust's resolve_state() (`had_license`
+    /// short-circuits the trial).
     /// Must NOT be called while holding cache_mutex_ (checkTrial() locks it).
     State resolve_with_trial_(State paid_state) const {
         if (paid_state != State::Invalid) {
             return paid_state;
         }
         switch (checkTrial()) {
-            case TrialStatus::Active:  return State::Trial;
-            case TrialStatus::Expired: return State::Expired;
-            case TrialStatus::NotStarted: break;
+            case TrialStatus::Active:
+                return State::Trial;
+            case TrialStatus::Expired:
+                // Free tier outranks an elapsed trial: keylight-rust's
+                // `_ if free_tier_enabled` arm sits AFTER the trial match, so a
+                // lapsed trial drops to the free tier rather than the paywall.
+                return cfg_.freeTierEnabled ? State::FreeTier : State::Expired;
+            case TrialStatus::NotStarted:
+                break;
         }
-        return State::Invalid;
+        return cfg_.freeTierEnabled ? State::FreeTier : State::Invalid;
     }
 
     /// Re-resolve the current state offline. When any paid-licensing material
@@ -2627,6 +3171,20 @@ private:
         if (cached_trial_start_.has_value()) {
             append("\"trialStart\":" + std::to_string(*cached_trial_start_));
         }
+        if (cached_free_tier_instance_id_.has_value()) {
+            append("\"freeTierInstanceId\":" +
+                   json_str(*cached_free_tier_instance_id_));
+        }
+        if (cached_hardware_id_.has_value()) {
+            append("\"cachedHardwareId\":" + json_str(*cached_hardware_id_));
+        }
+        if (cached_keyless_last_state_.has_value()) {
+            append("\"keylessLastState\":" + json_str(*cached_keyless_last_state_));
+        }
+        if (cached_last_keyless_ping_at_ != 0) {
+            append("\"lastKeylessPingAt\":" +
+                   std::to_string(cached_last_keyless_ping_at_));
+        }
 
         blob += "}";
         return blob;
@@ -2685,11 +3243,15 @@ private:
     }
 
     /// Build the JSON body for a validate request.
-    std::string build_validate_body_() const {
-        return build_json_({
+    /// Not const: machine_hash_() writes the cached hardware id through to the
+    /// store on a successful live read.
+    std::string build_validate_body_() {
+        std::vector<std::pair<std::string, std::string>> fields{
             {"license_key", json_str(load_license_key_())},
             {"instance_id", json_str(load_instance_id_())},
-        }, true);
+        };
+        append_attribution_fields_(fields, /*include_instance_id=*/false);
+        return build_json_(std::move(fields), true);
     }
 
     /// Perform a single live validate() round-trip against the server and

@@ -3,7 +3,7 @@ from conan import ConanFile
 
 class KeylightConan(ConanFile):
     name = "keylight"
-    version = "0.1.5"
+    version = "0.1.6"
     description = "Cryptographic licensing SDK for Apple platforms and beyond"
     homepage = "https://github.com/keylight-dev/keylight-cpp"
     url = "https://github.com/keylight-dev/keylight-cpp"
