@@ -1340,3 +1340,66 @@ TEST_CASE("Client: refreshIfNeeded's offline grace denies Licensed after maxOffl
     CHECK(r.value() == State::Expired);
     CHECK(client.state() == State::Expired);
 }
+
+// ---------------------------------------------------------------------------
+// Clock-rollback guard — every read point, not just state()
+// ---------------------------------------------------------------------------
+
+TEST_CASE("Client: a rolled-back clock denies state, entitlements and checkOnLaunch alike") {
+    // The guard has to answer the same way at every read point. If state()
+    // fails closed while hasEntitlement() keeps returning true, the paywall
+    // and the feature gate disagree and the feature gate fails OPEN — the app
+    // shows "not licensed" and hands out the paid features anyway.
+    auto cfg = make_config();
+
+    int64_t          now = VALID_ACTIVE_NOW;
+    FailingTransport offline;  // this whole scenario is offline
+    MemoryStore      store;
+
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW);
+
+    Client client(cfg, offline, store, [&]{ return now; });
+
+    // Honest clock: a trusted, unexpired, entitled lease.
+    REQUIRE(client.state() == State::Licensed);
+    REQUIRE(client.hasEntitlement("pro") == true);
+
+    // The machine booted with a wrong clock and NTP has just corrected it
+    // backward past the tolerance. Nothing about the lease changed; what
+    // changed is that nothing can be aged against this clock any more.
+    now = VALID_ACTIVE_NOW - 2 * 3600;
+
+    CHECK(client.state() == State::Invalid);
+    CHECK(client.hasEntitlement("pro") == false);
+
+    // checkOnLaunch() must report what state() reports. Offline, its grace
+    // window would otherwise hand back Licensed against the moved clock.
+    auto r = client.checkOnLaunch();
+    REQUIRE(r.is_ok());
+    CHECK(r.value() == State::Invalid);
+}
+
+TEST_CASE("Client: an anchor ahead of the clock does not pass the maxOfflineDays bound") {
+    // A clock pushed forward across a validate leaves the persisted anchor
+    // ahead of real time. `now - anchor` is then NEGATIVE, so a bare
+    // `> max_age` comparison can never fire and the offline bound is silently
+    // disabled for as long as the anchor stays in the future.
+    auto cfg = make_config();
+    cfg.maxOfflineDays = 2;
+
+    int64_t          now = VALID_ACTIVE_NOW;
+    FailingTransport offline;
+    MemoryStore      store;
+
+    const int64_t future_anchor = VALID_ACTIVE_NOW + 2 * 86400;
+    seed_store_with_valid_lease(store, now, 1781681046LL, future_anchor);
+
+    Client client(cfg, offline, store, [&]{ return now; });
+
+    // Read it back once the wall clock has caught up past the anchor, so the
+    // rollback guard is no longer the one answering and we observe the state
+    // refresh_state_from_store_ actually resolved at construction. The lease's
+    // own ~7-day TTL has not run out, so only the offline bound can catch it.
+    now = future_anchor + 3600;
+    CHECK(client.state() == State::Expired);
+}

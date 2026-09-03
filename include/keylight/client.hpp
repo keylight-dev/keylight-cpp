@@ -9,9 +9,27 @@
 // Validate:     POST /{tenantId}/{productId}/validate
 // Deactivate:   POST /{tenantId}/{productId}/deactivate
 //
-// Thread-safety: state() reads a std::atomic<State> — audio-thread safe.
+// Thread-safety: state() reads std::atomics only — audio-thread safe.
 //                hasEntitlement / cachedLicenseExpiresAt / listener list are
 //                guarded by a mutex.
+//
+// NOW-FUNCTION CONTRACT
+// ─────────────────────
+// Client takes an optional `now_fn` (a std::function<int64_t()>) so tests and
+// integrators can supply the clock. state() calls it — to run the clock-
+// rollback guard — and state() is `noexcept` and documented audio-thread safe.
+// A caller-supplied `now_fn` MUST therefore be:
+//   - non-throwing        — an exception escaping a noexcept function is
+//                           std::terminate, and here that would happen on the
+//                           audio thread;
+//   - non-blocking        — no mutex, no I/O, no syscall that can wait;
+//   - allocation-free     — no heap traffic on the audio thread.
+// It must also be non-empty: invoking an empty std::function throws
+// std::bad_function_call, which is the same std::terminate.
+// The shipped default, std::time(nullptr), satisfies all of this. If your
+// clock cannot, do not call state() from an audio callback — mirror it into
+// your own std::atomic from a background thread instead (this is exactly what
+// the JUCE adapter does).
 
 #include "clock.hpp"
 #include "config.hpp"
@@ -690,7 +708,14 @@ public:
     Result<State> checkOnLaunch() {
         // The cache is already primed on construction via refresh_state_from_store_().
         if (has_stored_license_()) {
-            return validate_and_reconcile_();
+            auto r = validate_and_reconcile_();
+            // Report what state() reports. Offline, the grace window would
+            // otherwise hand back Licensed against a clock that has moved
+            // backward — the launch path and the paywall must not disagree.
+            if (r.is_ok() && clock_untrusted_()) {
+                return Result<State>::ok(State::Invalid);
+            }
+            return r;
         }
         // No paid license: resolve the persisted local trial offline. This
         // never *starts* a trial — a DAW scanning or instantiating a plugin
@@ -698,6 +723,7 @@ public:
         // that, and only when the user asks for it.
         State new_state = resolve_current_state_();
         set_state_(new_state);
+        if (clock_untrusted_()) return Result<State>::ok(State::Invalid);
         return Result<State>::ok(new_state);
     }
 
@@ -781,16 +807,23 @@ public:
     /// A clock rolled back beyond tolerance since the last recorded server
     /// contact invalidates any offline reasoning we could do, so this fails
     /// closed rather than trusting a lease against a moved clock.
+    ///
+    /// This method is `noexcept` and documented audio-thread safe, and it
+    /// calls the caller-supplied `now_fn_`. See the NOW-FUNCTION CONTRACT at
+    /// the top of this header: a `now_fn` that throws terminates the process,
+    /// and one that locks or allocates breaks the audio-thread guarantee.
     State state() const noexcept {
-        const int64_t anchor = last_validated_online_atomic_.load();
-        if (anchor != 0 && clock_rolled_back(anchor, now_fn_())) {
-            return State::Invalid;
-        }
+        if (clock_untrusted_()) return State::Invalid;
         return state_.load();
     }
 
     /// True iff the cached, verified lease contains the named entitlement.
+    ///
+    /// Applies the same clock-rollback guard as state(). A feature gate that
+    /// kept answering true while state() answered Invalid would fail OPEN —
+    /// the paywall and the gate must agree.
     bool hasEntitlement(const std::string& feature) const {
+        if (clock_untrusted_()) return false;
         std::lock_guard<std::mutex> lock(cache_mutex_);
         if (!cached_lease_.has_value()) return false;
         const auto& l = *cached_lease_;
@@ -810,6 +843,23 @@ public:
     }
 
 private:
+    // ── Clock trust ───────────────────────────────────────────────────────
+
+    /// True when the system clock has moved backward, beyond tolerance, since
+    /// the last recorded server contact. Every state read point consults this
+    /// so they cannot disagree: state(), hasEntitlement() and what
+    /// checkOnLaunch() reports all fail closed together.
+    ///
+    /// Reads the ATOMIC anchor mirror, never the mutex-guarded field, so it
+    /// stays usable from noexcept, lock-free, audio-thread-safe state().
+    /// An anchor of 0 means "never validated online" — there is nothing to
+    /// compare against, and the offline bound in refresh_state_from_store_()
+    /// already fails that case closed.
+    bool clock_untrusted_() const noexcept {
+        const int64_t anchor = last_validated_online_atomic_.load();
+        return anchor != 0 && clock_rolled_back(anchor, now_fn_());
+    }
+
     // ── Dependencies ──────────────────────────────────────────────────────
     Config                   cfg_;
     Transport&               transport_;
@@ -1187,15 +1237,27 @@ private:
         // ever having been validated online cannot be aged, and treating
         // "unknown" as "recent" is exactly the gap an attacker deletes a field
         // to create. Matches keylight-rust.
+        //
+        // Fail closed too when the anchor sits AHEAD of the clock beyond the
+        // rollback tolerance: `now - anchor` is negative there, so the
+        // `> max_age` test can never fire and the bound is silently disabled
+        // for as long as the anchor stays in the future — push the clock
+        // forward across one validate and the tenant's policy stops applying.
+        // Within the tolerance the anchor is trusted, for the same reason
+        // clock.hpp tolerates a small backward step: NTP corrections and
+        // suspend/resume routinely move the clock a little, and locking out a
+        // paying customer over a second of drift would be the worse bug.
         if (paid != State::Invalid && cfg_.maxOfflineDays > 0) {
             int64_t anchor;
             {
                 std::lock_guard<std::mutex> lock(cache_mutex_);
                 anchor = cached_last_validated_online_;
             }
+            const int64_t now = now_fn_();
             const int64_t max_age =
                 static_cast<int64_t>(cfg_.maxOfflineDays) * 86400;
-            if (anchor == 0 || (now_fn_() - anchor) > max_age) {
+            if (anchor == 0 || clock_rolled_back(anchor, now) ||
+                (now - anchor) > max_age) {
                 paid = State::Expired;
             }
         }
