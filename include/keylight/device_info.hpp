@@ -88,5 +88,22 @@ inline uint64_t detect_physical_memory_bytes() {
 #endif
 }
 
+// Canonical CPU-architecture token for this build target.
+//
+// The server allow-lists exactly two spellings — "arm64" and "x86_64" — and
+// canonicalizes aliases (aarch64 -> arm64) server-side, but we send the
+// canonical spelling ourselves. Targets outside the vocabulary (32-bit,
+// exotic ISAs) return "" and the caller omits the field: absent reads better
+// server-side than a long tail of one-off buckets it would drop anyway.
+inline const char* current_arch() {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return "arm64";
+#elif defined(__x86_64__) || defined(_M_X64)
+    return "x86_64";
+#else
+    return "";
+#endif
+}
+
 } // namespace detail
 } // namespace keylight

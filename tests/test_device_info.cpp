@@ -89,3 +89,17 @@ TEST_CASE("device_info: host detection yields a contract-legal bucket") {
     CHECK((mem.empty() || mem == "<4GB" || mem == "4-8GB" || mem == "8-16GB"
            || mem == "16-32GB" || mem == "32-64GB" || mem == "64GB+"));
 }
+
+TEST_CASE("device_info: current_arch is a server-allowed token or empty") {
+    std::string a = keylight::detail::current_arch();
+    // The server allow-lists exactly two spellings and canonicalizes aliases.
+    // A target outside that vocabulary omits the field rather than inventing
+    // a one-off bucket the server would drop anyway.
+    CHECK((a == "arm64" || a == "x86_64" || a.empty()));
+}
+
+TEST_CASE("device_info: current_arch is non-empty on the CI architectures") {
+#if defined(__aarch64__) || defined(_M_ARM64) || defined(__x86_64__) || defined(_M_X64)
+    CHECK(std::string(keylight::detail::current_arch()).empty() == false);
+#endif
+}
