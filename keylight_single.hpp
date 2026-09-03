@@ -39,7 +39,7 @@
 // include/keylight/version.hpp
 // ──────────────────────────────────────────────────────────────────────────
 
-#define KEYLIGHT_SDK_VERSION "0.1.4"
+#define KEYLIGHT_SDK_VERSION "0.1.5"
 
 // Identifies this SDK to the backend, sent as `sdk` alongside `platform`.
 // Server cap is 16 characters (zod `z.string().max(16)`).
@@ -1614,6 +1614,19 @@ enum class State {
 };
 
 // ---------------------------------------------------------------------------
+// TrialStatus — local, offline-first trial (mirrors keylight-rust TrialStatus)
+//
+// Trials are entirely local: the start timestamp is persisted next to the
+// lease and the window is measured against the client's clock. No API call is
+// involved — the free-tier / keyless beacon is a separate feature.
+// ---------------------------------------------------------------------------
+enum class TrialStatus {
+    NotStarted, // no trial timestamp persisted (or trials disabled)
+    Active,     // within trialDurationDays of the persisted start
+    Expired,    // the trial window has elapsed
+};
+
+// ---------------------------------------------------------------------------
 // compile-time platform string (matches Rust telemetry.rs)
 // ---------------------------------------------------------------------------
 namespace detail {
@@ -1789,6 +1802,7 @@ public:
             new_state = State::Licensed;
         }
 
+        new_state = resolve_with_trial_(new_state);
         set_state_(new_state);
         return Result<State>::ok(new_state);
     }
@@ -1863,7 +1877,9 @@ public:
             save_last_validated_online_(now_fn_());
         }
 
-        State new_state = resolve_from_lease_(lease);
+        // Paid licensing wins; an unusable result falls back to the local
+        // trial instead of dropping a trialling user to Invalid.
+        State new_state = resolve_with_trial_(resolve_from_lease_(lease));
         set_state_(new_state);
         return Result<State>::ok(new_state);
     }
@@ -1881,13 +1897,10 @@ public:
             transport_.request("POST", url, json_headers_(), body);
         }
 
-        // Clear store
-        auto cr = store_.clear();
-        if (!cr.is_ok()) {
-            return cr;
-        }
-
-        // Clear in-memory cache
+        // Clear the paid-licensing half of the cache. The trial start survives:
+        // deactivating a paid license must never hand the user a fresh trial
+        // (nor restart an expired one) — see startTrial().
+        bool keep_trial = false;
         {
             std::lock_guard<std::mutex> lock(cache_mutex_);
             cached_lease_                  = std::nullopt;
@@ -1895,9 +1908,92 @@ public:
             cached_instance_id_            = std::nullopt;
             cached_license_key_            = std::nullopt;
             cached_last_validated_online_  = 0;
+            keep_trial                     = cached_trial_start_.has_value();
         }
-        set_state_(State::Invalid);
+
+        if (keep_trial) {
+            // Rewrite the blob with the trial start (and nothing else) instead
+            // of dropping the file — clear() would restart the trial clock.
+            auto sr = save_cache_();
+            if (!sr.is_ok()) {
+                return sr;
+            }
+        } else {
+            auto cr = store_.clear();
+            if (!cr.is_ok()) {
+                return cr;
+            }
+        }
+
+        // No paid license left: the persisted trial (if any) decides the state.
+        set_state_(resolve_with_trial_(State::Invalid));
         return Result<void>::ok();
+    }
+
+    // ── Trial API (local, offline-first) ──────────────────────────────────
+
+    /// Explicitly begin the local trial. Idempotent: an existing trial start
+    /// is never overwritten, so an expired trial cannot be restarted by
+    /// calling this again (or by deactivating a paid license and re-calling).
+    /// No-op when trials are disabled (Config::trialDurationDays <= 0).
+    /// Performs store I/O — never call this from an audio thread.
+    Result<State> startTrial() {
+        if (cfg_.trialDurationDays <= 0) {
+            // Trials disabled — nothing is persisted and no state changes.
+            return Result<State>::ok(state_.load());
+        }
+
+        bool started = false;
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            if (!cached_trial_start_.has_value()) {
+                cached_trial_start_ = now_fn_();
+                started             = true;
+            }
+        }
+        if (started) {
+            save_cache_();
+        }
+
+        State new_state = resolve_current_state_();
+        set_state_(new_state);
+        return Result<State>::ok(new_state);
+    }
+
+    /// Current local trial status. Never performs I/O beyond reading the
+    /// in-memory cache primed from the store.
+    TrialStatus checkTrial() const {
+        if (cfg_.trialDurationDays <= 0) {
+            return TrialStatus::NotStarted;
+        }
+        std::optional<int64_t> start;
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            start = cached_trial_start_;
+        }
+        if (!start.has_value()) {
+            return TrialStatus::NotStarted;
+        }
+        return days_left_from_(*start) > 0 ? TrialStatus::Active
+                                           : TrialStatus::Expired;
+    }
+
+    /// Whole days remaining in the local trial; 0 when disabled, not started,
+    /// or elapsed. Matches keylight-rust's `days_left` (seconds / 86400).
+    int trialDaysLeft() const {
+        if (cfg_.trialDurationDays <= 0) {
+            return 0;
+        }
+        std::optional<int64_t> start;
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            start = cached_trial_start_;
+        }
+        if (!start.has_value()) {
+            return 0;
+        }
+        int64_t left = days_left_from_(*start);
+        return left > 0 ? static_cast<int>(left) : 0;
     }
 
     // ── Async wrappers ────────────────────────────────────────────────────
@@ -1982,7 +2078,13 @@ public:
         if (has_stored_license_()) {
             return validate_and_reconcile_();
         }
-        return Result<State>::ok(state_.load());
+        // No paid license: resolve the persisted local trial offline. This
+        // never *starts* a trial — a DAW scanning or instantiating a plugin
+        // must not consume the user's trial window; only startTrial() does
+        // that, and only when the user asks for it.
+        State new_state = resolve_current_state_();
+        set_state_(new_state);
+        return Result<State>::ok(new_state);
     }
 
     /// Apply the timer model: refresh debounce 5min, stale 6h, near-expiry 24h.
@@ -2094,6 +2196,8 @@ private:
     std::optional<std::string>       cached_license_key_;
     // Epoch seconds of last successful online validation (0 = never).
     int64_t                          cached_last_validated_online_ = 0;
+    // Epoch seconds when the local trial was started (nullopt = never started).
+    std::optional<int64_t>           cached_trial_start_;
 
     // ── Event listeners ───────────────────────────────────────────────────
     struct Listener {
@@ -2123,10 +2227,18 @@ private:
         return base + "/" + cfg_.tenantId + "/" + cfg_.productId + "/" + action;
     }
 
-    static std::map<std::string, std::string> json_headers_() {
-        return {
+    /// Headers for every Keylight API call. The tenant SDK key authenticates
+    /// the request; without it the worker answers 401 to activate/validate/
+    /// deactivate. Every call site goes through this helper so no endpoint can
+    /// be added later that forgets to authenticate.
+    std::map<std::string, std::string> json_headers_() const {
+        std::map<std::string, std::string> headers{
             {"Content-Type", "application/json"},
         };
+        if (!cfg_.sdkKey.empty()) {
+            headers["X-Keylight-SDK-Key"] = cfg_.sdkKey;
+        }
+        return headers;
     }
 
     // Tiny JSON string escaping (no control chars expected in these values)
@@ -2251,7 +2363,7 @@ private:
                     persist_({lease_json, expires_at, iid});
                     save_last_validated_online_(now);
                 }
-                State new_state = resolve_from_lease_(lease);
+                State new_state = resolve_with_trial_(resolve_from_lease_(lease));
                 set_state_(new_state);
                 return new_state;
             }
@@ -2260,7 +2372,11 @@ private:
             // no-lease deny path rather than silently keeping stale state.
         }
 
-        // Definitive rejection with no (usable) lease — a real revoke.
+        // Definitive rejection with no (usable) lease — a real revoke. This
+        // deliberately does NOT fall back to the local trial: the stored
+        // license key is still there and a revoked seat must not silently
+        // reopen an old trial (keylight-rust resolves the same case off
+        // `had_stored_license`, never off the trial).
         clear_lease_();
         set_state_(State::Invalid);
         return State::Invalid;
@@ -2274,33 +2390,14 @@ private:
     /// trusting the last-known "active" data. Mirrors keylight-js's
     /// `del(ACCOUNT.LEASE)` in the no-lease rejection branch of validate().
     void clear_lease_() {
-        std::optional<std::string> instance_id, license_key;
-        std::optional<int64_t>     expires_at;
-        int64_t                    last_lvo = 0;
         {
             std::lock_guard<std::mutex> lock(cache_mutex_);
             cached_lease_ = std::nullopt;
-            instance_id   = cached_instance_id_;
-            license_key   = cached_license_key_;
-            expires_at    = cached_expires_at_;
-            last_lvo      = cached_last_validated_online_;
         }
-
-        // Rebuild the on-disk blob without a "lease" key, preserving every
-        // other field we still have cached.
-        std::string blob = "{";
-        bool first = true;
-        auto append = [&](const std::string& kv) {
-            if (!first) blob += ",";
-            blob += kv;
-            first = false;
-        };
-        if (expires_at.has_value())  append("\"expiresAt\":" + std::to_string(*expires_at));
-        if (instance_id.has_value()) append("\"instanceId\":" + json_str(*instance_id));
-        if (license_key.has_value()) append("\"licenseKey\":" + json_str(*license_key));
-        if (last_lvo != 0)           append("\"lastValidatedOnline\":" + std::to_string(last_lvo));
-        blob += "}";
-        store_.save(blob);
+        // Rewrite the blob from the cache: every other field (instanceId,
+        // licenseKey, lastValidatedOnline, trialStart) is preserved because
+        // serialization happens in exactly one place.
+        save_cache_();
     }
 
     // Derive State from an optional (possibly-null) lease using current clock.
@@ -2330,60 +2427,116 @@ private:
             return;
         }
         // Try to decode as our persisted blob: a JSON object with
-        // "lease", "expiresAt", "instanceId" fields.
+        // "lease", "expiresAt", "instanceId", … fields.
         auto jr = Json::parse(lr.value());
         if (!jr.is_ok()) {
+            // Unreadable blob: nothing is cached, so checkTrial() reports
+            // NotStarted. A corrupted store must never look like a fresh
+            // install that is entitled to a brand-new trial — only an
+            // explicit startTrial() writes a trial start.
             state_.store(State::Invalid);
             return;
         }
         const Json& j = jr.value();
 
-        // Decode lease
-        auto lease_node = j["lease"];
-        if (lease_node.size() == 0) {
-            state_.store(State::Invalid);
-            return;
-        }
-        auto lease_r = Lease::from_json(lease_node);
-        if (!lease_r.is_ok()) {
-            state_.store(State::Invalid);
-            return;
+        std::optional<Lease> lease;
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+
+            // Decode lease (absent/undecodable → no cached lease; the trial
+            // fallback below still applies).
+            auto lease_node = j["lease"];
+            if (lease_node.size() > 0) {
+                auto lease_r = Lease::from_json(lease_node);
+                if (lease_r.is_ok()) {
+                    cached_lease_ = lease_r.value();
+                    lease         = cached_lease_;
+                }
+            }
+            {
+                int64_t v = j["expiresAt"].as_int();
+                if (v != 0) cached_expires_at_ = v;
+            }
+            {
+                std::string v = j["instanceId"].as_string();
+                if (!v.empty()) cached_instance_id_ = v;
+            }
+            {
+                std::string v = j["licenseKey"].as_string();
+                if (!v.empty()) cached_license_key_ = v;
+            }
+            {
+                // Load lastValidatedOnline (written by save_last_validated_online_)
+                int64_t v = j["lastValidatedOnline"].as_int();
+                if (v != 0) cached_last_validated_online_ = v;
+            }
+            {
+                // Load the local trial start written by startTrial().
+                int64_t v = j["trialStart"].as_int();
+                if (v != 0) cached_trial_start_ = v;
+            }
         }
 
-        std::lock_guard<std::mutex> lock(cache_mutex_);
-        cached_lease_ = lease_r.value();
-
-        {
-            int64_t v = j["expiresAt"].as_int();
-            if (v != 0) cached_expires_at_ = v;
+        State paid = State::Invalid;
+        if (lease.has_value()) {
+            auto vr = verifier_.verify(*lease, now_fn_());
+            paid    = derive_state_from_verify_(*lease, vr);
         }
-        {
-            std::string v = j["instanceId"].as_string();
-            if (!v.empty()) cached_instance_id_ = v;
-        }
-        {
-            std::string v = j["licenseKey"].as_string();
-            if (!v.empty()) cached_license_key_ = v;
-        }
-        {
-            // Load lastValidatedOnline (written by save_last_validated_online_)
-            int64_t v = j["lastValidatedOnline"].as_int();
-            if (v != 0) cached_last_validated_online_ = v;
-        }
-
-        // Don't hold mutex while computing state
-        Lease lease_copy = *cached_lease_;
-        // release lock before verify (not needed but cleaner)
-        // Actually we already hold it — that's fine, verifier doesn't touch mutex
-        auto vr = verifier_.verify(lease_copy, now_fn_());
-        State s = derive_state_from_verify_(lease_copy, vr);
-        state_.store(s);
+        // Paid licensing wins; the persisted local trial only fills the gap.
+        state_.store(resolve_with_trial_(paid));
     }
 
     static State derive_state_from_verify_(const Lease& l, const VerifyResult& vr) {
         if (!vr.is_trusted()) return State::Invalid;
         if (l.status == "active") return vr.expired ? State::Expired : State::Licensed;
         return State::Expired;
+    }
+
+    // ── Trial helpers ─────────────────────────────────────────────────────
+
+    /// Whole days remaining from a trial start timestamp; <= 0 means elapsed.
+    /// Elapsed time is seconds / 86400 (matching keylight-rust check_trial),
+    /// clamped at zero so a wall clock that moved backwards cannot extend the
+    /// window past its configured length.
+    int64_t days_left_from_(int64_t start) const {
+        int64_t elapsed_secs = now_fn_() - start;
+        if (elapsed_secs < 0) elapsed_secs = 0;
+        int64_t days_elapsed = elapsed_secs / 86400;
+        return static_cast<int64_t>(cfg_.trialDurationDays) - days_elapsed;
+    }
+
+    /// Apply the local-trial fallback to a state resolved from paid licensing.
+    /// Priority: valid paid license → active trial → elapsed trial → Invalid.
+    /// Only an otherwise-unusable (Invalid) paid state consults the trial, so
+    /// paid licensing — including a paid Expired — always wins, mirroring
+    /// keylight-rust's resolve_state() (`had_license` short-circuits the trial).
+    /// Must NOT be called while holding cache_mutex_ (checkTrial() locks it).
+    State resolve_with_trial_(State paid_state) const {
+        if (paid_state != State::Invalid) {
+            return paid_state;
+        }
+        switch (checkTrial()) {
+            case TrialStatus::Active:  return State::Trial;
+            case TrialStatus::Expired: return State::Expired;
+            case TrialStatus::NotStarted: break;
+        }
+        return State::Invalid;
+    }
+
+    /// Re-resolve the current state offline. When any paid-licensing material
+    /// is cached the license flow owns the state and it is returned as-is;
+    /// otherwise the persisted trial (or Invalid) decides. No network I/O.
+    State resolve_current_state_() const {
+        bool has_paid_material = false;
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            has_paid_material = cached_lease_.has_value()
+                || (cached_license_key_.has_value() && !cached_license_key_->empty());
+        }
+        if (has_paid_material) {
+            return state_.load();
+        }
+        return resolve_with_trial_(State::Invalid);
     }
 
     // ── Persist helpers ───────────────────────────────────────────────────
@@ -2396,36 +2549,11 @@ private:
         std::optional<std::string>       license_key;
     };
 
-    /// Write a blob to the store in the format we read back.
-    /// Blob format: {"lease":{...},"expiresAt":N,"instanceId":"..."}
+    /// Merge the supplied fields into the in-memory cache, then rewrite the
+    /// whole store blob from that cache. Fields the caller did not supply keep
+    /// their cached value — a partial update can no longer drop licenseKey,
+    /// lastValidatedOnline or trialStart from disk.
     void persist_(const PersistData& d) {
-        // Build the storage blob
-        std::string blob = "{";
-
-        if (d.lease_json.has_value()) {
-            blob += "\"lease\":" + *d.lease_json;
-        }
-
-        if (d.expires_at.has_value()) {
-            if (blob.size() > 1) blob += ",";
-            blob += "\"expiresAt\":" + std::to_string(*d.expires_at);
-        }
-
-        if (d.instance_id.has_value()) {
-            if (blob.size() > 1) blob += ",";
-            blob += "\"instanceId\":" + json_str(*d.instance_id);
-        }
-
-        if (d.license_key.has_value()) {
-            if (blob.size() > 1) blob += ",";
-            blob += "\"licenseKey\":" + json_str(*d.license_key);
-        }
-
-        blob += "}";
-
-        store_.save(blob);
-
-        // Update in-memory cache
         {
             std::lock_guard<std::mutex> lock(cache_mutex_);
 
@@ -2449,6 +2577,59 @@ private:
                 cached_license_key_ = *d.license_key;
             }
         }
+
+        save_cache_();
+    }
+
+    /// THE serializer for the persisted blob. Every field the client keeps on
+    /// disk is written here and nowhere else, so no code path (activate,
+    /// validate, lease refresh, lease clearing, revoke, deactivate) can erase
+    /// a field it never touched.
+    /// Blob format:
+    ///   {"lease":{…},"expiresAt":N,"instanceId":"…","licenseKey":"…",
+    ///    "lastValidatedOnline":N,"trialStart":N}
+    /// Caller must hold cache_mutex_.
+    std::string build_blob_locked_() const {
+        std::string blob  = "{";
+        bool        first = true;
+        auto append = [&](const std::string& kv) {
+            if (!first) blob += ",";
+            blob += kv;
+            first = false;
+        };
+
+        if (cached_lease_.has_value()) {
+            append("\"lease\":" + lease_to_json_(*cached_lease_));
+        }
+        if (cached_expires_at_.has_value()) {
+            append("\"expiresAt\":" + std::to_string(*cached_expires_at_));
+        }
+        if (cached_instance_id_.has_value()) {
+            append("\"instanceId\":" + json_str(*cached_instance_id_));
+        }
+        if (cached_license_key_.has_value()) {
+            append("\"licenseKey\":" + json_str(*cached_license_key_));
+        }
+        if (cached_last_validated_online_ != 0) {
+            append("\"lastValidatedOnline\":" +
+                   std::to_string(cached_last_validated_online_));
+        }
+        if (cached_trial_start_.has_value()) {
+            append("\"trialStart\":" + std::to_string(*cached_trial_start_));
+        }
+
+        blob += "}";
+        return blob;
+    }
+
+    /// Serialize the current cache and hand it to the store.
+    Result<void> save_cache_() {
+        std::string blob;
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            blob = build_blob_locked_();
+        }
+        return store_.save(blob);
     }
 
     /// Load the stored instance_id from cache (or empty string if none).
@@ -2489,18 +2670,8 @@ private:
             std::lock_guard<std::mutex> lock(cache_mutex_);
             cached_last_validated_online_ = t;
         }
-        // Also write into the store blob. We reload the existing blob and patch it.
-        // This is a best-effort update; failures are non-fatal.
-        auto lr = store_.load();
-        if (!lr.is_ok() || lr.value().empty()) return;
-        // Append/overwrite the lastValidatedOnline field by rebuilding the blob.
-        // Simple approach: strip trailing '}' and append the key.
-        std::string blob = lr.value();
-        if (!blob.empty() && blob.back() == '}') {
-            blob.pop_back();
-            blob += ",\"lastValidatedOnline\":" + std::to_string(t) + "}";
-            store_.save(blob);
-        }
+        // Rewrite the blob from the cache (best-effort; failures are non-fatal).
+        save_cache_();
     }
 
     /// Build the JSON body for a validate request.
@@ -2581,7 +2752,9 @@ private:
             save_last_validated_online_(now);
         }
 
-        State new_state = resolve_from_lease_(lease);
+        // Paid licensing wins; an unusable result falls back to the local
+        // trial instead of dropping a trialling user to Invalid.
+        State new_state = resolve_with_trial_(resolve_from_lease_(lease));
         set_state_(new_state);
         return Result<State>::ok(new_state);
     }

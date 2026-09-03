@@ -20,7 +20,7 @@ extra dependencies.  Networking goes through JUCE's own `juce::URL` and
 | JUCE              | 7.x or 8.x                         |
 | C++ standard      | C++17                               |
 | JUCE modules      | `juce_core` (URL, File, Thread), `juce_events` (MessageManager) |
-| Keylight C++ SDK  | any version after 0.1.0             |
+| Keylight C++ SDK  | 0.1.5 or newer (trial API + SDK-key auth) |
 | Target platforms  | macOS, Windows, Linux (any platform juce::URL supports) |
 
 ---
@@ -101,8 +101,10 @@ class MyAudioProcessor : public juce::AudioProcessor
 ```cpp
 // PluginProcessor.cpp constructor
 keylight::Config cfg;
-cfg.tenantId    = "your-tenant-id";
-cfg.productId   = "your-product-id";
+cfg.tenantId          = "your-tenant-id";
+cfg.productId         = "your-product-id";
+cfg.sdkKey            = "sdk_live_...";   // sent as X-Keylight-SDK-Key
+cfg.trialDurationDays = 14;               // 0 (default) disables trials
 cfg.trustedKeys = { { "kid-1", "<base64-Ed25519-public-key>" } };
 
 licensing_ = std::make_unique<keylight::juce_integration::Licensing>(cfg);
@@ -110,9 +112,42 @@ licensing_ = std::make_unique<keylight::juce_integration::Licensing>(cfg);
 // Optional: react to state changes on the message thread
 licensing_->onStateChanged = [this](keylight::State s) { /* repaint editor */ };
 
-// Refresh from server on launch (non-blocking — runs on a background thread)
+// Refresh from server on launch (non-blocking — runs on a background thread).
+// This resolves an already-started local trial offline; it never starts one,
+// so a DAW scanning your plugin cannot consume the user's trial.
 licensing_->checkOnLaunch();
 ```
+
+### Start a trial (local, offline-first)
+
+Trials are entirely local: `startTrial()` writes a start timestamp next to the
+lease and the window is measured against the local clock — no API call, and no
+dependency on the free-tier/keyless feature. Call it only when the user asks
+for a trial (a "Start free trial" button), never on load.
+
+```cpp
+// In your PluginEditor button handler (message thread):
+processor.licensing().startTrial(
+    [this](keylight::Result<keylight::State> result)
+    {
+        // Back on the message thread. State::Trial while the window is open,
+        // State::Expired once it has elapsed, State::Licensed if a paid
+        // license is already active (paid licensing always wins).
+        if (result.is_ok())
+            statusLabel.setText(juce::String(processor.licensing().trialDaysLeft())
+                                    + " days left",
+                                juce::dontSendNotification);
+    });
+```
+
+`startTrial()` is idempotent — an existing trial start is never overwritten, so
+an elapsed trial cannot be restarted, and activating then deactivating a paid
+license leaves the original trial clock untouched. Trial state changes flow
+through `onStateChanged` and the `state()` snapshot like every other
+transition, so `processBlock` keeps reading a single atomic.
+
+`trialStatus()` (`NotStarted` / `Active` / `Expired`) and `trialDaysLeft()` are
+UI queries — call them from the message thread, not from `processBlock`.
 
 ### Gate a feature in processBlock
 
@@ -170,12 +205,13 @@ licensing_->startAutoValidation();
 
 | Method / event                          | Thread               |
 |-----------------------------------------|----------------------|
-| Constructor, `checkOnLaunch`, `activate`, `validate`, `deactivate` | Call from **message thread** |
+| Constructor, `checkOnLaunch`, `activate`, `validate`, `deactivate`, `startTrial` | Call from **message thread** |
 | Completion callbacks (`activate`, etc.) | Delivered on **message thread** via `callAsync` |
 | `onStateChanged`                        | Fires on **message thread** |
 | `state()`                               | **Any thread** (atomic load) |
 | `hasFeature(feature)`                   | **Any thread** — audio-thread safe (atomic load) |
 | `hasEntitlement(feature)` (SDK mutex)   | Message thread only  |
+| `trialStatus()` / `trialDaysLeft()` (SDK mutex) | Message thread only  |
 | `JuceUrlTransport::request()`           | Background `std::thread` only — never the audio thread |
 
 `JuceUrlTransport::request()` calls `juce::URL::createInputStream()` which

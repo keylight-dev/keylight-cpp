@@ -328,6 +328,44 @@ public:
     }
 
     // -----------------------------------------------------------------------
+    // startTrial — call from the message thread (e.g. a "Start free trial"
+    // button).  Begins the LOCAL, offline-first trial: the start timestamp is
+    // written to the on-disk store, so this is dispatched to the background
+    // thread like every other licensing call — never call it from
+    // processBlock.  Idempotent: an existing trial is never restarted.
+    //
+    // Nothing starts a trial implicitly.  A DAW that scans or instantiates the
+    // plugin runs checkOnLaunch(), which only *resolves* a trial that the user
+    // already started.
+    //
+    // The resulting state flows through the normal subscription, so
+    // state()/onStateChanged see State::Trial without any extra plumbing.
+    // -----------------------------------------------------------------------
+    void startTrial(std::function<void(keylight::Result<keylight::State>)> callback = {})
+    {
+        dispatch_([this, cb = std::move(callback)]()
+        {
+            auto result = client_->startTrial();
+            juce::MessageManager::callAsync([result, cb]()
+            {
+                if (cb) cb(result);
+            });
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Trial queries — message thread only (they take the SDK's cache mutex).
+    // For the audio thread use state() == keylight::State::Trial, which reads
+    // the atomic snapshot.
+    // -----------------------------------------------------------------------
+
+    /// Whole days left in the local trial (0 when disabled/not started/elapsed).
+    int trialDaysLeft() const { return client_->trialDaysLeft(); }
+
+    /// NotStarted / Active / Expired for the local trial.
+    keylight::TrialStatus trialStatus() const { return client_->checkTrial(); }
+
+    // -----------------------------------------------------------------------
     // startAutoValidation / stopAutoValidation
     // Delegates to keylight::Client's built-in auto-validation thread
     // (interval configured via Config::autoValidationIntervalMs, default 30 min).
