@@ -23,15 +23,19 @@ struct FakeTransport : keylight::Transport {
     std::string canned_body;
     int         canned_status = 200;
 
+    // Headers of the most recent request (used by the SDK-key auth check).
+    std::map<std::string, std::string> last_headers;
+
     explicit FakeTransport(std::string body = "{}", int status = 200)
         : canned_body(std::move(body)), canned_status(status) {}
 
     keylight::Result<keylight::HttpResponse> request(
         const std::string& /*method*/,
         const std::string& /*url*/,
-        const std::map<std::string, std::string>& /*headers*/,
+        const std::map<std::string, std::string>& headers,
         const std::string& /*body*/) override
     {
+        last_headers = headers;
         keylight::HttpResponse resp;
         resp.status = canned_status;
         resp.body   = canned_body;
@@ -161,6 +165,60 @@ static void test_client_initial_state() {
     std::cout << "  Client initial state (Invalid): ok\n";
 }
 
+static void test_sdk_key_header() {
+    keylight::Config cfg;
+    cfg.tenantId  = "acme";
+    cfg.productId = "widget";
+    cfg.sdkKey    = "sdk_live_single_header";
+
+    FakeTransport transport(R"({"activated":false})");
+    FakeStore     store;
+
+    keylight::Client client(cfg, transport, store);
+    (void)client.activate("KEY-0001");
+
+    auto it = transport.last_headers.find("X-Keylight-SDK-Key");
+    assert(it != transport.last_headers.end() &&
+           "activate must send X-Keylight-SDK-Key");
+    assert(it->second == "sdk_live_single_header" && "SDK key value mismatch");
+    std::cout << "  X-Keylight-SDK-Key header: ok\n";
+}
+
+static void test_local_trial() {
+    keylight::Config cfg;
+    cfg.tenantId          = "acme";
+    cfg.productId         = "widget";
+    cfg.sdkKey            = "sk_test";
+    cfg.trialDurationDays = 14;
+
+    FakeTransport transport;
+    FakeStore     store;
+
+    int64_t now = 1'700'000'000LL;
+    keylight::Client client(cfg, transport, store, [&]{ return now; });
+
+    // Nothing starts a trial implicitly.
+    assert(client.checkTrial() == keylight::TrialStatus::NotStarted);
+    assert(client.state() == keylight::State::Invalid);
+
+    auto r = client.startTrial();
+    assert(r.is_ok() && r.value() == keylight::State::Trial);
+    assert(client.checkTrial() == keylight::TrialStatus::Active);
+    assert(client.trialDaysLeft() == 14);
+
+    // Persisted and restored, with no network call.
+    now += 3 * 86400;
+    keylight::Client relaunched(cfg, transport, store, [&]{ return now; });
+    assert(relaunched.state() == keylight::State::Trial);
+    assert(relaunched.trialDaysLeft() == 11);
+
+    // Elapsed → Expired, and never restartable.
+    now += 20 * 86400;
+    assert(relaunched.checkTrial() == keylight::TrialStatus::Expired);
+    assert(relaunched.startTrial().value() == keylight::State::Expired);
+    std::cout << "  local trial: ok\n";
+}
+
 static void test_json_parse() {
     auto jr = keylight::Json::parse(R"({"hello":"world","n":42})");
     assert(jr.is_ok());
@@ -184,6 +242,8 @@ int main() {
     test_result_void();
     test_verifier_unknown_kid();
     test_client_initial_state();
+    test_sdk_key_header();
+    test_local_trial();
     test_json_parse();
 
     std::cout << "test_amalgamation: ALL PASSED\n";

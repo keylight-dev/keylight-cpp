@@ -41,6 +41,7 @@ Licensing shouldn't mean bolting a heavyweight, phone-home-or-die SDK onto your 
 - [JUCE](#juce)
 - [License Lifecycle](#license-lifecycle)
 - [License States](#license-states)
+- [Trials](#trials)
 - [Entitlements](#entitlements)
 - [Offline & Security](#offline--security)
 - [Configuration Reference](#configuration-reference)
@@ -58,7 +59,7 @@ include(FetchContent)
 FetchContent_Declare(
   keylight
   GIT_REPOSITORY https://github.com/keylight-dev/keylight-cpp.git
-  GIT_TAG        v0.1.0
+  GIT_TAG        v0.1.5
 )
 FetchContent_MakeAvailable(keylight)
 
@@ -103,7 +104,7 @@ vcpkg install "keylight[httplib-transport]"
 ### Conan
 
 ```bash
-conan install keylight/0.1.0@
+conan install keylight/0.1.5@
 ```
 
 > Conan Center submission is planned for a future release.
@@ -119,10 +120,11 @@ conan install keylight/0.1.0@
 int main() {
     // 1. Build a Config with your tenant/product credentials.
     keylight::Config cfg;
-    cfg.tenantId      = "your-tenant";
-    cfg.productId     = "your-product";
-    cfg.sdkKey        = "sdk_live_...";
-    cfg.maxOfflineDays = 7;  // optional offline grace window
+    cfg.tenantId          = "your-tenant";
+    cfg.productId         = "your-product";
+    cfg.sdkKey            = "sdk_live_...";  // sent as X-Keylight-SDK-Key on every call
+    cfg.trialDurationDays = 14;              // local trial length (0 = trials disabled)
+    cfg.maxOfflineDays    = 7;               // optional offline grace window
 
     // 2. Fetch the tenant's trusted Ed25519 keyset so leases verify offline.
     //    (You can also pin keys explicitly via cfg.trustedKeys["kid"] = base64_pub.)
@@ -138,8 +140,14 @@ int main() {
     // 4. Construct the Client — primes state from the persisted store immediately.
     keylight::Client client(cfg, transport, store);
 
-    // 5. On launch: refresh if the cached lease is stale (debounced, non-blocking).
+    // 5. On launch: revalidate a stored license, or resolve an already-started
+    //    local trial offline. Never starts a trial by itself.
     client.checkOnLaunch();
+
+    // 5b. Start the local trial — only when the user asks for one.
+    if (client.checkTrial() == keylight::TrialStatus::NotStarted) {
+        client.startTrial();   // → State::Trial for the next 14 days
+    }
 
     // 6. Activate a license key (online). The returned lease is Ed25519-verified
     //    *before* anything is persisted.
@@ -193,8 +201,8 @@ A JUCE adapter lives in [`integrations/juce/`](integrations/juce/) and provides:
 - **`keylight::juce_integration::JuceUrlTransport`** — a `keylight::Transport` adapter over
   `juce::URL::createInputStream` with no OpenSSL dependency and no cpp-httplib.
 - **`keylight::juce_integration::Licensing`** — owns the `Client`, `FileStore`, and transport;
-  exposes `activate` / `validate` / `deactivate` / `checkOnLaunch` with message-thread callbacks
-  via `juce::MessageManager::callAsync`. `state()` and `hasFeature()` read a `std::atomic`
+  exposes `activate` / `validate` / `deactivate` / `checkOnLaunch` / `startTrial` with
+  message-thread callbacks via `juce::MessageManager::callAsync`. `state()` and `hasFeature()` read a `std::atomic`
   snapshot — safe to call from the audio thread.
 
 Compiles against JUCE 7 and JUCE 8 with zero extra dependencies beyond `juce_core`.
@@ -221,8 +229,11 @@ Compiles against JUCE 7 and JUCE 8 with zero extra dependencies beyond `juce_cor
 | `activate(key) → Result<State>` | Activates a key on this device. Verifies the returned lease before persisting. |
 | `validate() → Result<State>` | Re-checks the stored license online. Network failures are non-fatal (grace window applies). |
 | `deactivate() → Result<void>` | Releases the seat and clears local license state, even if the network call fails. |
-| `refreshIfNeeded() → Result<State>` | Validates only if due (debounce 5 min, stale 6 h, within 24 h of expiry). Safe to call often. |
-| `checkOnLaunch() → Result<State>` | Convenience: refresh if a license is stored, else no-op. |
+| `refreshIfNeeded() → Result<State>` | Validates only if due (debounce 5 min, stale 6 h, within 24 h of expiry). With no stored license it re-resolves the local trial offline. Safe to call often. |
+| `checkOnLaunch() → Result<State>` | Revalidates a stored license; otherwise resolves the persisted local trial offline. Never starts a trial. |
+| `startTrial() → Result<State>` | Explicitly begins the local trial (idempotent; never restarts one). No network call. |
+| `checkTrial() → TrialStatus` | `NotStarted` / `Active` / `Expired` for the local trial. |
+| `trialDaysLeft() → int` | Whole days left in the local trial (0 when disabled, not started, or elapsed). |
 
 ## License States
 
@@ -244,6 +255,60 @@ switch (client.state()) {
     case keylight::State::Invalid:  /* prompt activate */ break;
 }
 ```
+
+## Trials
+
+Trials are **local and offline-first**. `startTrial()` persists a start timestamp
+next to the lease; the window is then measured against the local clock with no
+API call at all. (The free-tier / keyless reporting feature is separate — trial
+validity never depends on it.)
+
+```cpp
+keylight::Config cfg;
+cfg.tenantId          = "your-tenant";
+cfg.productId         = "your-product";
+cfg.sdkKey            = "sdk_live_...";
+cfg.trialDurationDays = 14;      // 0 (the default) disables trials entirely
+
+keylight::Client client(cfg, transport, store);
+
+// Explicit — nothing starts a trial implicitly.
+client.startTrial();             // → State::Trial
+
+client.checkTrial();             // TrialStatus::Active
+client.trialDaysLeft();          // 14
+
+// On the next launch: resolves the persisted trial with no network call.
+client.checkOnLaunch();          // → State::Trial (or Expired once elapsed)
+```
+
+Rules the state machine guarantees:
+
+- **`trialDurationDays <= 0` disables trials.** Nothing is persisted and
+  `checkTrial()` stays `NotStarted`.
+- **`checkOnLaunch()` never starts a trial.** It only resolves one the user
+  already started — important for JUCE plugins, since a DAW may scan or
+  instantiate a plugin without the user ever asking for a trial.
+- **`startTrial()` is idempotent.** An existing start timestamp is never
+  overwritten, so an elapsed trial cannot be restarted.
+- **A running trial elapses on its own.** `state()` is an atomic read, so it
+  never recomputes; `checkOnLaunch()` and `refreshIfNeeded()` re-resolve the
+  trial (offline, no request) and notify subscribers, and
+  `startAutoValidation()` ticks the latter for long-running hosts.
+- **Paid licensing always wins.** Activating during a trial resolves
+  `Licensed`; deactivating later returns to whatever the *original* trial has
+  become (`Trial` if still running, `Expired` if it elapsed meanwhile,
+  `Invalid` if there never was one). Deactivation does not reset the trial clock.
+
+State priority: valid paid license → active local trial → elapsed local trial →
+`Invalid`.
+
+> **Not tamper-proof.** The trial start lives in the same on-disk JSON blob as
+> the lease. Clearing that file (or a fresh install on a clean machine) starts
+> the user over — the store makes no reinstall-proof or anti-tamper claim. The
+> Ed25519 signature is the security boundary for *paid* licenses; the local
+> trial is a convenience, and a backwards clock jump is clamped rather than
+> credited.
 
 ## Entitlements
 
@@ -280,11 +345,11 @@ Populate a `keylight::Config` struct:
 |-------|------|---------|-------------|
 | `tenantId` | `std::string` | — | Your Keylight tenant (required). |
 | `productId` | `std::string` | — | Your product (required). |
-| `sdkKey` | `std::string` | — | Tenant SDK key (sent as `X-Keylight-SDK-Key`). |
+| `sdkKey` | `std::string` | — | Tenant SDK key, sent as `X-Keylight-SDK-Key` on every API call. Required — the API answers `401` without it. |
 | `trustedKeys` | `map<string,string>` | empty | Trusted Ed25519 public keys (`kid → base64`) for offline verification. |
 | `maxOfflineDays` | `int` | `7` | Offline grace window since last online validation. Set `0` to run offline as long as the lease itself is current. |
 | `keyPrefix` | `std::string` | — | Client-side key-format check (e.g. `"PROD"`). |
-| `trialDurationDays` | `int` | `0` | Local trial length in days (0 = trials disabled). |
+| `trialDurationDays` | `int` | `0` | Local trial length in days (0 = trials disabled). See [Trials](#trials). |
 | `apiBaseUrl` | `std::string` | `https://api.keylight.dev` | Keylight API base URL. |
 | `appVersion` | `std::string` | — | Reported in activation/validation telemetry. |
 | `autoValidationIntervalMs` | `int` | `1800000` | Background auto-validation interval (ms); used only when `startAutoValidation()` is called. |

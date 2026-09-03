@@ -1,3 +1,57 @@
+## [0.1.5] - 2026-09-03
+
+### Fixed
+
+- **The tenant SDK key is now actually sent.** `Config::sdkKey` was documented as
+  being sent as `X-Keylight-SDK-Key`, but the core `Client` only ever set
+  `Content-Type`, so `activate`, `validate`, `deactivate` and the launch-time
+  revalidation could come back `401`. Every API call now goes through one header
+  helper that adds `X-Keylight-SDK-Key` whenever `sdkKey` is configured. Set
+  `cfg.sdkKey` and no other code change is needed.
+- **Persisted state is serialized in one place.** `activate`, `validate`, lease
+  refresh, lease clearing (revoke), and `deactivate` each rebuilt the on-disk JSON
+  blob themselves, so a partial write could drop fields it had not touched
+  (`licenseKey` was lost on every `validate`). The blob is now rebuilt from the
+  in-memory cache by a single serializer, so no path can erase a field it does
+  not own.
+
+### Added
+
+- **Local trials.** `Config::trialDurationDays` is finally wired up, following the
+  Rust SDK's model: trials are **local and offline-first**, persisted on-device as
+  a `trialStart` timestamp, and never dependent on the free-tier/keyless endpoint
+  (which stays a separate feature).
+
+  New public API on `keylight::Client`:
+
+  | Method | Description |
+  |--------|-------------|
+  | `startTrial() → Result<State>` | Explicitly begins the trial. Idempotent — never restarts an existing or elapsed one. |
+  | `checkTrial() → TrialStatus` | `NotStarted` / `Active` / `Expired`. |
+  | `trialDaysLeft() → int` | Whole days remaining (0 when disabled/not started/elapsed). |
+
+  Semantics: `trialDurationDays <= 0` disables trials entirely; `checkOnLaunch()`
+  resolves a persisted trial offline but **never starts one** (a DAW scanning a
+  plugin must not consume the user's trial); state priority is valid paid license
+  → active trial → elapsed trial → `Invalid`; and deactivating a paid license
+  restores the *original* trial state without resetting its clock.
+
+  The trial start is stored in the same JSON blob as the lease — it is a
+  convenience, not a tamper-proof or reinstall-proof mechanism.
+
+- **`refreshIfNeeded()` re-resolves the local trial.** With no stored license it
+  used to return the cached state verbatim, so a trial that ran out mid-session
+  stayed `Trial` until the next launch. `keylight-rust` and `keylight-js`
+  recompute `check_trial()` inside `state()` on every call; C++ `state()` is an
+  atomic read (audio-thread contract) and cannot, so `refreshIfNeeded()` carries
+  that duty — hosts already call it on focus/resume and `startAutoValidation()`
+  ticks it. Still no network call when there is no license to validate.
+
+- **JUCE adapter trial support.** `Licensing::startTrial(callback)` runs on the
+  existing background dispatch (never `processBlock`) and reports through the same
+  state snapshot / `onStateChanged` subscription; `trialStatus()` and
+  `trialDaysLeft()` are message-thread UI queries.
+
 ## [0.1.4] - 2026-08-07
 
 ### Added
