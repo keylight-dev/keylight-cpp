@@ -363,3 +363,200 @@ TEST_CASE("Instance id: survives activate and validate") {
     REQUIRE(client.validate().is_ok());
     CHECK(store.str_field("freeTierInstanceId") == id);
 }
+
+// ===========================================================================
+// Hardware id, machine_hash and the keyless beacon
+// ===========================================================================
+
+TEST_CASE("Hardware id: cached after the first successful read") {
+    auto cfg = canonical_config();
+    RecordingTransport transport;
+    MemStore           store;
+    int64_t now   = T0;
+    int     reads = 0;
+
+    // Succeeds once, then fails — models a transient IOKit/registry failure.
+    auto flaky = [&]() -> std::optional<std::string> {
+        if (reads++ == 0) return std::string("hardware-1");
+        return std::nullopt;
+    };
+
+    Client client(cfg, transport, store, [&]{ return now; }, flaky);
+    client.reportKeylessState(KeylessState::FreeTier);
+    CHECK(store.str_field("cachedHardwareId") == "hardware-1");
+
+    // A later beacon must still carry the hash, from the cached id.
+    transport.calls.clear();
+    client.reportKeylessState(KeylessState::Expired);
+    const auto* call = transport.last_call_for("keyless");
+    REQUIRE(call != nullptr);
+    CHECK(call->body.find(CANONICAL_HASH) != std::string::npos);
+}
+
+TEST_CASE("Hardware id: machine_hash omitted entirely when none is available") {
+    auto cfg = canonical_config();
+    RecordingTransport transport;
+    MemStore           store;
+    int64_t now = T0;
+    auto none = []() -> std::optional<std::string> { return std::nullopt; };
+
+    Client client(cfg, transport, store, [&]{ return now; }, none);
+    client.reportKeylessState(KeylessState::FreeTier);
+
+    const auto* call = transport.last_call_for("keyless");
+    REQUIRE(call != nullptr);
+    CHECK(call->body.find("machine_hash") == std::string::npos);
+}
+
+TEST_CASE("Hardware id: an empty id is treated as absent") {
+    auto cfg = canonical_config();
+    RecordingTransport transport;
+    MemStore           store;
+    int64_t now = T0;
+    auto empty = []() -> std::optional<std::string> { return std::string(""); };
+
+    Client client(cfg, transport, store, [&]{ return now; }, empty);
+    client.reportKeylessState(KeylessState::FreeTier);
+
+    const auto* call = transport.last_call_for("keyless");
+    REQUIRE(call != nullptr);
+    CHECK(call->body.find("machine_hash") == std::string::npos);
+}
+
+TEST_CASE("Beacon: posts instance_id, state and the SDK key to /keyless") {
+    auto cfg = canonical_config();
+    RecordingTransport transport;
+    MemStore           store;
+    int64_t now = T0;
+    auto hw = []() -> std::optional<std::string> { return std::string("hardware-1"); };
+
+    Client client(cfg, transport, store, [&]{ return now; }, hw);
+    const std::string id = client.freeTierInstanceId();
+    client.reportKeylessState(KeylessState::FreeTier);
+
+    const auto* call = transport.last_call_for("keyless");
+    REQUIRE(call != nullptr);
+    CHECK(call->method == "POST");
+    CHECK(call->url    == "https://api.keylight.dev/testco/testapp/keyless");
+    CHECK(RecordingTransport::header(*call, "X-Keylight-SDK-Key") == SDK_KEY);
+    CHECK(call->body.find("\"instance_id\":\"" + id + "\"") != std::string::npos);
+    CHECK(call->body.find("\"state\":\"free_tier\"")        != std::string::npos);
+    CHECK(call->body.find(CANONICAL_HASH)                   != std::string::npos);
+    CHECK(call->body.find("\"sdk\":\"cpp\"")                != std::string::npos);
+}
+
+TEST_CASE("Beacon: debounced — same state inside 24h sends nothing") {
+    auto cfg = canonical_config();
+    RecordingTransport transport;
+    MemStore           store;
+    int64_t now = T0;
+    auto none = []() -> std::optional<std::string> { return std::nullopt; };
+
+    Client client(cfg, transport, store, [&]{ return now; }, none);
+    client.reportKeylessState(KeylessState::FreeTier);
+    REQUIRE(transport.calls.size() == 1);
+
+    now = T0 + 23 * 3600;
+    client.reportKeylessState(KeylessState::FreeTier);
+    CHECK(transport.calls.size() == 1);
+}
+
+TEST_CASE("Beacon: a changed state defeats the debounce immediately") {
+    auto cfg = canonical_config();
+    RecordingTransport transport;
+    MemStore           store;
+    int64_t now = T0;
+    auto none = []() -> std::optional<std::string> { return std::nullopt; };
+
+    Client client(cfg, transport, store, [&]{ return now; }, none);
+    client.reportKeylessState(KeylessState::Trial);
+    REQUIRE(transport.calls.size() == 1);
+
+    now = T0 + 60;
+    client.reportKeylessState(KeylessState::FreeTier);
+    CHECK(transport.calls.size() == 2);
+}
+
+TEST_CASE("Beacon: the same state sends again once 24h have passed") {
+    auto cfg = canonical_config();
+    RecordingTransport transport;
+    MemStore           store;
+    int64_t now = T0;
+    auto none = []() -> std::optional<std::string> { return std::nullopt; };
+
+    Client client(cfg, transport, store, [&]{ return now; }, none);
+    client.reportKeylessState(KeylessState::FreeTier);
+    REQUIRE(transport.calls.size() == 1);
+
+    now = T0 + DAY + 1;
+    client.reportKeylessState(KeylessState::FreeTier);
+    CHECK(transport.calls.size() == 2);
+}
+
+TEST_CASE("Beacon: a non-200 response does NOT arm the debounce") {
+    // keylight-rust records the debounce only on success, so a failed beacon
+    // cannot suppress free-tier reporting for a full day.
+    auto cfg = canonical_config();
+    RecordingTransport transport;
+    MemStore           store;
+    transport.next_status = 500;
+    int64_t now = T0;
+    auto none = []() -> std::optional<std::string> { return std::nullopt; };
+
+    Client client(cfg, transport, store, [&]{ return now; }, none);
+    client.reportKeylessState(KeylessState::FreeTier);
+    REQUIRE(transport.calls.size() == 1);
+    CHECK_FALSE(store.has_field("keylessLastState"));
+
+    now = T0 + 60;
+    transport.next_status = 200;
+    client.reportKeylessState(KeylessState::FreeTier);
+    CHECK(transport.calls.size() == 2);
+    CHECK(store.str_field("keylessLastState") == "free_tier");
+    CHECK(store.int_field("lastKeylessPingAt") == now);
+}
+
+TEST_CASE("Beacon: a network error is swallowed and leaves the debounce unarmed") {
+    auto cfg = canonical_config();
+    RecordingTransport transport;
+    MemStore           store;
+    transport.fail = true;
+    int64_t now = T0;
+    auto none = []() -> std::optional<std::string> { return std::nullopt; };
+
+    Client client(cfg, transport, store, [&]{ return now; }, none);
+    client.reportKeylessState(KeylessState::FreeTier);   // must not throw
+    CHECK_FALSE(store.has_field("keylessLastState"));
+}
+
+TEST_CASE("Beacon: the debounce survives a relaunch") {
+    auto cfg = canonical_config();
+    RecordingTransport transport;
+    MemStore           store;
+    int64_t now = T0;
+    auto none = []() -> std::optional<std::string> { return std::nullopt; };
+
+    {
+        Client client(cfg, transport, store, [&]{ return now; }, none);
+        client.reportKeylessState(KeylessState::FreeTier);
+    }
+    REQUIRE(transport.calls.size() == 1);
+
+    now = T0 + 3600;
+    Client relaunched(cfg, transport, store, [&]{ return now; }, none);
+    relaunched.reportKeylessState(KeylessState::FreeTier);
+    CHECK(transport.calls.size() == 1);
+}
+
+TEST_CASE("Beacon: reporting never changes the resolved state") {
+    auto cfg = canonical_config();
+    RecordingTransport transport;
+    MemStore           store;
+    int64_t now = T0;
+    auto none = []() -> std::optional<std::string> { return std::nullopt; };
+
+    Client client(cfg, transport, store, [&]{ return now; }, none);
+    REQUIRE(client.checkOnLaunch().value() == State::FreeTier);
+    client.reportKeylessState(KeylessState::FreeTier);
+    CHECK(client.state() == State::FreeTier);
+}

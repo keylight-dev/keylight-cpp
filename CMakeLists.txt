@@ -189,6 +189,15 @@ if(KEYLIGHT_BUILD_TESTS)
   # Only the repo root is on the include path — no split-header directories.
   target_include_directories(test_amalgamation PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}")
+  # Deliberately does NOT link the keylight target — this compiles the single
+  # header exactly as an end user would. It does still need the system
+  # frameworks machine_id.hpp reads the hardware id through, which is precisely
+  # the link line a single-header consumer must supply for themselves.
+  if(APPLE)
+    target_link_libraries(test_amalgamation PRIVATE "-framework IOKit" "-framework CoreFoundation")
+  elseif(WIN32)
+    target_link_libraries(test_amalgamation PRIVATE advapi32)
+  endif()
   add_test(NAME test_amalgamation COMMAND test_amalgamation)
   set_tests_properties(test_amalgamation PROPERTIES
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
