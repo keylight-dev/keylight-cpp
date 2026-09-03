@@ -19,6 +19,13 @@
  * after every SDK state transition.  No mutex, no allocation, no juce::String
  * construction happens on the audio thread — just two relaxed atomic loads.
  *
+ * state_snapshot_ is re-read from client_->state() on every transition — it is
+ * NOT the State handed to the subscription callback.  Those two differ: the
+ * callback carries the raw resolved state, while Client::state() additionally
+ * fails closed when the system clock has been rolled back.  Storing the
+ * callback's parameter would drop that guard on the first transition and leave
+ * the plugin unlocked against a moved clock.
+ *
  * JUCE version compatibility: JUCE 7 and JUCE 8.
  *
  * Manual verification pending: compile in a real JUCE plugin project.
@@ -208,7 +215,13 @@ public:
         {
             // Update atomics (may be called from any thread, but always from
             // our own background thread — never from the audio thread).
-            state_snapshot_.store(newState, std::memory_order_relaxed);
+            //
+            // Store client_->state(), NOT `newState`. The callback carries the
+            // raw resolved state; Client::state() additionally fails closed on
+            // a rolled-back system clock. Storing the parameter would overwrite
+            // the guarded seed on the very first transition and disable the
+            // guard for the rest of the session. Still a single atomic store.
+            state_snapshot_.store(client_->state(), std::memory_order_relaxed);
             refresh_entitlement_cache_();
 
             // Anonymous funnel beacon. Swift's LicenseManager reports
