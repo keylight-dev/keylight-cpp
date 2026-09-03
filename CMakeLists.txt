@@ -4,13 +4,22 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ---------------------------------------------------------------------------
-# Core library — zero external dependencies
+# Core library — no third-party dependencies (system frameworks only)
 # ---------------------------------------------------------------------------
 add_library(keylight INTERFACE)
 add_library(keylight::keylight ALIAS keylight)
 target_include_directories(keylight INTERFACE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
+
+# machine_id.hpp reads the OS hardware id for the keyless beacon's machine_hash.
+# This is the ONLY external linkage the core needs; there are still no
+# third-party library dependencies.
+if(APPLE)
+  target_link_libraries(keylight INTERFACE "-framework IOKit" "-framework CoreFoundation")
+elseif(WIN32)
+  target_link_libraries(keylight INTERFACE advapi32)
+endif()
 
 # ---------------------------------------------------------------------------
 # Opt-in: cpp-httplib + OpenSSL transport
