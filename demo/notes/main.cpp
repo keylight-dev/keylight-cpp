@@ -74,6 +74,7 @@ static const char* state_name(keylight::State s) {
         case keylight::State::Trial:    return "Trial";
         case keylight::State::Expired:  return "Expired";
         case keylight::State::Invalid:  return "Invalid";
+        case keylight::State::FreeTier: return "Free tier";
     }
     return "Unknown";
 }

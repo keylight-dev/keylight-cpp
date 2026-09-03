@@ -11,6 +11,11 @@
 
 #include "keylight_single.hpp"
 
+// Every check below is a bare assert().  A Release build defines NDEBUG, which
+// would compile all of them away and leave this test passing vacuously — the
+// release workflow builds Release, so that hole was live.  Undefine it before
+// <cassert> so the checks run in every configuration.
+#undef NDEBUG
 #include <cassert>
 #include <iostream>
 #include <string>
