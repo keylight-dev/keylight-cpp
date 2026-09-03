@@ -48,6 +48,9 @@ enum class State {
     Trial,      // no license; within trial window
     Expired,    // trusted lease expired, or license status "expired"/"fallback"
     Invalid,    // no trusted lease, no active trial
+    FreeTier,   // no license and no trial, but the product offers a free tier.
+                // Appended last on purpose: renumbering the values above would
+                // break any integrator that persisted a State as an integer.
 };
 
 // ---------------------------------------------------------------------------
@@ -62,6 +65,26 @@ enum class TrialStatus {
     Active,     // within trialDurationDays of the persisted start
     Expired,    // the trial window has elapsed
 };
+
+// ---------------------------------------------------------------------------
+// KeylessState — what the anonymous keyless beacon reports (mirrors
+// keylight-rust KeylessState).  The wire strings are fixed by the server and
+// shared with every other Keylight SDK.
+// ---------------------------------------------------------------------------
+enum class KeylessState {
+    Trial,
+    FreeTier,
+    Expired,
+};
+
+inline const char* keyless_state_wire(KeylessState s) {
+    switch (s) {
+        case KeylessState::Trial:    return "trial";
+        case KeylessState::FreeTier: return "free_tier";
+        case KeylessState::Expired:  return "expired";
+    }
+    return "expired";
+}
 
 // ---------------------------------------------------------------------------
 // compile-time platform string (matches Rust telemetry.rs)
@@ -963,11 +986,17 @@ private:
             return paid_state;
         }
         switch (checkTrial()) {
-            case TrialStatus::Active:  return State::Trial;
-            case TrialStatus::Expired: return State::Expired;
-            case TrialStatus::NotStarted: break;
+            case TrialStatus::Active:
+                return State::Trial;
+            case TrialStatus::Expired:
+                // Free tier outranks an elapsed trial: keylight-rust's
+                // `_ if free_tier_enabled` arm sits AFTER the trial match, so a
+                // lapsed trial drops to the free tier rather than the paywall.
+                return cfg_.freeTierEnabled ? State::FreeTier : State::Expired;
+            case TrialStatus::NotStarted:
+                break;
         }
-        return State::Invalid;
+        return cfg_.freeTierEnabled ? State::FreeTier : State::Invalid;
     }
 
     /// Re-resolve the current state offline. When any paid-licensing material

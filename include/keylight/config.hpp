@@ -15,6 +15,10 @@ struct Config {
     int         maxOfflineDays     = 15;
     std::string keyPrefix;
     int         trialDurationDays  = 0;
+    // Free tier: when true, a device with no license and no active trial
+    // resolves State::FreeTier instead of Invalid/Expired.  Parity with
+    // keylight-rust Config::free_tier_enabled.
+    bool        freeTierEnabled    = false;
     std::string apiBaseUrl         = "https://api.keylight.dev";
     std::string appVersion;        // optional; sent as telemetry in activate/validate
 
