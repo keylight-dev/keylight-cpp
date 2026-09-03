@@ -1075,3 +1075,35 @@ TEST_CASE("Client: every request carries a unique X-Keylight-Request-Id") {
     REQUIRE(client.validate().is_ok());
     CHECK(transport.last_request_headers["X-Keylight-Request-Id"] != first);
 }
+
+TEST_CASE("Client: activate surfaces the worker's error message") {
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; });
+
+    transport.next_status = 404;
+    transport.next_body   = R"({"error":"License key not found"})";
+
+    auto r = client.activate("XXXX-YYYY-ZZZZ-0001");
+    REQUIRE(!r.is_ok());
+    // This string goes straight into the integrator's UI. "activate HTTP 404"
+    // tells the customer nothing they can act on.
+    CHECK(r.error().message == "License key not found");
+}
+
+TEST_CASE("Client: activate falls back to the status line on an unparseable body") {
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; });
+
+    transport.next_status = 502;
+    transport.next_body   = "<html>gateway</html>";
+
+    auto r = client.activate("XXXX-YYYY-ZZZZ-0001");
+    REQUIRE(!r.is_ok());
+    CHECK(r.error().message == "activate HTTP 502");
+}

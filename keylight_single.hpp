@@ -2313,7 +2313,7 @@ public:
         const auto& resp = hr.value();
         if (resp.status != 200) {
             return Result<State>::err({ErrorCode::Http,
-                "activate HTTP " + std::to_string(resp.status)});
+                http_error_message_(resp.body, "activate", resp.status)});
         }
 
         // Parse activate response
@@ -2478,12 +2478,9 @@ public:
             if (!hr.is_ok()) {
                 server_error = hr.error();
             } else if (hr.value().status != 200) {
-                // http_error_message_ is added in Task 7; use a literal
-                // fallback here so this task compiles and passes standalone.
                 server_error = Error{ErrorCode::Http,
-                    hr.value().body.empty()
-                        ? ("deactivate HTTP " + std::to_string(hr.value().status))
-                        : hr.value().body};
+                    http_error_message_(hr.value().body, "deactivate",
+                                        hr.value().status)};
             }
         }
 
@@ -2928,6 +2925,26 @@ private:
         }
         headers["X-Keylight-Request-Id"] = detail::random_request_id();
         return headers;
+    }
+
+    // The worker's human-readable rejection reason, e.g. "License key not
+    // found" or "Activation limit reached". This is the string an integrator's
+    // UI shows the customer, so a status line is the fallback, not the default.
+    // `message` is accepted alongside `error` because the two are used
+    // interchangeably across worker routes.
+    static std::string http_error_message_(const std::string& body,
+                                           const std::string& action,
+                                           int                status)
+    {
+        const std::string fallback = action + " HTTP " + std::to_string(status);
+        if (body.empty()) return fallback;
+
+        auto jr = Json::parse(body);
+        if (!jr.is_ok()) return fallback;
+
+        std::string msg = jr.value()["error"].as_string();
+        if (msg.empty()) msg = jr.value()["message"].as_string();
+        return msg.empty() ? fallback : msg;
     }
 
     // Tiny JSON string escaping (no control chars expected in these values)
