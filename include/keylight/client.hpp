@@ -532,7 +532,17 @@ public:
     /// fix: it still governs long-running hosts between launches.
     Result<State> refreshIfNeeded() {
         if (!has_stored_license_()) {
-            return Result<State>::ok(state_.load());
+            // No paid license — nothing to revalidate online, but the local
+            // trial may have elapsed since the last resolve. keylight-rust and
+            // keylight-js recompute check_trial() inside state() on every call;
+            // C++ state() reads an atomic (audio-thread contract) and cannot,
+            // so the trial is re-resolved here instead. Hosts already call this
+            // on focus/resume, and startAutoValidation() ticks it, so a trial
+            // that runs out mid-session downgrades on its own and the change
+            // reaches subscribers. Still purely local — no network call.
+            State new_state = resolve_current_state_();
+            set_state_(new_state);
+            return Result<State>::ok(new_state);
         }
 
         int64_t now          = now_fn_();

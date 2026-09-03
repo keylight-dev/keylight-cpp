@@ -640,3 +640,61 @@ TEST_CASE("Trial: state transitions fire subscription events") {
     REQUIRE(seen.size() == 2);
     CHECK(seen.back() == State::Licensed);
 }
+
+TEST_CASE("Trial: refreshIfNeeded downgrades a trial that elapsed mid-session") {
+    // keylight-rust/keylight-js recompute check_trial() inside state(); C++
+    // state() is an atomic read, so refreshIfNeeded() carries that duty for a
+    // long-running host (window focus, resume, or the auto-validation tick).
+    auto cfg = make_config(14);
+    RecordingTransport transport;
+    MemStore           store;
+    transport.fail = true; // a local trial must never need the network
+
+    int64_t now = T0;
+    Client client(cfg, transport, store, [&]{ return now; });
+    REQUIRE(client.startTrial().is_ok());
+    REQUIRE(client.state() == State::Trial);
+
+    std::vector<State> seen;
+    auto sub = client.subscribe([&](State s){ seen.push_back(s); });
+
+    // Still inside the window: no transition, no request.
+    now = T0 + 13 * DAY;
+    auto r = client.refreshIfNeeded();
+    REQUIRE(r.is_ok());
+    CHECK(r.value() == State::Trial);
+    CHECK(seen.empty());
+
+    // Window elapsed: downgrade to Expired and tell subscribers.
+    now = T0 + 14 * DAY;
+    r = client.refreshIfNeeded();
+    REQUIRE(r.is_ok());
+    CHECK(r.value()      == State::Expired);
+    CHECK(client.state() == State::Expired);
+    REQUIRE(seen.size() == 1);
+    CHECK(seen.back() == State::Expired);
+    CHECK(transport.calls.empty());
+}
+
+TEST_CASE("Trial: refreshIfNeeded leaves a licensed client alone") {
+    auto cfg = make_config(14);
+    RecordingTransport transport;
+    MemStore           store;
+
+    int64_t now = T0;
+    Client client(cfg, transport, store, [&]{ return now; });
+    REQUIRE(client.startTrial().is_ok());
+
+    transport.next_body = ACTIVATE_OK;
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+    REQUIRE(client.state() == State::Licensed);
+
+    // Debounced (< 5 min since the activate's online validation): no request,
+    // and the trial fallback must not touch a Licensed client.
+    transport.calls.clear();
+    now = T0 + 60;
+    auto r = client.refreshIfNeeded();
+    REQUIRE(r.is_ok());
+    CHECK(r.value() == State::Licensed);
+    CHECK(transport.calls.empty());
+}

@@ -39,6 +39,14 @@
   The trial start is stored in the same JSON blob as the lease — it is a
   convenience, not a tamper-proof or reinstall-proof mechanism.
 
+- **`refreshIfNeeded()` re-resolves the local trial.** With no stored license it
+  used to return the cached state verbatim, so a trial that ran out mid-session
+  stayed `Trial` until the next launch. `keylight-rust` and `keylight-js`
+  recompute `check_trial()` inside `state()` on every call; C++ `state()` is an
+  atomic read (audio-thread contract) and cannot, so `refreshIfNeeded()` carries
+  that duty — hosts already call it on focus/resume and `startAutoValidation()`
+  ticks it. Still no network call when there is no license to validate.
+
 - **JUCE adapter trial support.** `Licensing::startTrial(callback)` runs on the
   existing background dispatch (never `processBlock`) and reports through the same
   state snapshot / `onStateChanged` subscription; `trialStatus()` and

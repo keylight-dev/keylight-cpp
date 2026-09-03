@@ -229,7 +229,7 @@ Compiles against JUCE 7 and JUCE 8 with zero extra dependencies beyond `juce_cor
 | `activate(key) → Result<State>` | Activates a key on this device. Verifies the returned lease before persisting. |
 | `validate() → Result<State>` | Re-checks the stored license online. Network failures are non-fatal (grace window applies). |
 | `deactivate() → Result<void>` | Releases the seat and clears local license state, even if the network call fails. |
-| `refreshIfNeeded() → Result<State>` | Validates only if due (debounce 5 min, stale 6 h, within 24 h of expiry). Safe to call often. |
+| `refreshIfNeeded() → Result<State>` | Validates only if due (debounce 5 min, stale 6 h, within 24 h of expiry). With no stored license it re-resolves the local trial offline. Safe to call often. |
 | `checkOnLaunch() → Result<State>` | Revalidates a stored license; otherwise resolves the persisted local trial offline. Never starts a trial. |
 | `startTrial() → Result<State>` | Explicitly begins the local trial (idempotent; never restarts one). No network call. |
 | `checkTrial() → TrialStatus` | `NotStarted` / `Active` / `Expired` for the local trial. |
@@ -291,6 +291,10 @@ Rules the state machine guarantees:
   instantiate a plugin without the user ever asking for a trial.
 - **`startTrial()` is idempotent.** An existing start timestamp is never
   overwritten, so an elapsed trial cannot be restarted.
+- **A running trial elapses on its own.** `state()` is an atomic read, so it
+  never recomputes; `checkOnLaunch()` and `refreshIfNeeded()` re-resolve the
+  trial (offline, no request) and notify subscribers, and
+  `startAutoValidation()` ticks the latter for long-running hosts.
 - **Paid licensing always wins.** Activating during a trial resolves
   `Licensed`; deactivating later returns to whatever the *original* trial has
   become (`Trial` if still running, `Expired` if it elapsed meanwhile,
