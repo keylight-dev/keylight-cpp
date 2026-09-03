@@ -30,6 +30,9 @@
   a `Limited` arm. Unreal Blueprint users: `EKeylightState` enum is appended
   with `FreeTier` and `Limited`; ensure your state-switch logic covers both
   values (existing serialized state values are unchanged).
+- **JUCE:** The state switch (`Licensing::onStateChanged`) now handles
+  `State::Limited`, so a fallback lease from a signing-key incident surfaces as
+  the degraded state rather than being treated as expired.
 - **Breaking:** `deactivate()` returns the server's error instead of always
   succeeding. The local cache is still cleared either way.
 - Errors from the API now carry the server's message ("License key not found",
