@@ -18,6 +18,7 @@
 #include "KeylightJuce.h"
 
 #include <iostream>
+#include <string>
 
 int main()
 {
@@ -99,6 +100,34 @@ int main()
     {
         std::cerr << "FAIL: startTrial must be a no-op when trials are disabled\n";
         return 6;
+    }
+
+    // Keyless beacon: compile + link check ONLY, on both the adapter method and
+    // the SDK method underneath.
+    //
+    // Neither is invoked. This test is offline by contract and Licensing owns a
+    // real transport, so calling reportKeylessState() would attempt a live
+    // request against a bogus tenant. The beacon is not gated on
+    // freeTierEnabled — keylight-rust does not gate it either, since trial and
+    // expired are keyless states that exist without a free tier — so there is
+    // no configuration that makes a real call safe here. Behaviour is covered
+    // by tests/test_free_tier.cpp against a recording transport.
+    using ReportFn = void (keylight::juce_integration::Licensing::*)(
+        keylight::KeylessState, std::function<void()>);
+    const ReportFn reportFn =
+        &keylight::juce_integration::Licensing::reportKeylessState;
+    (void) reportFn;
+
+    using SdkReportFn = void (keylight::Client::*)(keylight::KeylessState);
+    const SdkReportFn sdkReportFn = &keylight::Client::reportKeylessState;
+    (void) sdkReportFn;
+
+    // The wire strings are pure and safe to assert offline.
+    if (std::string(keylight::keyless_state_wire(keylight::KeylessState::FreeTier))
+        != "free_tier")
+    {
+        std::cerr << "FAIL: keyless wire string mismatch\n";
+        return 7;
     }
 
     std::cout << "KeylightJuce smoke test OK\n";

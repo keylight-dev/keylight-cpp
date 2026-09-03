@@ -13,7 +13,18 @@
 
 // cpp-httplib — vendored single header in third_party/
 // CPPHTTPLIB_OPENSSL_SUPPORT is defined by the CMake option target.
+//
+// Included by relative path, so marking third_party/ a SYSTEM include
+// directory does not silence it. Third-party code is not ours to police, so
+// the warnings we enable on our own targets are suppressed across this include.
+#if defined(__clang__) || defined(__GNUC__)
+#  pragma GCC diagnostic push
+#  pragma GCC diagnostic ignored "-Wswitch-enum"
+#endif
 #include "../../../third_party/httplib.h"
+#if defined(__clang__) || defined(__GNUC__)
+#  pragma GCC diagnostic pop
+#endif
 
 #include <string>
 #include <map>

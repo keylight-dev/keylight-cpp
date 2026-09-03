@@ -1,0 +1,3 @@
+# Hashes of file build rules.
+e4cc86e0dbd9ff2f21f012e0e75e8a68 /Users/halloweed/Coding/Projects/keylight-cpp/keylight_single.hpp
+6e512a1ce52645c7f402fe8bc84710fc CMakeFiles/keylight_amalgamate

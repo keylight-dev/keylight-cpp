@@ -149,6 +149,50 @@ transition, so `processBlock` keeps reading a single atomic.
 `trialStatus()` (`NotStarted` / `Active` / `Expired`) and `trialDaysLeft()` are
 UI queries — call them from the message thread, not from `processBlock`.
 
+### Free tier (optional)
+
+Set `cfg.freeTierEnabled = true` and a device with no licence and no active
+trial resolves `keylight::State::FreeTier` instead of `Invalid`. An **elapsed**
+trial resolves `FreeTier` too — a lapsed trial drops to the free tier rather
+than the paywall — and `deactivate()` lands there as well.
+
+```cpp
+cfg.freeTierEnabled = true;
+...
+switch (licensing.state())
+{
+    case keylight::State::Licensed: /* everything */            break;
+    case keylight::State::Trial:    /* everything, time-boxed */ break;
+    case keylight::State::FreeTier: /* reduced feature set */    break;
+    case keylight::State::Expired:
+    case keylight::State::Invalid:  /* paywall */                break;
+}
+```
+
+**`State::FreeTier` is a new enumerator.** An exhaustive `switch` over
+`keylight::State` compiled with `-Werror=switch` will stop building until you
+add the case. It is appended after `Invalid`, so the existing values do not
+renumber.
+
+#### The keyless beacon
+
+The adapter reports an anonymous funnel signal (`trial` / `free_tier` /
+`expired`) on every state transition, on its background thread. You do not call
+it. It carries a random per-install id and, where the OS exposes one, a one-way
+hash of a machine identifier — never a licence key, and never a raw device id.
+It is debounced to one request per 24 hours per state, and a failed request is
+never recorded, so it retries rather than going quiet for a day.
+
+`keylight::Client` itself never sends it. That is deliberate: `checkOnLaunch()`
+makes no network request when no licence is stored, so a DAW scanning your
+plugin does not phone home through the SDK. The adapter opts into reporting on
+your behalf; use `keylight::Client` directly if you would rather it did not.
+
+`Licensing::reportKeylessState()` exists for hosts that resolve state
+themselves. It is a blocking network call dispatched to the background thread —
+never call it from `processBlock`, and do not call it from inside
+`onStateChanged`, since that transition already reports itself.
+
 ### Gate a feature in processBlock
 
 ```cpp

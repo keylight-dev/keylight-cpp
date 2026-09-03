@@ -17,6 +17,7 @@
 #include "device_info.hpp"
 #include "lease.hpp"
 #include "result.hpp"
+#include "machine_id.hpp"
 #include "store.hpp"
 #include "transport.hpp"
 #include "verifier.hpp"
@@ -48,6 +49,9 @@ enum class State {
     Trial,      // no license; within trial window
     Expired,    // trusted lease expired, or license status "expired"/"fallback"
     Invalid,    // no trusted lease, no active trial
+    FreeTier,   // no license and no trial, but the product offers a free tier.
+                // Appended last on purpose: renumbering the values above would
+                // break any integrator that persisted a State as an integer.
 };
 
 // ---------------------------------------------------------------------------
@@ -62,6 +66,26 @@ enum class TrialStatus {
     Active,     // within trialDurationDays of the persisted start
     Expired,    // the trial window has elapsed
 };
+
+// ---------------------------------------------------------------------------
+// KeylessState — what the anonymous keyless beacon reports (mirrors
+// keylight-rust KeylessState).  The wire strings are fixed by the server and
+// shared with every other Keylight SDK.
+// ---------------------------------------------------------------------------
+enum class KeylessState {
+    Trial,
+    FreeTier,
+    Expired,
+};
+
+inline const char* keyless_state_wire(KeylessState s) {
+    switch (s) {
+        case KeylessState::Trial:    return "trial";
+        case KeylessState::FreeTier: return "free_tier";
+        case KeylessState::Expired:  return "expired";
+    }
+    return "expired";
+}
 
 // ---------------------------------------------------------------------------
 // compile-time platform string (matches Rust telemetry.rs)
@@ -136,7 +160,8 @@ public:
     // Production constructor — clock defaults to real wall clock.
     Client(Config cfg, Transport& transport, LicenseStore& store)
         : Client(std::move(cfg), transport, store,
-                 []{ return static_cast<int64_t>(std::time(nullptr)); })
+                 []{ return static_cast<int64_t>(std::time(nullptr)); },
+                 []{ return detail::read_hardware_id(); })
     {}
 
     // Testable constructor — inject a deterministic clock.
@@ -145,10 +170,25 @@ public:
            Transport&               transport,
            LicenseStore&            store,
            std::function<int64_t()> now_fn)
+        : Client(std::move(cfg), transport, store, std::move(now_fn),
+                 []{ return detail::read_hardware_id(); })
+    {}
+
+    // Testable constructor — inject a deterministic clock AND hardware id.
+    // hardware_id_fn() returns the true OS/hardware id, or nullopt when the
+    // platform has none.  It must NEVER return a random per-install value:
+    // machine_hash exists to dedupe a device across reinstalls, and a random
+    // fallback would defeat exactly that.
+    Client(Config                                      cfg,
+           Transport&                                  transport,
+           LicenseStore&                               store,
+           std::function<int64_t()>                    now_fn,
+           std::function<std::optional<std::string>()> hardware_id_fn)
         : cfg_(std::move(cfg))
         , transport_(transport)
         , store_(store)
         , now_fn_(std::move(now_fn))
+        , hardware_id_fn_(std::move(hardware_id_fn))
         , verifier_(cfg_.trustedKeys)
         , state_(State::Invalid)
     {
@@ -169,10 +209,12 @@ public:
     /// State::Invalid is returned (no exception thrown).
     Result<State> activate(const std::string& key) {
         // Build activate request body
-        std::string body = build_json_({
+        std::vector<std::pair<std::string, std::string>> fields{
             {"license_key",   json_str(key)},
             {"instance_name", json_str("device")},
-        }, true /*include telemetry*/);
+        };
+        append_attribution_fields_(fields, /*include_instance_id=*/true);
+        std::string body = build_json_(std::move(fields), true /*telemetry*/);
 
         std::string url = api_url_("activate");
         auto hr = transport_.request("POST", url, json_headers_(), body);
@@ -250,10 +292,15 @@ public:
         std::string license_key  = load_license_key_();
         std::string instance_id  = load_instance_id_();
 
-        std::string body = build_json_({
+        std::vector<std::pair<std::string, std::string>> fields{
             {"license_key", json_str(license_key)},
             {"instance_id", json_str(instance_id)},
-        }, true /*include telemetry*/);
+        };
+        // machine_hash only — the free-tier id belongs on activate, which is
+        // where a conversion is actually recorded (keylight-rust does the same;
+        // deactivate gets neither, it already identifies the device).
+        append_attribution_fields_(fields, /*include_instance_id=*/false);
+        std::string body = build_json_(std::move(fields), true /*telemetry*/);
 
         std::string url = api_url_("validate");
         auto hr = transport_.request("POST", url, json_headers_(), body);
@@ -374,6 +421,82 @@ public:
     /// calling this again (or by deactivating a paid license and re-calling).
     /// No-op when trials are disabled (Config::trialDurationDays <= 0).
     /// Performs store I/O — never call this from an audio thread.
+    /// Anonymous, per-install identifier for keyless/free-tier reporting.
+    /// Minted on first use and persisted; never derived from a licence or from
+    /// hardware.  Returns an empty string only when the store write fails.
+    /// Mirrors keylight-rust free_tier_instance_id().
+    std::string freeTierInstanceId() {
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            if (cached_free_tier_instance_id_.has_value()) {
+                return *cached_free_tier_instance_id_;
+            }
+            cached_free_tier_instance_id_ = detail::uuid_v4();
+        }
+        if (!save_cache_().is_ok()) {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            cached_free_tier_instance_id_.reset();
+            return {};
+        }
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        return *cached_free_tier_instance_id_;
+    }
+
+    /// Anonymous keyless/free-tier beacon.  Fire-and-forget: every error is
+    /// swallowed, nothing is thrown, and the resolved state never changes.
+    /// Debounced to once per 24h per state — a state *change* always sends.
+    ///
+    /// Nothing calls this for you.  keylight-rust behaves the same way: the
+    /// core never emits network traffic the integrator did not ask for, which
+    /// is what keeps checkOnLaunch() free of network I/O while a DAW scans the
+    /// plugin.  The JUCE adapter wires it to state transitions for you.
+    ///
+    /// Blocking network call — never invoke it from an audio thread.
+    void reportKeylessState(KeylessState state) {
+        const std::string wire = keyless_state_wire(state);
+
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            const bool changed =
+                !cached_keyless_last_state_.has_value() ||
+                *cached_keyless_last_state_ != wire;
+            const bool within_24h =
+                cached_last_keyless_ping_at_ != 0 &&
+                (now_fn_() - cached_last_keyless_ping_at_) < 86400;
+            if (!changed && within_24h) {
+                return;
+            }
+        }
+
+        const std::string instance = freeTierInstanceId();
+        if (instance.empty()) {
+            return;   // could not persist an id; nothing to report under
+        }
+
+        std::vector<std::pair<std::string, std::string>> fields{
+            {"instance_id", json_str(instance)},
+            {"state",       json_str(wire)},
+        };
+        if (auto hash = machine_hash_()) {
+            fields.push_back({"machine_hash", json_str(*hash)});
+        }
+
+        auto hr = transport_.request("POST", api_url_("keyless"),
+                                     json_headers_(),
+                                     build_json_(std::move(fields), true));
+        // Arm the debounce ONLY on a real 200.  A failed beacon must not
+        // suppress reporting for a day (keylight-rust does the same).
+        if (!hr.is_ok() || hr.value().status != 200) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            cached_keyless_last_state_   = wire;
+            cached_last_keyless_ping_at_ = now_fn_();
+        }
+        (void)save_cache_();
+    }
+
     Result<State> startTrial() {
         if (cfg_.trialDurationDays <= 0) {
             // Trials disabled — nothing is persisted and no state changes.
@@ -391,6 +514,9 @@ public:
         if (started) {
             save_cache_();
         }
+        // Attribution: a trial that later converts must carry the same
+        // anonymous id the keyless beacon reported it under.
+        freeTierInstanceId();
 
         State new_state = resolve_current_state_();
         set_state_(new_state);
@@ -630,6 +756,7 @@ private:
     Transport&               transport_;
     LicenseStore&            store_;
     std::function<int64_t()> now_fn_;
+    std::function<std::optional<std::string>()> hardware_id_fn_;
     Verifier                 verifier_;
 
     // ── State ─────────────────────────────────────────────────────────────
@@ -645,6 +772,10 @@ private:
     int64_t                          cached_last_validated_online_ = 0;
     // Epoch seconds when the local trial was started (nullopt = never started).
     std::optional<int64_t>           cached_trial_start_;
+    std::optional<std::string>       cached_free_tier_instance_id_;
+    std::optional<std::string>       cached_hardware_id_;
+    std::optional<std::string>       cached_keyless_last_state_;
+    int64_t                          cached_last_keyless_ping_at_ = 0;
 
     // ── Event listeners ───────────────────────────────────────────────────
     struct Listener {
@@ -922,6 +1053,20 @@ private:
                 int64_t v = j["trialStart"].as_int();
                 if (v != 0) cached_trial_start_ = v;
             }
+            {
+                // Anonymous free-tier instance id (see freeTierInstanceId()).
+                std::string fid = j["freeTierInstanceId"].as_string();
+                if (!fid.empty()) cached_free_tier_instance_id_ = fid;
+            }
+            {
+                std::string hw = j["cachedHardwareId"].as_string();
+                if (!hw.empty()) cached_hardware_id_ = hw;
+            }
+            {
+                std::string kls = j["keylessLastState"].as_string();
+                if (!kls.empty()) cached_keyless_last_state_ = kls;
+                cached_last_keyless_ping_at_ = j["lastKeylessPingAt"].as_int();
+            }
         }
 
         State paid = State::Invalid;
@@ -952,22 +1097,90 @@ private:
         return static_cast<int64_t>(cfg_.trialDurationDays) - days_elapsed;
     }
 
-    /// Apply the local-trial fallback to a state resolved from paid licensing.
-    /// Priority: valid paid license → active trial → elapsed trial → Invalid.
-    /// Only an otherwise-unusable (Invalid) paid state consults the trial, so
-    /// paid licensing — including a paid Expired — always wins, mirroring
-    /// keylight-rust's resolve_state() (`had_license` short-circuits the trial).
+    // ── Device identity helpers ───────────────────────────────────────────
+
+    /// Append the anonymous free-tier id (only if one already exists — never
+    /// mint one here) and machine_hash to an outgoing body.  Mirrors
+    /// keylight-rust, which attaches both to activate and machine_hash to
+    /// validate, so a device converting from free tier to paid is counted once
+    /// rather than twice.
+    void append_attribution_fields_(
+        std::vector<std::pair<std::string, std::string>>& fields,
+        bool include_instance_id)
+    {
+        if (include_instance_id) {
+            std::optional<std::string> id;
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                id = cached_free_tier_instance_id_;
+            }
+            if (id.has_value() && !id->empty()) {
+                fields.push_back({"free_tier_instance_id", json_str(*id)});
+            }
+        }
+        if (auto hash = machine_hash_()) {
+            fields.push_back({"machine_hash", json_str(*hash)});
+        }
+    }
+
+
+    /// The true hardware id: read live, written through to the store on
+    /// success, falling back to the last cached value when a live read fails.
+    /// Keeps machine_hash stable across a transient IOKit/registry failure.
+    /// NO random fallback — nullopt means "omit machine_hash entirely".
+    std::optional<std::string> cached_hardware_id_value_() {
+        std::optional<std::string> live =
+            hardware_id_fn_ ? hardware_id_fn_() : std::nullopt;
+        if (live.has_value() && !live->empty()) {
+            bool changed = false;
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                if (cached_hardware_id_ != live) {
+                    cached_hardware_id_ = live;
+                    changed = true;
+                }
+            }
+            if (changed) (void)save_cache_();
+            return live;
+        }
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        if (cached_hardware_id_.has_value() && !cached_hardware_id_->empty()) {
+            return cached_hardware_id_;
+        }
+        return std::nullopt;
+    }
+
+    /// Cross-SDK machine_hash from the cached hardware id, if any.
+    std::optional<std::string> machine_hash_() {
+        auto hw = cached_hardware_id_value_();
+        if (!hw.has_value()) return std::nullopt;
+        return detail::machine_hash(cfg_.tenantId, cfg_.productId, *hw);
+    }
+
+    /// Apply the local-trial and free-tier fallbacks to a state resolved from
+    /// paid licensing.
+    /// Priority: valid paid licence → active trial → free tier → elapsed trial
+    /// → Invalid.  Only an otherwise-unusable (Invalid) paid state consults the
+    /// trial, so paid licensing — including a paid Expired — always wins,
+    /// mirroring keylight-rust's resolve_state() (`had_license`
+    /// short-circuits the trial).
     /// Must NOT be called while holding cache_mutex_ (checkTrial() locks it).
     State resolve_with_trial_(State paid_state) const {
         if (paid_state != State::Invalid) {
             return paid_state;
         }
         switch (checkTrial()) {
-            case TrialStatus::Active:  return State::Trial;
-            case TrialStatus::Expired: return State::Expired;
-            case TrialStatus::NotStarted: break;
+            case TrialStatus::Active:
+                return State::Trial;
+            case TrialStatus::Expired:
+                // Free tier outranks an elapsed trial: keylight-rust's
+                // `_ if free_tier_enabled` arm sits AFTER the trial match, so a
+                // lapsed trial drops to the free tier rather than the paywall.
+                return cfg_.freeTierEnabled ? State::FreeTier : State::Expired;
+            case TrialStatus::NotStarted:
+                break;
         }
-        return State::Invalid;
+        return cfg_.freeTierEnabled ? State::FreeTier : State::Invalid;
     }
 
     /// Re-resolve the current state offline. When any paid-licensing material
@@ -1064,6 +1277,20 @@ private:
         if (cached_trial_start_.has_value()) {
             append("\"trialStart\":" + std::to_string(*cached_trial_start_));
         }
+        if (cached_free_tier_instance_id_.has_value()) {
+            append("\"freeTierInstanceId\":" +
+                   json_str(*cached_free_tier_instance_id_));
+        }
+        if (cached_hardware_id_.has_value()) {
+            append("\"cachedHardwareId\":" + json_str(*cached_hardware_id_));
+        }
+        if (cached_keyless_last_state_.has_value()) {
+            append("\"keylessLastState\":" + json_str(*cached_keyless_last_state_));
+        }
+        if (cached_last_keyless_ping_at_ != 0) {
+            append("\"lastKeylessPingAt\":" +
+                   std::to_string(cached_last_keyless_ping_at_));
+        }
 
         blob += "}";
         return blob;
@@ -1122,11 +1349,15 @@ private:
     }
 
     /// Build the JSON body for a validate request.
-    std::string build_validate_body_() const {
-        return build_json_({
+    /// Not const: machine_hash_() writes the cached hardware id through to the
+    /// store on a successful live read.
+    std::string build_validate_body_() {
+        std::vector<std::pair<std::string, std::string>> fields{
             {"license_key", json_str(load_license_key_())},
             {"instance_id", json_str(load_instance_id_())},
-        }, true);
+        };
+        append_attribution_fields_(fields, /*include_instance_id=*/false);
+        return build_json_(std::move(fields), true);
     }
 
     /// Perform a single live validate() round-trip against the server and

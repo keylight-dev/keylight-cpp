@@ -4,13 +4,41 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ---------------------------------------------------------------------------
-# Core library — zero external dependencies
+# Core library — no third-party dependencies (system frameworks only)
 # ---------------------------------------------------------------------------
 add_library(keylight INTERFACE)
 add_library(keylight::keylight ALIAS keylight)
 target_include_directories(keylight INTERFACE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
+
+# machine_id.hpp reads the OS hardware id for the keyless beacon's machine_hash.
+# This is the ONLY external linkage the core needs; there are still no
+# third-party library dependencies.
+if(APPLE)
+  target_link_libraries(keylight INTERFACE "-framework IOKit" "-framework CoreFoundation")
+elseif(WIN32)
+  target_link_libraries(keylight INTERFACE advapi32)
+endif()
+
+# ---------------------------------------------------------------------------
+# Warnings for OUR OWN targets only — never on the INTERFACE target, which
+# would force flags onto every downstream consumer.
+#
+# -Wswitch is the one that matters: State and TrialStatus are public enums, and
+# adding a value must break every exhaustive switch in this repo at compile
+# time rather than silently falling through to a default label.
+# ---------------------------------------------------------------------------
+function(keylight_enable_warnings target)
+  if(MSVC)
+    target_compile_options(${target} PRIVATE /w14062)   # unhandled enum in switch
+  else()
+    # -Wextra is deliberately NOT enabled: it fires on pre-existing
+    # missing-field-initializers / unused-parameter noise unrelated to the
+    # enum contract this function exists to protect.
+    target_compile_options(${target} PRIVATE -Wall -Wswitch-enum)
+  endif()
+endfunction()
 
 # ---------------------------------------------------------------------------
 # Opt-in: cpp-httplib + OpenSSL transport
@@ -38,7 +66,10 @@ if(KEYLIGHT_BUILD_HTTPLIB_TRANSPORT)
   target_compile_definitions(keylight_httplib_transport INTERFACE
     CPPHTTPLIB_OPENSSL_SUPPORT
     KEYLIGHT_BUILD_HTTPLIB_TRANSPORT)
-  target_include_directories(keylight_httplib_transport INTERFACE
+  # SYSTEM so the vendored cpp-httplib header does not emit warnings under the
+  # -Wswitch-enum we enable on our own targets. It is third-party code; we do
+  # not police its switches.
+  target_include_directories(keylight_httplib_transport SYSTEM INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party>)
 endif()
 
@@ -93,6 +124,7 @@ if(KEYLIGHT_BUILD_TESTS)
 
   add_executable(keylight_tests ${KL_TESTS})
   target_link_libraries(keylight_tests PRIVATE keylight)
+  keylight_enable_warnings(keylight_tests)
   target_include_directories(keylight_tests PRIVATE tests)
   add_test(NAME keylight_tests COMMAND keylight_tests)
   set_tests_properties(keylight_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
@@ -102,6 +134,7 @@ if(KEYLIGHT_BUILD_TESTS)
     # Separate executable so default ctest stays zero-dep.
     add_executable(keylight_tests_httplib ${KL_TESTS} tests/test_live.cpp)
     target_link_libraries(keylight_tests_httplib PRIVATE keylight_httplib_transport)
+  keylight_enable_warnings(keylight_tests_httplib)
     target_include_directories(keylight_tests_httplib PRIVATE tests)
     add_test(NAME keylight_tests_httplib COMMAND keylight_tests_httplib)
     set_tests_properties(keylight_tests_httplib PROPERTIES
@@ -154,10 +187,20 @@ if(KEYLIGHT_BUILD_TESTS)
 
   # The standalone test includes keylight_single.hpp from the repo root.
   add_executable(test_amalgamation tests/test_amalgamation.cpp)
+  keylight_enable_warnings(test_amalgamation)
   add_dependencies(test_amalgamation keylight_amalgamate)
   # Only the repo root is on the include path — no split-header directories.
   target_include_directories(test_amalgamation PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}")
+  # Deliberately does NOT link the keylight target — this compiles the single
+  # header exactly as an end user would. It does still need the system
+  # frameworks machine_id.hpp reads the hardware id through, which is precisely
+  # the link line a single-header consumer must supply for themselves.
+  if(APPLE)
+    target_link_libraries(test_amalgamation PRIVATE "-framework IOKit" "-framework CoreFoundation")
+  elseif(WIN32)
+    target_link_libraries(test_amalgamation PRIVATE advapi32)
+  endif()
   add_test(NAME test_amalgamation COMMAND test_amalgamation)
   set_tests_properties(test_amalgamation PROPERTIES
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")

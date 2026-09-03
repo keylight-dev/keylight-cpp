@@ -211,6 +211,32 @@ public:
             state_snapshot_.store(newState, std::memory_order_relaxed);
             refresh_entitlement_cache_();
 
+            // Anonymous funnel beacon. Swift's LicenseManager reports
+            // automatically; keylight::Client deliberately never does, so the
+            // adapter does it here.
+            //
+            // Called INLINE on purpose. This callback already runs on our
+            // background thread (never the audio or message thread), and
+            // dispatch_() joins that same thread — routing through it here
+            // would make the thread join itself. The SDK debounces to one
+            // request per 24h per state, so the usual cost is a lock and a
+            // comparison. Licensed/Invalid are not keyless states.
+            switch (newState)
+            {
+                case keylight::State::Trial:
+                    client_->reportKeylessState(keylight::KeylessState::Trial);
+                    break;
+                case keylight::State::FreeTier:
+                    client_->reportKeylessState(keylight::KeylessState::FreeTier);
+                    break;
+                case keylight::State::Expired:
+                    client_->reportKeylessState(keylight::KeylessState::Expired);
+                    break;
+                case keylight::State::Licensed:
+                case keylight::State::Invalid:
+                    break;
+            }
+
             // Deliver to message thread if a state-change callback is set.
             // Capture alive_ by value (copies the shared_ptr, keeping the
             // flag alive even after ~Licensing runs) so the lambda can
@@ -358,6 +384,33 @@ public:
     // For the audio thread use state() == keylight::State::Trial, which reads
     // the atomic snapshot.
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // reportKeylessState — anonymous free-tier/trial funnel beacon.
+    //
+    // You do NOT normally call this: the adapter fires it for you on every
+    // state transition. It exists for hosts that resolve state themselves.
+    //
+    // Blocking network call, so it runs on the background dispatch — never
+    // call it from processBlock. Do not call it from inside onStateChanged
+    // either; the transition already reports itself.
+    // -----------------------------------------------------------------------
+    void reportKeylessState(keylight::KeylessState state,
+                            std::function<void()> callback = {})
+    {
+        dispatch_([this, state, cb = std::move(callback)]()
+        {
+            client_->reportKeylessState(state);
+            if (cb)
+            {
+                auto aliveCopy = alive_;
+                juce::MessageManager::callAsync([aliveCopy, cb]()
+                {
+                    if (aliveCopy->load()) cb();
+                });
+            }
+        });
+    }
 
     /// Whole days left in the local trial (0 when disabled/not started/elapsed).
     int trialDaysLeft() const { return client_->trialDaysLeft(); }
