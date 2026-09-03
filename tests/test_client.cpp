@@ -956,3 +956,48 @@ TEST_CASE("E3: worker invokes refreshIfNeeded at least once when stale") {
     // The worker must have called refreshIfNeeded at least once → transport hit
     CHECK(transport.call_count >= 1);
 }
+
+TEST_CASE("Client: deactivate sends license_key alongside instance_id") {
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; });
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    transport.next_body = R"({"deactivated":true})";
+    REQUIRE(client.deactivate().is_ok());
+
+    // DeactivateBodySchema requires BOTH fields. A body missing license_key is
+    // rejected by zod before any mutation runs, so the seat is never released.
+    CHECK(transport.last_request_body.find("\"license_key\"")        != std::string::npos);
+    CHECK(transport.last_request_body.find("XXXX-YYYY-ZZZZ-0001")    != std::string::npos);
+    CHECK(transport.last_request_body.find("\"instance_id\"")        != std::string::npos);
+}
+
+TEST_CASE("Client: deactivate surfaces a server rejection but still clears the store") {
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; });
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    transport.next_status = 422;
+    transport.next_body   = R"({"error":"Instance not found or deactivated"})";
+
+    auto dr = client.deactivate();
+    CHECK(!dr.is_ok());
+    CHECK(dr.error().message.find("Instance not found") != std::string::npos);
+
+    // The local half is cleared regardless — the app must not stay "licensed"
+    // on a machine the user asked to release.
+    auto loaded = store.load();
+    REQUIRE(loaded.is_ok());
+    CHECK(loaded.value().empty());
+    CHECK(client.state() == State::Invalid);
+}

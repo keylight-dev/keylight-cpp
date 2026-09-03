@@ -368,17 +368,34 @@ public:
         return Result<State>::ok(new_state);
     }
 
-    /// Deactivate this device.  Clears the store regardless of network outcome.
+    /// Deactivate this device.  Clears the local cache regardless of the
+    /// network outcome, but no longer hides a server rejection: a 4xx here
+    /// means the seat is still consumed, and only the caller can decide to
+    /// retry.
     Result<void> deactivate() {
         std::string instance_id = load_instance_id_();
+        std::string license_key = load_license_key_();
 
+        std::optional<Error> server_error;
         if (!instance_id.empty()) {
+            // The worker requires BOTH fields (DeactivateBodySchema); sending
+            // instance_id alone is rejected by zod and frees nothing.
             std::string body = build_json_({
+                {"license_key", json_str(license_key)},
                 {"instance_id", json_str(instance_id)},
             }, false);
             std::string url = api_url_("deactivate");
-            // Best-effort: ignore network errors (mirror Rust/C# behaviour)
-            transport_.request("POST", url, json_headers_(), body);
+            auto hr = transport_.request("POST", url, json_headers_(), body);
+            if (!hr.is_ok()) {
+                server_error = hr.error();
+            } else if (hr.value().status != 200) {
+                // http_error_message_ is added in Task 7; use a literal
+                // fallback here so this task compiles and passes standalone.
+                server_error = Error{ErrorCode::Http,
+                    hr.value().body.empty()
+                        ? ("deactivate HTTP " + std::to_string(hr.value().status))
+                        : hr.value().body};
+            }
         }
 
         // Clear the paid-licensing half of the cache. The trial start survives:
@@ -411,6 +428,10 @@ public:
 
         // No paid license left: the persisted trial (if any) decides the state.
         set_state_(resolve_with_trial_(State::Invalid));
+
+        if (server_error.has_value()) {
+            return Result<void>::err(*server_error);
+        }
         return Result<void>::ok();
     }
 
