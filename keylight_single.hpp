@@ -224,6 +224,35 @@ inline std::string base64_decode(const std::string& input) {
 } // namespace keylight
 
 // ──────────────────────────────────────────────────────────────────────────
+// include/keylight/clock.hpp
+// ──────────────────────────────────────────────────────────────────────────
+
+// keylight/clock.hpp — heuristic detection of system-clock manipulation.
+// Ported from keylight-rust keylight/src/clock.rs.
+
+
+namespace keylight {
+
+// How far the clock may move backward before we call it manipulation rather
+// than drift. NTP corrections and suspend/resume routinely move it a little.
+inline constexpr int64_t CLOCK_BACKWARD_TOLERANCE = 3600; // 1h
+
+// True when `now` is more than the tolerance behind `last_seen` — the clock
+// was rolled back since the last recorded contact.
+//
+// This deliberately OMITS the forward-jump component of Rust's
+// clock_manipulated(), so it can gate the read-only state() resolver without
+// governing offline duration — that stays with maxOfflineDays. Conflating the
+// two would fail-close on every user who simply went offline for a while.
+//
+// Operates on UTC epoch seconds, so a timezone change never trips it.
+inline bool clock_rolled_back(int64_t last_seen, int64_t now) {
+    return last_seen - now > CLOCK_BACKWARD_TOLERANCE;
+}
+
+} // namespace keylight
+
+// ──────────────────────────────────────────────────────────────────────────
 // include/keylight/config.hpp
 // ──────────────────────────────────────────────────────────────────────────
 
@@ -2500,6 +2529,7 @@ public:
             cached_instance_id_            = std::nullopt;
             cached_license_key_            = std::nullopt;
             cached_last_validated_online_  = 0;
+            last_validated_online_atomic_.store(0);
             keep_trial                     = cached_trial_start_.has_value();
         }
 
@@ -2837,8 +2867,16 @@ public:
 
     // ── Query API ─────────────────────────────────────────────────────────
 
-    /// Current state — reads atomic; audio-thread safe.
+    /// Current state — reads atomics only; audio-thread safe, never blocks.
+    ///
+    /// A clock rolled back beyond tolerance since the last recorded server
+    /// contact invalidates any offline reasoning we could do, so this fails
+    /// closed rather than trusting a lease against a moved clock.
     State state() const noexcept {
+        const int64_t anchor = last_validated_online_atomic_.load();
+        if (anchor != 0 && clock_rolled_back(anchor, now_fn_())) {
+            return State::Invalid;
+        }
         return state_.load();
     }
 
@@ -2873,6 +2911,10 @@ private:
 
     // ── State ─────────────────────────────────────────────────────────────
     std::atomic<State>       state_;
+    // Atomic mirror of cached_last_validated_online_, so the clock guard can
+    // run inside noexcept, lock-free state(). The mutex-protected field stays
+    // the source of truth for persistence; this is written alongside it.
+    std::atomic<int64_t>     last_validated_online_atomic_{0};
 
     // Mutex-guarded cache of the decoded lease + extras
     mutable std::mutex               cache_mutex_;
@@ -3195,7 +3237,10 @@ private:
             {
                 // Load lastValidatedOnline (written by save_last_validated_online_)
                 int64_t v = j["lastValidatedOnline"].as_int();
-                if (v != 0) cached_last_validated_online_ = v;
+                if (v != 0) {
+                    cached_last_validated_online_ = v;
+                    last_validated_online_atomic_.store(v);
+                }
             }
             {
                 // Load the local trial start written by startTrial().
@@ -3497,6 +3542,7 @@ private:
             std::lock_guard<std::mutex> lock(cache_mutex_);
             cached_last_validated_online_ = t;
         }
+        last_validated_online_atomic_.store(t);
         // Rewrite the blob from the cache (best-effort; failures are non-fatal).
         save_cache_();
     }

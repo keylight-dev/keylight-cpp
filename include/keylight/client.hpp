@@ -13,6 +13,7 @@
 //                hasEntitlement / cachedLicenseExpiresAt / listener list are
 //                guarded by a mutex.
 
+#include "clock.hpp"
 #include "config.hpp"
 #include "device_info.hpp"
 #include "lease.hpp"
@@ -437,6 +438,7 @@ public:
             cached_instance_id_            = std::nullopt;
             cached_license_key_            = std::nullopt;
             cached_last_validated_online_  = 0;
+            last_validated_online_atomic_.store(0);
             keep_trial                     = cached_trial_start_.has_value();
         }
 
@@ -774,8 +776,16 @@ public:
 
     // ── Query API ─────────────────────────────────────────────────────────
 
-    /// Current state — reads atomic; audio-thread safe.
+    /// Current state — reads atomics only; audio-thread safe, never blocks.
+    ///
+    /// A clock rolled back beyond tolerance since the last recorded server
+    /// contact invalidates any offline reasoning we could do, so this fails
+    /// closed rather than trusting a lease against a moved clock.
     State state() const noexcept {
+        const int64_t anchor = last_validated_online_atomic_.load();
+        if (anchor != 0 && clock_rolled_back(anchor, now_fn_())) {
+            return State::Invalid;
+        }
         return state_.load();
     }
 
@@ -810,6 +820,10 @@ private:
 
     // ── State ─────────────────────────────────────────────────────────────
     std::atomic<State>       state_;
+    // Atomic mirror of cached_last_validated_online_, so the clock guard can
+    // run inside noexcept, lock-free state(). The mutex-protected field stays
+    // the source of truth for persistence; this is written alongside it.
+    std::atomic<int64_t>     last_validated_online_atomic_{0};
 
     // Mutex-guarded cache of the decoded lease + extras
     mutable std::mutex               cache_mutex_;
@@ -1132,7 +1146,10 @@ private:
             {
                 // Load lastValidatedOnline (written by save_last_validated_online_)
                 int64_t v = j["lastValidatedOnline"].as_int();
-                if (v != 0) cached_last_validated_online_ = v;
+                if (v != 0) {
+                    cached_last_validated_online_ = v;
+                    last_validated_online_atomic_.store(v);
+                }
             }
             {
                 // Load the local trial start written by startTrial().
@@ -1434,6 +1451,7 @@ private:
             std::lock_guard<std::mutex> lock(cache_mutex_);
             cached_last_validated_online_ = t;
         }
+        last_validated_online_atomic_.store(t);
         // Rewrite the blob from the cache (best-effort; failures are non-fatal).
         save_cache_();
     }

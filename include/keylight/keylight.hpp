@@ -1,6 +1,7 @@
 #pragma once
 #include "version.hpp"
 #include "result.hpp"
+#include "clock.hpp"
 #include "config.hpp"
 #include "device_info.hpp"
 #include "lease.hpp"
