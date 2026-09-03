@@ -493,6 +493,35 @@ public:
     }
 };
 
+// A transport that behaves like FakeTransport (configurable status/body)
+// until told to go offline, at which point every subsequent request() fails
+// with a network error. This lets a single Client instance activate online
+// and then "lose the network" mid-session, without constructing a second
+// Client (which would re-run refresh_state_from_store_ and defeat tests that
+// need to isolate apply_offline_grace_'s own deny branch from the launch
+// path's construction-time bound).
+class GoesOfflineTransport : public Transport {
+public:
+    int         next_status = 200;
+    std::string next_body;
+    bool        offline     = false;
+
+    Result<HttpResponse> request(
+        const std::string&,
+        const std::string&,
+        const std::map<std::string, std::string>&,
+        const std::string&) override
+    {
+        if (offline) {
+            return Result<HttpResponse>::err({ErrorCode::Network, "simulated network failure"});
+        }
+        HttpResponse r;
+        r.status = next_status;
+        r.body   = next_body;
+        return Result<HttpResponse>::ok(r);
+    }
+};
+
 // Persist a valid-active lease blob directly into the store, mimicking what
 // activate() would have written (format: {"lease":{...},"expiresAt":N,...}).
 // Also stores lastValidatedOnline (for offline-grace tests).
@@ -1247,4 +1276,67 @@ TEST_CASE("Client: a lease within maxOfflineDays survives a relaunch") {
     Client relaunched(cfg, offline, store, [&]{ return one_day_later; });
 
     CHECK(relaunched.state() == State::Licensed);
+}
+
+// The two relaunch tests above only exercise refresh_state_from_store_'s
+// construction-time offline bound. apply_offline_grace_ (used by both
+// checkOnLaunch() and refreshIfNeeded() when a network call fails mid-
+// session) has its own, separate Licensed->Expired deny branch that only
+// fires when state_ is Licensed on entry — and every relaunch test starts
+// a NEW Client whose construction has already resolved to Expired before
+// that branch could ever run. These two tests keep a single Client alive
+// across a clock advance so the deny branch gets its own coverage.
+TEST_CASE("Client: checkOnLaunch's offline grace denies Licensed after maxOfflineDays elapses mid-session") {
+    auto cfg = make_config();
+    cfg.maxOfflineDays = 2;
+
+    int64_t now = VALID_ACTIVE_NOW;
+    GoesOfflineTransport transport;
+    MemoryStore          store;
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    Client client(cfg, transport, store, [&]{ return now; });
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+    // Proves the entry condition apply_offline_grace_'s deny branch requires:
+    // state_ is Licensed before the clock moves or the network goes away.
+    REQUIRE(client.state() == State::Licensed);
+
+    // Advance past maxOfflineDays (2 days) but stay within the lease's own
+    // ~7-day TTL, so it is the offline bound doing the work, not raw lease
+    // expiry (apply_offline_grace_'s lease_raw_expired short-circuit is
+    // deliberately not what this test exercises).
+    now += 3 * 86400;
+    transport.offline = true;
+
+    auto r = client.checkOnLaunch();
+    REQUIRE(r.is_ok());
+    CHECK(r.value() == State::Expired);
+    CHECK(client.state() == State::Expired);
+}
+
+TEST_CASE("Client: refreshIfNeeded's offline grace denies Licensed after maxOfflineDays elapses mid-session") {
+    auto cfg = make_config();
+    cfg.maxOfflineDays = 2;
+
+    int64_t now = VALID_ACTIVE_NOW;
+    GoesOfflineTransport transport;
+    MemoryStore          store;
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    Client client(cfg, transport, store, [&]{ return now; });
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+    REQUIRE(client.state() == State::Licensed);
+
+    // Advance past both maxOfflineDays (2 days) and refreshIfNeeded's own
+    // 6h staleness timer, so it actually attempts a network call, while
+    // staying within the lease's own ~7-day TTL.
+    now += 3 * 86400;
+    transport.offline = true;
+
+    auto r = client.refreshIfNeeded();
+    REQUIRE(r.is_ok());
+    CHECK(r.value() == State::Expired);
+    CHECK(client.state() == State::Expired);
 }
