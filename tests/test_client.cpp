@@ -708,8 +708,12 @@ TEST_CASE("E2: checkOnLaunch denies once offline past maxOfflineDays (15)") {
 
     seed_store_with_valid_lease(store, VALID_ACTIVE_NOW, 1781681046LL, last_lvo);
 
+    // refresh_state_from_store_ now applies the offline bound directly on
+    // construction (this is the behavior this task adds), so the cached
+    // lease already resolves to Expired before any network call — not just
+    // after checkOnLaunch's own grace check below.
     Client client(cfg, transport, store, [now]{ return now; });
-    REQUIRE(client.state() == State::Licensed);
+    REQUIRE(client.state() == State::Expired);
 
     auto r = client.checkOnLaunch();
     REQUIRE(r.is_ok());
@@ -1198,4 +1202,49 @@ TEST_CASE("Client: a fallback lease cached from a previous launch is still Limit
 
     CHECK(client.state() == State::Limited);
     CHECK(transport.call_count == 0);
+}
+
+TEST_CASE("Client: a lease older than maxOfflineDays does not survive a relaunch") {
+    auto cfg = make_config();
+    cfg.maxOfflineDays = 2;
+
+    FakeTransport transport;
+    MemoryStore   store;
+
+    // First run: activate and go offline.
+    {
+        transport.next_status = 200;
+        transport.next_body   = ACTIVATE_RESPONSE;
+        Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; });
+        REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+        REQUIRE(client.state() == State::Licensed);
+    }
+
+    // Relaunch three days later with no network. The lease itself is still
+    // within its 7-day TTL, so only the offline bound can catch this.
+    const int64_t three_days_later = VALID_ACTIVE_NOW + 3 * 86400;
+    FailingTransport offline;
+    Client relaunched(cfg, offline, store, [&]{ return three_days_later; });
+
+    CHECK(relaunched.state() != State::Licensed);
+}
+
+TEST_CASE("Client: a lease within maxOfflineDays survives a relaunch") {
+    auto cfg = make_config();
+    cfg.maxOfflineDays = 7;
+
+    FakeTransport transport;
+    MemoryStore   store;
+    {
+        transport.next_status = 200;
+        transport.next_body   = ACTIVATE_RESPONSE;
+        Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; });
+        REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+    }
+
+    const int64_t one_day_later = VALID_ACTIVE_NOW + 86400;
+    FailingTransport offline;
+    Client relaunched(cfg, offline, store, [&]{ return one_day_later; });
+
+    CHECK(relaunched.state() == State::Licensed);
 }

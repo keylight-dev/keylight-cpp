@@ -3268,6 +3268,29 @@ private:
             auto vr = verifier_.verify(*lease, now_fn_());
             paid    = derive_state_from_verify_(*lease, vr);
         }
+
+        // Bound how long a cached lease may carry the app without server
+        // contact. The lease's own 7-day TTL is the ceiling; maxOfflineDays is
+        // the tenant's policy underneath it, and it was previously ignored on
+        // this path — so a tenant setting 2 still got 7.
+        //
+        // Fail closed when the anchor is missing: a lease with no record of
+        // ever having been validated online cannot be aged, and treating
+        // "unknown" as "recent" is exactly the gap an attacker deletes a field
+        // to create. Matches keylight-rust.
+        if (paid != State::Invalid && cfg_.maxOfflineDays > 0) {
+            int64_t anchor;
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                anchor = cached_last_validated_online_;
+            }
+            const int64_t max_age =
+                static_cast<int64_t>(cfg_.maxOfflineDays) * 86400;
+            if (anchor == 0 || (now_fn_() - anchor) > max_age) {
+                paid = State::Expired;
+            }
+        }
+
         // Paid licensing wins; the persisted local trial only fills the gap.
         state_.store(resolve_with_trial_(paid));
     }
