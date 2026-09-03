@@ -560,3 +560,76 @@ TEST_CASE("Beacon: reporting never changes the resolved state") {
     client.reportKeylessState(KeylessState::FreeTier);
     CHECK(client.state() == State::FreeTier);
 }
+
+// ===========================================================================
+// Conversion attribution on activate / validate
+// ===========================================================================
+
+TEST_CASE("Attribution: activate carries free_tier_instance_id and machine_hash") {
+    auto cfg = canonical_config();
+    RecordingTransport transport;
+    MemStore           store;
+    transport.next_body = ACTIVATE_OK;
+    int64_t now = T0;
+    auto hw = []() -> std::optional<std::string> { return std::string("hardware-1"); };
+
+    Client client(cfg, transport, store, [&]{ return now; }, hw);
+    const std::string id = client.freeTierInstanceId();
+    REQUIRE(client.activate("KL-TEST-KEY").is_ok());
+
+    const auto* call = transport.last_call_for("activate");
+    REQUIRE(call != nullptr);
+    CHECK(call->body.find("\"free_tier_instance_id\":\"" + id + "\"") != std::string::npos);
+    CHECK(call->body.find(CANONICAL_HASH) != std::string::npos);
+}
+
+TEST_CASE("Attribution: activate omits free_tier_instance_id when none was minted") {
+    auto cfg = canonical_config();
+    RecordingTransport transport;
+    MemStore           store;
+    transport.next_body = ACTIVATE_OK;
+    int64_t now = T0;
+    auto none = []() -> std::optional<std::string> { return std::nullopt; };
+
+    Client client(cfg, transport, store, [&]{ return now; }, none);
+    REQUIRE(client.activate("KL-TEST-KEY").is_ok());
+
+    const auto* call = transport.last_call_for("activate");
+    REQUIRE(call != nullptr);
+    CHECK(call->body.find("free_tier_instance_id") == std::string::npos);
+}
+
+TEST_CASE("Attribution: validate carries machine_hash but not the instance id") {
+    auto cfg = canonical_config();
+    RecordingTransport transport;
+    MemStore           store;
+    transport.next_body = ACTIVATE_OK;
+    int64_t now = T0;
+    auto hw = []() -> std::optional<std::string> { return std::string("hardware-1"); };
+
+    Client client(cfg, transport, store, [&]{ return now; }, hw);
+    REQUIRE(client.activate("KL-TEST-KEY").is_ok());
+    REQUIRE(client.validate().is_ok());
+
+    const auto* call = transport.last_call_for("validate");
+    REQUIRE(call != nullptr);
+    CHECK(call->body.find(CANONICAL_HASH)            != std::string::npos);
+    CHECK(call->body.find("free_tier_instance_id")   == std::string::npos);
+}
+
+TEST_CASE("Attribution: activate still sends its original fields") {
+    auto cfg = canonical_config();
+    RecordingTransport transport;
+    MemStore           store;
+    transport.next_body = ACTIVATE_OK;
+    int64_t now = T0;
+    auto hw = []() -> std::optional<std::string> { return std::string("hardware-1"); };
+
+    Client client(cfg, transport, store, [&]{ return now; }, hw);
+    REQUIRE(client.activate("KL-TEST-KEY").is_ok());
+
+    const auto* call = transport.last_call_for("activate");
+    REQUIRE(call != nullptr);
+    CHECK(call->body.find("\"license_key\":\"KL-TEST-KEY\"") != std::string::npos);
+    CHECK(call->body.find("\"instance_name\":\"device\"")    != std::string::npos);
+}

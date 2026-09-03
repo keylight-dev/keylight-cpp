@@ -209,10 +209,12 @@ public:
     /// State::Invalid is returned (no exception thrown).
     Result<State> activate(const std::string& key) {
         // Build activate request body
-        std::string body = build_json_({
+        std::vector<std::pair<std::string, std::string>> fields{
             {"license_key",   json_str(key)},
             {"instance_name", json_str("device")},
-        }, true /*include telemetry*/);
+        };
+        append_attribution_fields_(fields, /*include_instance_id=*/true);
+        std::string body = build_json_(std::move(fields), true /*telemetry*/);
 
         std::string url = api_url_("activate");
         auto hr = transport_.request("POST", url, json_headers_(), body);
@@ -290,10 +292,15 @@ public:
         std::string license_key  = load_license_key_();
         std::string instance_id  = load_instance_id_();
 
-        std::string body = build_json_({
+        std::vector<std::pair<std::string, std::string>> fields{
             {"license_key", json_str(license_key)},
             {"instance_id", json_str(instance_id)},
-        }, true /*include telemetry*/);
+        };
+        // machine_hash only — the free-tier id belongs on activate, which is
+        // where a conversion is actually recorded (keylight-rust does the same;
+        // deactivate gets neither, it already identifies the device).
+        append_attribution_fields_(fields, /*include_instance_id=*/false);
+        std::string body = build_json_(std::move(fields), true /*telemetry*/);
 
         std::string url = api_url_("validate");
         auto hr = transport_.request("POST", url, json_headers_(), body);
@@ -1092,6 +1099,31 @@ private:
 
     // ── Device identity helpers ───────────────────────────────────────────
 
+    /// Append the anonymous free-tier id (only if one already exists — never
+    /// mint one here) and machine_hash to an outgoing body.  Mirrors
+    /// keylight-rust, which attaches both to activate and machine_hash to
+    /// validate, so a device converting from free tier to paid is counted once
+    /// rather than twice.
+    void append_attribution_fields_(
+        std::vector<std::pair<std::string, std::string>>& fields,
+        bool include_instance_id)
+    {
+        if (include_instance_id) {
+            std::optional<std::string> id;
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                id = cached_free_tier_instance_id_;
+            }
+            if (id.has_value() && !id->empty()) {
+                fields.push_back({"free_tier_instance_id", json_str(*id)});
+            }
+        }
+        if (auto hash = machine_hash_()) {
+            fields.push_back({"machine_hash", json_str(*hash)});
+        }
+    }
+
+
     /// The true hardware id: read live, written through to the store on
     /// success, falling back to the last cached value when a live read fails.
     /// Keeps machine_hash stable across a transient IOKit/registry failure.
@@ -1317,11 +1349,15 @@ private:
     }
 
     /// Build the JSON body for a validate request.
-    std::string build_validate_body_() const {
-        return build_json_({
+    /// Not const: machine_hash_() writes the cached hardware id through to the
+    /// store on a successful live read.
+    std::string build_validate_body_() {
+        std::vector<std::pair<std::string, std::string>> fields{
             {"license_key", json_str(load_license_key_())},
             {"instance_id", json_str(load_instance_id_())},
-        }, true);
+        };
+        append_attribution_fields_(fields, /*include_instance_id=*/false);
+        return build_json_(std::move(fields), true);
     }
 
     /// Perform a single live validate() round-trip against the server and
