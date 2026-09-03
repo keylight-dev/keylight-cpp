@@ -1,3 +1,40 @@
+## 0.2.0 (unreleased)
+
+### Fixed
+
+- **`deactivate()` never released the seat.** The request omitted `license_key`,
+  which the API requires, so every deactivation was rejected before any mutation
+  ran while the SDK reported success. Apps believed they were deactivated; the
+  seat stayed consumed until the customer hit their activation limit.
+- `maxOfflineDays` is now applied when state is resolved at launch. It was
+  previously ignored on that path, so a tenant configuring 2 days still got the
+  lease's full 7-day TTL offline.
+
+### Added
+
+- `State::Limited` for a lease with server status `fallback`.
+- `os_version` and `arch` are now sent on activate, validate and keyless, so the
+  matching dashboard cards are populated for C++ tenants.
+- `instance_name` now carries the real machine name instead of the constant
+  `"device"`.
+- `X-Keylight-Request-Id` on every request, echoed by the API, so app logs and
+  server logs can be correlated during support.
+- Clock-rollback detection: state fails closed when the system clock has moved
+  backward more than an hour since the last server contact.
+
+### Changed
+
+- **Breaking:** a lease with status `fallback` now resolves to `State::Limited`
+  instead of `State::Expired`. A server-side signing incident degrades the app
+  rather than locking it. Exhaustive `switch` statements over `State` will need
+  a `Limited` arm. Unreal Blueprint users: `EKeylightState` enum is appended
+  with `FreeTier` and `Limited`; ensure your state-switch logic covers both
+  values (existing serialized state values are unchanged).
+- **Breaking:** `deactivate()` returns the server's error instead of always
+  succeeding. The local cache is still cleared either way.
+- Errors from the API now carry the server's message ("License key not found",
+  "Activation limit reached") instead of a bare `"activate HTTP 422"`.
+
 ## [0.1.6] - 2026-09-03
 
 ### Added
