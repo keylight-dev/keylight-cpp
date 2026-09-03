@@ -883,6 +883,18 @@ private:
             if (mem[0] != '\0') {
                 fields.push_back({"memory", json_str(mem)});
             }
+            // Phase-3 device dimensions. Both are omitted entirely when the
+            // platform cannot report them — never a placeholder. device_class
+            // is deliberately absent: the server derives it, and inventing one
+            // here would fight that.
+            std::string osv = detail::detect_os_version();
+            if (!osv.empty()) {
+                fields.push_back({"os_version", json_str(osv)});
+            }
+            const char* arch = detail::current_arch();
+            if (arch[0] != '\0') {
+                fields.push_back({"arch", json_str(arch)});
+            }
         }
 
         std::string out = "{";

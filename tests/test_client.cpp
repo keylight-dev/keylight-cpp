@@ -1001,3 +1001,29 @@ TEST_CASE("Client: deactivate surfaces a server rejection but still clears the s
     CHECK(loaded.value().empty());
     CHECK(client.state() == State::Invalid);
 }
+
+TEST_CASE("Client: activate sends os_version and arch when detectable") {
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; });
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    const std::string& body = transport.last_request_body;
+
+    // Both fields are omitted entirely when the platform cannot report them —
+    // the SDK never guesses — so assert presence only when detection worked.
+    if (!keylight::detail::detect_os_version().empty()) {
+        CHECK(body.find("\"os_version\"") != std::string::npos);
+        CHECK(body.find(keylight::detail::detect_os_version()) != std::string::npos);
+    }
+    if (std::string(keylight::detail::current_arch()).empty() == false) {
+        CHECK(body.find("\"arch\"") != std::string::npos);
+        CHECK(body.find(keylight::detail::current_arch()) != std::string::npos);
+    }
+    // device_class is NEVER sent from this SDK: the server derives it.
+    CHECK(body.find("\"device_class\"") == std::string::npos);
+}
