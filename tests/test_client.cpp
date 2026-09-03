@@ -1107,3 +1107,50 @@ TEST_CASE("Client: activate falls back to the status line on an unparseable body
     REQUIRE(!r.is_ok());
     CHECK(r.error().message == "activate HTTP 502");
 }
+
+// A signature-valid lease whose server-assigned status is "fallback": the
+// server could not mint a full lease (signing-key incident, key rotation).
+// Copied verbatim from the `fallback-status` conformance vector
+// (tests/fixtures/vectors.json, vectors[3]) so it stays byte-identical to the
+// Rust and worker suites.
+static const std::string FALLBACK_VALIDATE_RESPONSE = R"({
+  "valid": true,
+  "lease": {
+    "kid": "k1",
+    "licenseKeyHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "instanceId": "00000000-0000-4000-8000-000000000001",
+    "issuedAt": 1781076246,
+    "expiresAt": 1781681046,
+    "status": "fallback",
+    "signature": "H/L/1y6x6Cg11Hle+6RNFioM9N6gFWGeR9tOORsNZlcL+kinqJdtb3T5dD2Irh5Q9bH1avSUQZGQXtkqaeEVDw==",
+    "entitlements": []
+  }
+})";
+
+TEST_CASE("Client: enum values are stable for anyone who persisted a State") {
+    // Renumbering would silently reinterpret a stored integer as a different
+    // state. New values are appended only.
+    CHECK(static_cast<int>(State::Licensed) == 0);
+    CHECK(static_cast<int>(State::Trial)    == 1);
+    CHECK(static_cast<int>(State::Expired)  == 2);
+    CHECK(static_cast<int>(State::Invalid)  == 3);
+    CHECK(static_cast<int>(State::FreeTier) == 4);
+    CHECK(static_cast<int>(State::Limited)  == 5);
+}
+
+TEST_CASE("Client: a fallback lease degrades to Limited, it does not lock the app") {
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    transport.next_status = 200;
+    transport.next_body   = FALLBACK_VALIDATE_RESPONSE;
+
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; });
+    REQUIRE(client.validate().is_ok());
+
+    // "fallback" means the server could not sign a full lease — a key-rotation
+    // or signing incident. Degrading is correct; locking a paying customer out
+    // over a server-side incident is not.
+    CHECK(client.state() == State::Limited);
+}

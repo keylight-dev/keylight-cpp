@@ -234,6 +234,11 @@ public:
                     break;
                 case keylight::State::Licensed:
                 case keylight::State::Invalid:
+                // Limited means a trusted, licensed lease that the server
+                // could only issue in degraded form (signing-key incident) —
+                // it is licensing material, not a keyless funnel state, so it
+                // is not reported here either.
+                case keylight::State::Limited:
                     break;
             }
 

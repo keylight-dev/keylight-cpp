@@ -48,11 +48,16 @@ namespace keylight {
 enum class State {
     Licensed,   // trusted, unexpired active lease
     Trial,      // no license; within trial window
-    Expired,    // trusted lease expired, or license status "expired"/"fallback"
+    Expired,    // trusted lease expired, or license status "expired"
     Invalid,    // no trusted lease, no active trial
     FreeTier,   // no license and no trial, but the product offers a free tier.
                 // Appended last on purpose: renumbering the values above would
                 // break any integrator that persisted a State as an integer.
+    Limited,    // trusted lease with server status "fallback": the server could
+                // not mint a full lease, so the app runs degraded rather than
+                // locked. Appended last for the same reason as FreeTier —
+                // renumbering would break any integrator that persisted a
+                // State as an integer.
 };
 
 // ---------------------------------------------------------------------------
@@ -1070,7 +1075,11 @@ private:
         if (l.status == "active") {
             return vr.expired ? State::Expired : State::Licensed;
         }
-        // "expired", "fallback", or anything else from a trusted lease → Expired
+        // Rust's resolve_state maps ("fallback", _) -> Limited BEFORE the
+        // expired arm. Keeping fallback on Expired locks the app over a
+        // server-side signing incident.
+        if (l.status == "fallback") return State::Limited;
+        // "expired", or anything else from a trusted lease → Expired
         return State::Expired;
     }
 
@@ -1158,6 +1167,10 @@ private:
     static State derive_state_from_verify_(const Lease& l, const VerifyResult& vr) {
         if (!vr.is_trusted()) return State::Invalid;
         if (l.status == "active") return vr.expired ? State::Expired : State::Licensed;
+        // Mirrors resolve_from_lease_: a cached "fallback" lease must still
+        // resolve to Limited after an offline relaunch, not re-lock to
+        // Expired just because the store reload took a different path.
+        if (l.status == "fallback") return State::Limited;
         return State::Expired;
     }
 
