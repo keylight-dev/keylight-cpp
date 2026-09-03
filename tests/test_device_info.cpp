@@ -162,3 +162,48 @@ TEST_CASE("device_info: sanitize_instance_name strips control chars and caps len
     CHECK(sanitize_instance_name(std::string(200, 'x')).size() == 64);
     CHECK(sanitize_instance_name("").empty());
 }
+
+// Minimal RFC 3629 well-formedness check: rejects a truncated sequence, a
+// continuation byte with no lead byte, and an invalid start byte.
+static bool is_valid_utf8(const std::string& s) {
+    size_t i = 0;
+    while (i < s.size()) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        size_t extra;
+        if      (c < 0x80)           extra = 0;
+        else if ((c & 0xE0) == 0xC0) extra = 1;
+        else if ((c & 0xF0) == 0xE0) extra = 2;
+        else if ((c & 0xF8) == 0xF0) extra = 3;
+        else                         return false;  // 0x80-0xBF lead, or 0xF8+
+        if (i + extra >= s.size()) return false;    // truncated sequence
+        for (size_t k = 1; k <= extra; ++k) {
+            if ((static_cast<unsigned char>(s[i + k]) & 0xC0) != 0x80) return false;
+        }
+        i += extra + 1;
+    }
+    return true;
+}
+
+TEST_CASE("device_info: sanitize_instance_name never splits a UTF-8 sequence") {
+    using keylight::detail::sanitize_instance_name;
+
+    // A non-ASCII hostname longer than the 64-byte cap. High bytes are kept on
+    // purpose, so a blind resize(64) cuts through the middle of a character.
+    // json_str does not escape high bytes, so those malformed bytes would go
+    // straight onto the wire and the worker can reject the whole activate
+    // request — over a machine name.
+    //
+    // 30 x U+65E5 (3 bytes each) = 90 bytes; the cap lands inside character 22.
+    std::string host;
+    for (int i = 0; i < 30; ++i) host += "\xE6\x97\xA5";
+    REQUIRE(host.size() == 90);
+
+    const std::string out = sanitize_instance_name(host);
+
+    CHECK(out.size() <= keylight::detail::INSTANCE_NAME_MAX);
+    CHECK(out.empty() == false);
+    CHECK(is_valid_utf8(out) == true);
+    // Backing off to the character boundary drops the partial character and
+    // nothing more: 21 whole characters, 63 bytes.
+    CHECK(out.size() == 63);
+}

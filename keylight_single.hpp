@@ -517,7 +517,22 @@ inline std::string sanitize_instance_name(std::string s) {
         if (u >= 0x20 && u != 0x7f) out += c;
     }
     while (!out.empty() && out.back() == ' ') out.pop_back();
-    if (out.size() > INSTANCE_NAME_MAX) out.resize(INSTANCE_NAME_MAX);
+    if (out.size() > INSTANCE_NAME_MAX) {
+        // Cap by BYTES, but never mid-character. High bytes are kept above, so
+        // a non-ASCII hostname over the cap would otherwise be cut through the
+        // middle of a UTF-8 sequence. json_str does not escape high bytes, so
+        // the malformed tail would reach the wire verbatim and the worker can
+        // reject the whole activate request over a machine name.
+        //
+        // Continuation bytes are 10xxxxxx; walk back off them to the lead byte
+        // and drop the partial character entirely.
+        size_t cut = INSTANCE_NAME_MAX;
+        while (cut > 0 &&
+               (static_cast<unsigned char>(out[cut]) & 0xC0) == 0x80) {
+            --cut;
+        }
+        out.resize(cut);
+    }
     return out;
 }
 
