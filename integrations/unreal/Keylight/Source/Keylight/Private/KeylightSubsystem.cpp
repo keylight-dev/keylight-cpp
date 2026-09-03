@@ -289,12 +289,15 @@ EKeylightState UKeylightSubsystem::GetState() const
 /*static*/ EKeylightState UKeylightSubsystem::ToUEState(int NativeState)
 {
     // keylight::State enum values in declaration order:
-    //   0 = Licensed, 1 = Trial, 2 = Expired, 3 = Invalid
+    //   0 = Licensed, 1 = Trial, 2 = Expired, 3 = Invalid, 4 = FreeTier,
+    //   5 = Limited
     switch (static_cast<keylight::State>(NativeState))
     {
         case keylight::State::Licensed: return EKeylightState::Licensed;
         case keylight::State::Trial:    return EKeylightState::Trial;
         case keylight::State::Expired:  return EKeylightState::Expired;
+        case keylight::State::FreeTier: return EKeylightState::FreeTier;
+        case keylight::State::Limited:  return EKeylightState::Limited;
         default:                        return EKeylightState::Invalid;
     }
 }

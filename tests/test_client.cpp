@@ -522,6 +522,31 @@ static void seed_store_with_valid_lease(MemoryStore& store,
     store.save(blob);
 }
 
+// Persist a trusted, "fallback"-status lease blob directly into the store —
+// the same lease as FALLBACK_VALIDATE_RESPONSE, in the shape validate()
+// would have written after receiving it. Used to exercise the offline
+// relaunch path (refresh_state_from_store_ -> derive_state_from_verify_)
+// independently of the online path (resolve_from_lease_), which
+// FALLBACK_VALIDATE_RESPONSE + a live transport already covers elsewhere.
+static void seed_store_with_fallback_lease(MemoryStore& store, int64_t now) {
+    std::string blob = R"({"lease":{)"
+        R"("kid":"k1",)"
+        R"("licenseKeyHash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",)"
+        R"("instanceId":"00000000-0000-4000-8000-000000000001",)"
+        R"("issuedAt":1781076246,)"
+        R"("expiresAt":1781681046,)"
+        R"("status":"fallback",)"
+        R"("signature":"H/L/1y6x6Cg11Hle+6RNFioM9N6gFWGeR9tOORsNZlcL+kinqJdtb3T5dD2Irh5Q9bH1avSUQZGQXtkqaeEVDw==",)"
+        R"("entitlements":[]})"
+        R"(,"expiresAt":1781681046)"
+        R"(,"instanceId":"inst-abc")"
+        R"(,"licenseKey":"XXXX-YYYY-ZZZZ-0001")"
+        ",\"lastValidatedOnline\":" + std::to_string(now) +
+        "}";
+
+    store.save(blob);
+}
+
 // ---------------------------------------------------------------------------
 // E2 TEST CASES
 // ---------------------------------------------------------------------------
@@ -1153,4 +1178,24 @@ TEST_CASE("Client: a fallback lease degrades to Limited, it does not lock the ap
     // or signing incident. Degrading is correct; locking a paying customer out
     // over a server-side incident is not.
     CHECK(client.state() == State::Limited);
+}
+
+TEST_CASE("Client: a fallback lease cached from a previous launch is still Limited offline") {
+    // resolve_from_lease_ (the online validate() path, covered above) is not
+    // the only place that decides State from a lease's "fallback" status.
+    // derive_state_from_verify_ recomputes state from whatever is persisted
+    // in the store on construction — the relaunch path — and must reach the
+    // same answer with NO server round-trip, or a client that degraded to
+    // Limited during validate() would silently re-lock to Expired the next
+    // time the app starts.
+    auto cfg = make_config();
+    FailingTransport transport; // must not be called: state must come from cache
+    MemoryStore      store;
+
+    seed_store_with_fallback_lease(store, VALID_ACTIVE_NOW);
+
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; });
+
+    CHECK(client.state() == State::Limited);
+    CHECK(transport.call_count == 0);
 }

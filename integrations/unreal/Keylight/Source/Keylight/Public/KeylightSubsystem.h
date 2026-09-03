@@ -34,6 +34,12 @@ enum class EKeylightState : uint8
     Trial     UMETA(DisplayName = "Trial"),
     Expired   UMETA(DisplayName = "Expired"),
     Invalid   UMETA(DisplayName = "Invalid"),
+    // Appended, not inserted: keylight::State is append-only because
+    // integrators persist it as an integer, and this enum mirrors it.
+    // Reordering the values above would relabel every previously-stored
+    // EKeylightState.
+    FreeTier  UMETA(DisplayName = "Free Tier"),
+    Limited   UMETA(DisplayName = "Limited"),
 };
 
 // ---------------------------------------------------------------------------
