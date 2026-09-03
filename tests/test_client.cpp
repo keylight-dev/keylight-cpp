@@ -27,13 +27,17 @@ public:
     // After each request(), the request body is stored here.
     std::string last_request_body;
 
+    // After each request(), the request headers are stored here.
+    std::map<std::string, std::string> last_request_headers;
+
     Result<HttpResponse> request(
         const std::string&,
         const std::string&,
-        const std::map<std::string, std::string>&,
+        const std::map<std::string, std::string>& headers,
         const std::string& body) override
     {
-        last_request_body = body;
+        last_request_body    = body;
+        last_request_headers = headers;
         HttpResponse r;
         r.status = next_status;
         r.body   = next_body;
@@ -1047,4 +1051,27 @@ TEST_CASE("Client: activate sends a real instance_name, not the literal 'device'
     if (!host.empty()) {
         CHECK(transport.last_request_body.find(host) != std::string::npos);
     }
+}
+
+TEST_CASE("Client: every request carries a unique X-Keylight-Request-Id") {
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; });
+
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+    auto it = transport.last_request_headers.find("X-Keylight-Request-Id");
+    REQUIRE(it != transport.last_request_headers.end());
+
+    const std::string first = it->second;
+    CHECK(first.size() == 32);
+    CHECK(first.find_first_not_of("0123456789abcdef") == std::string::npos);
+
+    // A correlation id that repeats correlates nothing.
+    transport.next_body = VALIDATE_RESPONSE;
+    REQUIRE(client.validate().is_ok());
+    CHECK(transport.last_request_headers["X-Keylight-Request-Id"] != first);
 }

@@ -35,6 +35,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -101,6 +102,25 @@ inline const char* current_platform() {
 #else
     return "unknown";
 #endif
+}
+
+// 128 bits of hex for the X-Keylight-Request-Id correlation header. Not a
+// security token — it exists so an app log line and a worker log line can be
+// matched up during support, so a per-thread PRNG is sufficient.
+inline std::string random_request_id() {
+    static thread_local std::mt19937_64 rng{std::random_device{}()};
+    static const char* kHex = "0123456789abcdef";
+
+    std::string out;
+    out.reserve(32);
+    for (int i = 0; i < 4; ++i) {
+        uint64_t chunk = rng();
+        for (int j = 0; j < 8; ++j) {
+            out += kHex[chunk & 0xF];
+            chunk >>= 4;
+        }
+    }
+    return out;
 }
 } // namespace detail
 
@@ -843,6 +863,7 @@ private:
         if (!cfg_.sdkKey.empty()) {
             headers["X-Keylight-SDK-Key"] = cfg_.sdkKey;
         }
+        headers["X-Keylight-Request-Id"] = detail::random_request_id();
         return headers;
     }
 
