@@ -286,3 +286,80 @@ TEST_CASE("FreeTier: deactivate lands on FreeTier rather than the paywall") {
     REQUIRE(client.deactivate().is_ok());
     CHECK(client.state() == State::FreeTier);
 }
+
+// ===========================================================================
+// The anonymous free-tier instance id
+// ===========================================================================
+
+TEST_CASE("Instance id: minted once and stable across calls") {
+    auto cfg = make_config();
+    RecordingTransport transport;
+    MemStore           store;
+    int64_t now = T0;
+
+    Client client(cfg, transport, store, [&]{ return now; });
+    const std::string a = client.freeTierInstanceId();
+    const std::string b = client.freeTierInstanceId();
+
+    CHECK(a.size() == 36);
+    CHECK(a == b);
+    CHECK(store.str_field("freeTierInstanceId") == a);
+}
+
+TEST_CASE("Instance id: restored by a new Client on the same store") {
+    auto cfg = make_config();
+    RecordingTransport transport;
+    MemStore           store;
+    int64_t now = T0;
+
+    std::string first;
+    {
+        Client client(cfg, transport, store, [&]{ return now; });
+        first = client.freeTierInstanceId();
+    }
+    Client relaunched(cfg, transport, store, [&]{ return now; });
+    CHECK(relaunched.freeTierInstanceId() == first);
+}
+
+TEST_CASE("Instance id: startTrial mints one for conversion attribution") {
+    // keylight-rust start_trial() writes FREE_TIER_INSTANCE_ID alongside
+    // TRIAL_START so a trial that converts can be attributed.
+    auto cfg = make_config(14);
+    RecordingTransport transport;
+    MemStore           store;
+    int64_t now = T0;
+
+    Client client(cfg, transport, store, [&]{ return now; });
+    REQUIRE(client.startTrial().is_ok());
+
+    CHECK(store.has_field("trialStart"));
+    CHECK(store.str_field("freeTierInstanceId").size() == 36);
+}
+
+TEST_CASE("Instance id: trials disabled means startTrial mints nothing") {
+    auto cfg = make_config(0);
+    RecordingTransport transport;
+    MemStore           store;
+    int64_t now = T0;
+
+    Client client(cfg, transport, store, [&]{ return now; });
+    REQUIRE(client.startTrial().is_ok());
+    CHECK_FALSE(store.has_field("freeTierInstanceId"));
+}
+
+TEST_CASE("Instance id: survives activate and validate") {
+    auto cfg = make_config();
+    RecordingTransport transport;
+    MemStore           store;
+    transport.next_body = ACTIVATE_OK;
+    int64_t now = T0;
+
+    Client client(cfg, transport, store, [&]{ return now; });
+    const std::string id = client.freeTierInstanceId();
+
+    REQUIRE(client.activate("KL-TEST-KEY").is_ok());
+    CHECK(store.str_field("freeTierInstanceId") == id);
+
+    REQUIRE(client.validate().is_ok());
+    CHECK(store.str_field("freeTierInstanceId") == id);
+}

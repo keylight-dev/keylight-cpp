@@ -17,6 +17,7 @@
 #include "device_info.hpp"
 #include "lease.hpp"
 #include "result.hpp"
+#include "machine_id.hpp"
 #include "store.hpp"
 #include "transport.hpp"
 #include "verifier.hpp"
@@ -397,6 +398,27 @@ public:
     /// calling this again (or by deactivating a paid license and re-calling).
     /// No-op when trials are disabled (Config::trialDurationDays <= 0).
     /// Performs store I/O — never call this from an audio thread.
+    /// Anonymous, per-install identifier for keyless/free-tier reporting.
+    /// Minted on first use and persisted; never derived from a licence or from
+    /// hardware.  Returns an empty string only when the store write fails.
+    /// Mirrors keylight-rust free_tier_instance_id().
+    std::string freeTierInstanceId() {
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            if (cached_free_tier_instance_id_.has_value()) {
+                return *cached_free_tier_instance_id_;
+            }
+            cached_free_tier_instance_id_ = detail::uuid_v4();
+        }
+        if (!save_cache_().is_ok()) {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            cached_free_tier_instance_id_.reset();
+            return {};
+        }
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        return *cached_free_tier_instance_id_;
+    }
+
     Result<State> startTrial() {
         if (cfg_.trialDurationDays <= 0) {
             // Trials disabled — nothing is persisted and no state changes.
@@ -414,6 +436,9 @@ public:
         if (started) {
             save_cache_();
         }
+        // Attribution: a trial that later converts must carry the same
+        // anonymous id the keyless beacon reported it under.
+        freeTierInstanceId();
 
         State new_state = resolve_current_state_();
         set_state_(new_state);
@@ -668,6 +693,7 @@ private:
     int64_t                          cached_last_validated_online_ = 0;
     // Epoch seconds when the local trial was started (nullopt = never started).
     std::optional<int64_t>           cached_trial_start_;
+    std::optional<std::string>       cached_free_tier_instance_id_;
 
     // ── Event listeners ───────────────────────────────────────────────────
     struct Listener {
@@ -945,6 +971,11 @@ private:
                 int64_t v = j["trialStart"].as_int();
                 if (v != 0) cached_trial_start_ = v;
             }
+            {
+                // Anonymous free-tier instance id (see freeTierInstanceId()).
+                std::string fid = j["freeTierInstanceId"].as_string();
+                if (!fid.empty()) cached_free_tier_instance_id_ = fid;
+            }
         }
 
         State paid = State::Invalid;
@@ -1092,6 +1123,10 @@ private:
         }
         if (cached_trial_start_.has_value()) {
             append("\"trialStart\":" + std::to_string(*cached_trial_start_));
+        }
+        if (cached_free_tier_instance_id_.has_value()) {
+            append("\"freeTierInstanceId\":" +
+                   json_str(*cached_free_tier_instance_id_));
         }
 
         blob += "}";
