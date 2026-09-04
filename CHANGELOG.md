@@ -61,6 +61,13 @@
   the rollback is detected, and again when the clock becomes honest. Events
   are deduplicated on the reported value, so a host that caches the last one
   cannot be left holding a stale `Licensed`.
+- **Breaking (listener contract):** state-change delivery is now serialised, so
+  concurrent notifiers cannot reorder events and leave a subscriber holding a
+  value `state()` contradicts. A listener therefore **must not call back into
+  the `Client`** — it will deadlock. Unsubscribing from inside your own
+  callback is still supported. Re-entering was never safe (a listener calling
+  `validate()` recursed straight back into delivery), but it now fails loudly
+  instead of quietly.
 - **Breaking:** `deactivate()` returns the server's error instead of always
   succeeding. The local cache is still cleared either way.
 - Errors from the API now carry the server's message ("License key not found",
