@@ -16,11 +16,18 @@
 - `os_version` and `arch` are now sent on activate, validate and keyless, so the
   matching dashboard cards are populated for C++ tenants.
 - `instance_name` now carries the real machine name instead of the constant
-  `"device"`.
+  `"device"`. **This means the machine's hostname is now sent to the API**,
+  where it appears in the customer's own device list on your dashboard —
+  previously every device was listed as `"device"`. It is capped at 64 bytes
+  and stripped of control characters; there is no opt-out.
 - `X-Keylight-Request-Id` on every request, echoed by the API, so app logs and
   server logs can be correlated during support.
-- Clock-rollback detection: state fails closed when the system clock has moved
-  backward more than an hour since the last server contact.
+- **`keylight::clock_rolled_back(last_seen, now)`** and
+  **`keylight::CLOCK_BACKWARD_TOLERANCE`** (1 hour), in `keylight/clock.hpp`.
+  Public surface: `clock_rolled_back` is true when `now` is more than the
+  tolerance behind `last_seen`. It deliberately omits the forward-jump half of
+  keylight-rust's `clock_manipulated()`, because going offline for a while is
+  governed by `maxOfflineDays`, not by this guard.
 
 ### Changed
 
@@ -33,6 +40,17 @@
 - **JUCE:** The state switch (`Licensing::onStateChanged`) now handles
   `State::Limited`, so a fallback lease from a signing-key incident surfaces as
   the degraded state rather than being treated as expired.
+- **Clock-rollback guard, at every state read point.** With the system clock
+  more than an hour behind the last recorded server contact, `state()`,
+  `hasEntitlement()`, `checkOnLaunch()`, `refreshIfNeeded()` and `validate()`
+  all fail closed together — `Invalid` and `false` — instead of ageing a
+  cached lease against a clock that moved. `maxOfflineDays` is enforced the
+  same way when the stored anchor sits *ahead* of the clock, which previously
+  disabled the bound silently. The guard clears itself the moment the clock is
+  honest again, or on the next successful server contact; errors are passed
+  through untouched. JUCE integrators: `KeylightJuce.h`'s audio-thread
+  snapshot now stores `client_->state()` rather than the raw state handed to
+  the subscription callback, so the guard survives the first state change.
 - **Breaking:** `deactivate()` returns the server's error instead of always
   succeeding. The local cache is still cleared either way.
 - Errors from the API now carry the server's message ("License key not found",
