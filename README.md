@@ -273,7 +273,10 @@ Subscribers registered with `subscribe()` receive the same value `state()` would
 paywall driven by events and one driven by the query API cannot disagree. Events are delivered
 in order, with no SDK lock held — your callback may take your own locks and may call back into
 the `Client`; a re-entrant call queues its event rather than recursing, so it may be delivered
-by a different thread. The one thing not to do is destroy the `Client` from a callback.
+by a different thread. Two things not to do: destroy the `Client` from a callback, and throw
+from one — an exception has nowhere to go, so it is caught and swallowed and the remaining
+listeners still get the event. Note also that `unsubscribe()` does not fence a delivery already
+in flight on another thread; keep whatever your callback captures alive across that window.
 
 The clock-rollback guard raises its own event in both directions — once when the rollback is
 detected, and again when the clock becomes honest. Because a moving clock changes no underlying

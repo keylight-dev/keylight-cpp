@@ -69,10 +69,12 @@
   call queues its event rather than recursing, and may be delivered by a
   different thread. Do not destroy the `Client` from a callback.
 - Because `validate()` also raises the guard's event, a `validate()` that spans
-  a clock correction now emits two events (`Invalid`, then the resolved state)
-  where it previously emitted none. Both are accurate — during the round trip
-  `state()` genuinely reported `Invalid` — but debounce your paywall if you
-  drive UI straight off the event.
+  a clock correction now emits `Invalid` where it previously emitted nothing —
+  followed, on the success path only, by the resolved state. Offline (network
+  failure, non-200, bad JSON) `validate()` returns early and emits just the
+  `Invalid`; the next poll corrects it, and it fails closed meanwhile. Both
+  events are accurate — during the round trip `state()` genuinely reported
+  `Invalid` — but debounce your paywall if you drive UI straight off events.
 - `stopAutoValidation()` called from a state-change listener that was delivered
   on the auto-validation thread no longer self-joins. It previously threw
   `EDEADLK` from `join()` and then aborted the process via `std::terminate` in
