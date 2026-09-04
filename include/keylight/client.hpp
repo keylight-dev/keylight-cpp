@@ -280,9 +280,12 @@ public:
         // alternative is a silent use-after-free, since the thread returns
         // into av_loop_ and touches av_mutex_ after this destructor is done.
         //
-        // This can block for a listener callback plus a network round trip —
-        // the cost stopAutoValidation() used to pay is concentrated here now.
-        // A JUCE ~Licensing() runs on the message thread, so budget for it.
+        // This blocks for however long the joined worker still has to do. That
+        // is AT LEAST one network round trip, and if the worker holds the
+        // delivery baton it is also every listener for every event still
+        // queued — hundreds of milliseconds under a transition storm, not a
+        // fixed cost. A JUCE ~Licensing() runs on the message thread, so
+        // budget for the worst case, not the typical one.
     }
 
     // ── Sync API ──────────────────────────────────────────────────────────
@@ -1921,8 +1924,12 @@ private:
     /// is no longer current — which is how both stopAutoValidation() and
     /// ~Client() retire it, without either of them joining.
     void av_loop_(uint64_t epoch) {
-        const auto interval =
-            std::chrono::milliseconds(cfg_.autoValidationIntervalMs);
+        // Clamp: wait_for() with a non-positive duration returns immediately,
+        // so a misconfigured interval turns the worker into a busy-spin that
+        // hammers refreshIfNeeded(). One millisecond is still absurd, but it
+        // is a rate rather than a spin.
+        const auto interval = std::chrono::milliseconds(
+            cfg_.autoValidationIntervalMs > 0 ? cfg_.autoValidationIntervalMs : 1);
         std::unique_lock<std::mutex> lk(av_mutex_);
         while (av_epoch_ == epoch) {
             // Interruptible wait: wakes immediately when the epoch moves.

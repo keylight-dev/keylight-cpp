@@ -361,9 +361,12 @@ public:
         //   an in-flight callback that got past the alive_ check would write
         //   to destroyed members.  Formally UB, and free to avoid.
         //
-        //   This can block for one listener callback plus a network round
-        //   trip, on the message thread.  That is the cost of a clean
-        //   shutdown; it was previously paid inside stopAutoValidation().
+        //   This blocks the MESSAGE THREAD for whatever the SDK worker still
+        //   has to finish: at least one network round trip, and every queued
+        //   listener callback if that worker is the one delivering events.
+        //   Hundreds of milliseconds under a transition storm, not a fixed
+        //   cost. It is the price of a clean shutdown, and it was previously
+        //   paid inside stopAutoValidation().
         client_.reset();
     }
 

@@ -180,7 +180,10 @@ int main() {
 > `client.startAutoValidation()` for daemon or headless applications. Both it and
 > `stopAutoValidation()` are safe from any thread, including from a state-change
 > listener, and neither blocks. Note `stopAutoValidation()` retires the worker rather
-> than waiting for it: one more tick can land after it returns. `~Client()` joins.
+> than waiting for it: one more tick can land after it returns. `~Client()` is what
+> joins, so it blocks for whatever the worker still has to finish — at least a round
+> trip, and every queued listener callback if that worker is delivering. Destroy the
+> client somewhere that can afford to wait.
 
 ## Unreal Engine
 

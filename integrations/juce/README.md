@@ -261,6 +261,20 @@ SDK deliberately makes no network call on that path.
 
 ---
 
+### Destruction blocks the message thread
+
+`~Licensing()` destroys the SDK client last, and `~keylight::Client` joins the
+auto-validation worker — that is what guarantees no worker outlives the client.
+So destruction waits for whatever that worker still has to finish: at least one
+network round trip, and if it happens to be the thread delivering state-change
+events, every listener for every event still queued. Hundreds of milliseconds
+under a transition storm, not a fixed cost.
+
+`stopAutoValidation()` does **not** shorten this. Since 0.2.0 it retires the
+worker and returns immediately; the waiting moved to the destructor. If you
+cannot afford to block the message thread, destroy `Licensing` somewhere that
+can.
+
 ## Threading contract
 
 | Method / event                          | Thread               |
@@ -273,6 +287,7 @@ SDK deliberately makes no network call on that path.
 | `hasEntitlement(feature)` (SDK mutex)   | Message thread only  |
 | `trialStatus()` / `trialDaysLeft()` (SDK mutex) | Message thread only  |
 | `JuceUrlTransport::request()`           | Background `std::thread` only — never the audio thread |
+| `~Licensing()`                          | **Message thread — and it blocks.** See below |
 
 `JuceUrlTransport::request()` calls `juce::URL::createInputStream()` which
 blocks the background thread synchronously.  The audio thread and message

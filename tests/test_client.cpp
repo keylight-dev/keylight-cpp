@@ -2101,9 +2101,19 @@ TEST_CASE("Client: a throwing transport on the worker does not abort the process
     REQUIRE(spin_until(std::chrono::seconds(5),
                        [&]{ return transport.calls.load() >= 3; }));
 
+    // Restartable. Drain to a full stop FIRST: stop() does not join, so
+    // without this the "calls went up" below could be satisfied by the
+    // retired worker finishing its in-flight cycle rather than by the new
+    // one — the assertion would read stronger than it is.
     client.stopAutoValidation();
-    client.startAutoValidation();
+    REQUIRE(spin_until(std::chrono::seconds(5), [&]{
+        const int settled = transport.calls.load();
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        return transport.calls.load() == settled;
+    }));
+
     const int before = transport.calls.load();
+    client.startAutoValidation();
     REQUIRE(spin_until(std::chrono::seconds(5),
                        [&]{ return transport.calls.load() > before; }));
 
