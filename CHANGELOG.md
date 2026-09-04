@@ -42,15 +42,25 @@
   the degraded state rather than being treated as expired.
 - **Clock-rollback guard, at every state read point.** With the system clock
   more than an hour behind the last recorded server contact, `state()`,
-  `hasEntitlement()`, `checkOnLaunch()`, `refreshIfNeeded()` and `validate()`
-  all fail closed together — `Invalid` and `false` — instead of ageing a
-  cached lease against a clock that moved. `maxOfflineDays` is enforced the
-  same way when the stored anchor sits *ahead* of the clock, which previously
-  disabled the bound silently. The guard clears itself the moment the clock is
-  honest again, or on the next successful server contact; errors are passed
-  through untouched. JUCE integrators: `KeylightJuce.h`'s audio-thread
-  snapshot now stores `client_->state()` rather than the raw state handed to
-  the subscription callback, so the guard survives the first state change.
+  `hasEntitlement()` and *every* public method returning a `Result<State>` —
+  `activate()`, `validate()`, `startTrial()`, `checkOnLaunch()`,
+  `refreshIfNeeded()` — fail closed together, reporting `Invalid` and `false`
+  rather than ageing a cached lease against a clock that moved. Note
+  `startTrial()`: it still starts and persists the trial, but reports
+  `Invalid` while the clock is untrusted. Errors are passed through untouched
+  — an error is not a state claim. `maxOfflineDays` is enforced the same way
+  when the stored anchor sits *ahead* of the clock, which previously disabled
+  the bound silently. The guard clears itself the moment the clock is honest
+  again, or on the next successful server contact.
+- **State-change events now report the guarded state, and the guard raises
+  its own.** Subscribers registered with `subscribe()` / `on()` are handed
+  what `state()` would return, so a paywall driven by the event stream cannot
+  disagree with one driven by the query API. Because a clock that moves
+  changes no underlying state, the event is raised from `refreshIfNeeded()` —
+  which `startAutoValidation()` already ticks — in both directions: once when
+  the rollback is detected, and again when the clock becomes honest. Events
+  are deduplicated on the reported value, so a host that caches the last one
+  cannot be left holding a stale `Licensed`.
 - **Breaking:** `deactivate()` returns the server's error instead of always
   succeeding. The local cache is still cleared either way.
 - Errors from the API now carry the server's message ("License key not found",

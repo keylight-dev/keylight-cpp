@@ -269,6 +269,13 @@ switch (client.state()) {
 allocation-free — an exception escaping it is `std::terminate`, on whichever thread called
 `state()`. The default (`std::time`) already satisfies this.
 
+Subscribers registered with `subscribe()` receive the same value `state()` would return, so a
+paywall driven by events and one driven by the query API cannot disagree. The clock-rollback
+guard raises its own event in both directions — once when the rollback is detected, and again
+when the clock becomes honest — but only from `refreshIfNeeded()`, since a moving clock changes
+no underlying state. Call `startAutoValidation()` (or `refreshIfNeeded()` on focus/resume) in a
+long-running host, or a mid-session rollback will reach `state()` and never reach your callback.
+
 ## Trials
 
 Trials are **local and offline-first**. `startTrial()` persists a start timestamp
