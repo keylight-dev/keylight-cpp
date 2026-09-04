@@ -181,9 +181,11 @@ int main() {
 > `stopAutoValidation()` are safe from any thread, including from a state-change
 > listener, and neither blocks. Note `stopAutoValidation()` retires the worker rather
 > than waiting for it: one more tick can land after it returns. `~Client()` is what
-> joins, so it blocks for whatever the worker still has to finish — at least a round
-> trip, and every queued listener callback if that worker is delivering. Destroy the
-> client somewhere that can afford to wait.
+> joins. It usually returns at once — it wakes the worker before joining, so a parked
+> one exits without another cycle — but if the worker is mid-cycle it waits for up to
+> a round trip, plus every queued listener callback if that worker is delivering.
+> Since listeners are your code, that upper bound is unbounded; destroy the client
+> somewhere that can afford to wait.
 
 ## Unreal Engine
 
@@ -432,7 +434,7 @@ Populate a `keylight::Config` struct:
 | `freeTierEnabled` | `bool` | `false` | Resolve `State::FreeTier` instead of `Invalid`/`Expired` when there is no license and no active trial. See [Free Tier](#free-tier). |
 | `apiBaseUrl` | `std::string` | `https://api.keylight.dev` | Keylight API base URL. |
 | `appVersion` | `std::string` | — | Reported in activation/validation telemetry. |
-| `autoValidationIntervalMs` | `int` | `1800000` | Background auto-validation interval (ms); used only when `startAutoValidation()` is called. |
+| `autoValidationIntervalMs` | `int` | `1800000` | Background auto-validation interval (ms); used only when `startAutoValidation()` is called. A non-positive value is clamped to 1 ms rather than busy-spinning. |
 
 ## Cross-SDK Conformance Vectors
 

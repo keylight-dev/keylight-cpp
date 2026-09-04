@@ -85,12 +85,13 @@
   stopped", gate on your own flag rather than on the call returning.
 
   `~Client()` still joins, so a worker can never outlive the `Client` — but
-  note the cost moved rather than vanished. The destructor blocks for whatever
-  the joined worker still has to do: at least one network round trip, and if
-  that worker is delivering events, every listener for every event still
-  queued. Budget for hundreds of milliseconds under a transition storm, not a
-  fixed cost. It matters if you destroy the client on a UI thread (JUCE's
-  `~Licensing` does).
+  note the cost moved rather than vanished. It usually returns immediately:
+  the destructor retires the worker and wakes it before joining, so one parked
+  in its interval wait exits without another cycle. It blocks only when the
+  worker is mid-cycle — by up to one round trip, plus every queued listener
+  callback if that worker is the one delivering events. That upper bound is
+  unbounded in principle, because listeners are your code. It matters if you
+  destroy the client on a UI thread (JUCE's `~Licensing` does).
 
   Workers are now retired by epoch instead of being joined, which is what makes
   the rest of this section true. `startAutoValidation()` and

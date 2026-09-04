@@ -325,9 +325,14 @@ public:
     }
 
     // -----------------------------------------------------------------------
-    // Destructor — joins any running background thread; stops auto-validation.
-    // Safe to call from the message thread (join is quick; background threads
-    // do only one SDK round-trip then exit).
+    // Destructor — retires auto-validation, joins our own worker thread, then
+    // destroys the SDK client (which joins the SDK's worker).
+    //
+    // Call from the MESSAGE THREAD, and know that it can block there. Usually
+    // it returns at once. It waits only when an SDK worker is mid-cycle: up to
+    // one round trip, plus every queued listener callback if that worker is
+    // delivering events. Since listeners are your code, that has no fixed
+    // upper bound — see step ⑤.
     // -----------------------------------------------------------------------
     ~Licensing()
     {
@@ -361,12 +366,15 @@ public:
         //   an in-flight callback that got past the alive_ check would write
         //   to destroyed members.  Formally UB, and free to avoid.
         //
-        //   This blocks the MESSAGE THREAD for whatever the SDK worker still
-        //   has to finish: at least one network round trip, and every queued
-        //   listener callback if that worker is the one delivering events.
-        //   Hundreds of milliseconds under a transition storm, not a fixed
-        //   cost. It is the price of a clean shutdown, and it was previously
-        //   paid inside stopAutoValidation().
+        //   COST: usually zero. ~Client() wakes the SDK worker before it
+        //   joins, so one parked in its interval wait exits without another
+        //   cycle — on the default 30-minute interval that is almost always
+        //   the case. It blocks the MESSAGE THREAD only when the worker is
+        //   mid-cycle: up to one round trip, plus every queued listener
+        //   callback if that worker is delivering events. Your listeners set
+        //   that ceiling, so keep them short if teardown latency matters.
+        //   It is the price of a clean shutdown, and it was previously paid
+        //   inside stopAutoValidation().
         client_.reset();
     }
 

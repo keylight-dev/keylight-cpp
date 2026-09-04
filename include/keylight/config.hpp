@@ -26,6 +26,10 @@ struct Config {
     // Default is 30 minutes (1 800 000 ms).  Set a smaller value in tests
     // as a deterministic seam — the background thread uses this as its
     // interruptible wait timeout.
+    //
+    // A non-positive value is clamped to 1 ms. Left unclamped it would make
+    // the wait return immediately and turn the worker into a busy-spin over
+    // refreshIfNeeded(); 1 ms is still a bad interval, but it is a rate.
     int autoValidationIntervalMs = 1'800'000; // 30 min
 };
 

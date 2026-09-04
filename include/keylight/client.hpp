@@ -280,12 +280,21 @@ public:
         // alternative is a silent use-after-free, since the thread returns
         // into av_loop_ and touches av_mutex_ after this destructor is done.
         //
-        // This blocks for however long the joined worker still has to do. That
-        // is AT LEAST one network round trip, and if the worker holds the
-        // delivery baton it is also every listener for every event still
-        // queued — hundreds of milliseconds under a transition storm, not a
-        // fixed cost. A JUCE ~Licensing() runs on the message thread, so
-        // budget for the worst case, not the typical one.
+        // COST. Usually zero: the epoch bump and notify_all() above happen
+        // BEFORE this join, so a worker parked in its interval wait wakes,
+        // fails the epoch check and exits without another cycle. On the
+        // default 30-minute interval it is parked essentially all the time.
+        //
+        // It blocks only when the worker is mid-cycle, and then by up to one
+        // round trip — plus, if that worker holds the delivery baton, every
+        // listener for every event still queued.
+        //
+        // That upper bound is UNBOUNDED in principle, because listeners are
+        // the integrator's code and nothing caps how long one may take. A
+        // JUCE ~Licensing() runs on the message thread, so a slow listener
+        // stalls a plugin teardown for as long as it likes. The LISTENER
+        // CONTRACT permits a listener to do anything except re-enter
+        // destruction; it does not promise it will be quick.
     }
 
     // ── Sync API ──────────────────────────────────────────────────────────
@@ -907,6 +916,11 @@ public:
     ///   - Events are delivered in order, but not synchronously: the call
     ///     that caused a transition may return before the event has been
     ///     delivered by whichever thread holds the delivery baton.
+    ///   - KEEP IT SHORT if teardown latency matters. ~Client() joins the
+    ///     auto-validation worker, and if that worker is delivering it must
+    ///     finish your callback for every queued event first — so a slow
+    ///     listener stalls destruction for as long as it likes. Nothing here
+    ///     caps it, and a JUCE ~Licensing() runs on the message thread.
     ///
     ///   - A listener MUST NOT throw. An exception cannot be reported from
     ///     here — delivery runs on whatever thread moved the state — so it is

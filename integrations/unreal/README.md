@@ -182,6 +182,23 @@ KL->Client_->startAutoValidation();  // internal — see note below
 | `OnActivateComplete` delegate fires  | **Game thread** always |
 | `GetState()`                         | Any thread (atomic reads, no lock) |
 | `HasEntitlement()`                   | Any thread (mutex-guarded read) |
+| `Deinitialize()` / a second `Configure()` | Game thread — may block; see below |
+
+### Teardown can block the game thread
+
+Both `Deinitialize()` and a repeat `Configure()` destroy the SDK client, and
+`~keylight::Client` joins the auto-validation worker — that is what guarantees
+no worker outlives the client.
+
+**Usually it returns at once.** The destructor wakes the worker before it
+joins, so a worker parked in its interval wait exits without another cycle.
+Since 0.2.0 `stopAutoValidation()` does *not* wait for anything; whatever
+waiting is left happens in the destructor.
+
+It blocks only when the worker is mid-cycle: up to one network round trip, plus
+every listener callback for every queued event if that worker is delivering.
+**Your listeners set that ceiling** — nothing in the SDK caps it. `Configure()`
+is the one to watch, since it runs mid-session where a hitch is visible.
 
 `GetState()` forwards to `keylight::Client::state()`, which is `noexcept` and
 calls the clock function the `Client` was constructed with. The default

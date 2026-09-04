@@ -68,7 +68,18 @@ void UKeylightSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 void UKeylightSubsystem::Deinitialize()
 {
-    // Stop background auto-validation before tearing down the client.
+    // Stop background auto-validation, then tear down the client.
+    //
+    // Since 0.2.0 stopAutoValidation() does NOT wait for the worker — it
+    // retires it and returns. The waiting, if any, happens in ~Client() via
+    // Client_.Reset(), which is what guarantees no worker outlives the client.
+    //
+    // On the GAME THREAD, so know the cost: usually zero, because ~Client()
+    // wakes the worker before it joins and one parked in its interval wait
+    // exits without another cycle. It blocks only when the worker is
+    // mid-cycle — up to one round trip, plus every listener callback for every
+    // queued event if that worker is delivering. Your listeners set that
+    // ceiling; nothing in the SDK caps it.
     if (Client_)
     {
         Client_->stopAutoValidation();
@@ -97,6 +108,9 @@ void UKeylightSubsystem::Configure(
     // Client_ and frees that object, leaving the background task with a
     // dangling ClientPtr. Ensure any in-flight operations have completed
     // (e.g. their delegates have fired) before calling Configure() again.
+    //
+    // Same game-thread cost as Deinitialize() — see the note there. Worse
+    // here, in fact: Configure() runs mid-session, so a hitch is visible.
     if (Client_)
     {
         Client_->stopAutoValidation();
