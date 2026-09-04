@@ -320,6 +320,11 @@ Rules the state machine guarantees:
   become (`Trial` if still running, `Expired` if it elapsed meanwhile,
   `Invalid` if there never was one). Deactivation does not reset the trial clock.
 
+- **`checkTrial()` and `trialDaysLeft()` do not apply the clock-rollback guard.**
+  They are local arithmetic over the persisted start timestamp, so on a rolled-back
+  clock `checkTrial()` can report `Active` while `state()` reports `Invalid`. Gate
+  access on `state()`; use these two for display.
+
 State priority: valid paid license → active local trial → elapsed local trial →
 `Invalid`.
 
