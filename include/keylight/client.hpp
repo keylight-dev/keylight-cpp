@@ -665,9 +665,32 @@ public:
     ///
     /// Idempotent: calling startAutoValidation() while a thread is already
     /// running is a no-op (the existing thread continues).
+    ///
+    /// Restartable: stop-then-start is an ordinary pattern (stop polling when
+    /// the licence goes invalid, restart when the user activates), including
+    /// after a stopAutoValidation() that came from a listener on the worker
+    /// thread itself — that path deliberately leaves the thread unjoined, and
+    /// a finished thread is still joinable(), so this reaps it rather than
+    /// mistaking it for a live worker and no-opping forever.
     void startAutoValidation() {
+        std::thread stale;
+        {
+            std::lock_guard<std::mutex> lock(av_mutex_);
+            if (av_thread_.joinable()) {
+                if (!av_stop_) return;   // genuinely running — no-op
+                // Cannot reap ourselves; the caller is the worker. It exits
+                // when this listener returns, and the next start reaps it.
+                if (av_thread_.get_id() == std::this_thread::get_id()) return;
+                stale = std::move(av_thread_);
+            }
+        }
+        // Join outside the lock — the worker needs av_mutex_ to exit — and
+        // BEFORE clearing av_stop_, or the old worker would see the flag drop
+        // and keep running.
+        if (stale.joinable()) stale.join();
+
         std::lock_guard<std::mutex> lock(av_mutex_);
-        if (av_thread_.joinable()) return; // already running — no-op
+        if (av_thread_.joinable()) return;   // another caller won the race
 
         av_stop_ = false;
         av_thread_ = std::thread([this] {
@@ -808,8 +831,9 @@ public:
     /// event: currently only "change" is defined (fires on every state transition).
     /// Returns a Subscription RAII handle; when the handle is destroyed or
     /// unsubscribe() is called, the callback is removed.
-    /// Callbacks are dispatched on the calling thread; UI/audio hosts must
-    /// marshal to their own thread if required.
+    /// Callbacks are dispatched on whichever thread happens to be draining the
+    /// event queue, which is NOT necessarily the thread that caused the
+    /// transition. UI/audio hosts must marshal to their own thread.
     Subscription on(const std::string& /*event*/,
                     std::function<void(State)> cb)
     {
@@ -835,9 +859,19 @@ public:
     ///     that caused a transition may return before the event has been
     ///     delivered by whichever thread holds the delivery baton.
     ///
-    /// The callback runs on whichever thread caused the transition, which for
-    /// startAutoValidation() is the SDK's background thread. Marshal to your
-    /// UI thread yourself.
+    ///   - A listener MUST NOT throw. An exception cannot be reported from
+    ///     here — delivery runs on whatever thread moved the state — so it is
+    ///     caught and swallowed, and the remaining listeners still get the
+    ///     event.
+    ///   - unsubscribe() does not fence a delivery already in flight on
+    ///     another thread. Keep whatever your listener captures alive across
+    ///     that window (the JUCE adapter uses a shared alive_ flag).
+    ///
+    /// The callback runs on whichever thread is draining the queue. That is
+    /// usually the thread that caused the transition, but under concurrency it
+    /// can be another one — a thread already delivering picks up your event
+    /// rather than handing it back. Never the audio thread. Marshal to your UI
+    /// thread yourself.
     Subscription subscribe(std::function<void(State)> cb) {
         std::lock_guard<std::mutex> lock(listeners_mutex_);
         uint64_t id = ++next_listener_id_;
@@ -984,9 +1018,10 @@ private:
     std::vector<Listener>     listeners_;
     uint64_t                  next_listener_id_ = 0;
     // Guards the event ORDER (pending_ + delivering_ + the dedupe), never the
-    // delivery itself — see notify_(). Always acquired BEFORE listeners_mutex_
-    // and never while holding cache_mutex_ or av_mutex_. Never held across a
-    // callback, so it cannot participate in an application's lock cycle.
+    // delivery itself — see notify_(). Never nested with listeners_mutex_,
+    // cache_mutex_ or av_mutex_ — each is taken and released on its own — and
+    // never held across a callback, so it cannot join an application's lock
+    // cycle.
     std::mutex                notify_mutex_;
     std::vector<State>        pending_;              // events in delivery order
     bool                      delivering_ = false;   // the delivery baton
@@ -1856,14 +1891,27 @@ private:
             delivering_ = true;
         }
 
+        // The baton is a plain bool, so unlike a lock_guard it does NOT release
+        // on unwind. Anything that throws past this point — a listener, or a
+        // bad_alloc from the copies below — would leave delivering_ stuck true
+        // and every later notify_() would take the "someone else is draining"
+        // exit. The channel would be dead for the life of the Client while
+        // state() kept moving: a caching subscriber like JUCE's audio-thread
+        // snapshot would hold its last value forever, which on a rolled-back
+        // clock is a permanent fail-open.
+        struct BatonGuard {
+            Client* self;
+            ~BatonGuard() {
+                std::lock_guard<std::mutex> lock(self->notify_mutex_);
+                self->delivering_ = false;
+            }
+        } baton_guard{this};
+
         for (;;) {
             State ev;
             {
                 std::lock_guard<std::mutex> lock(notify_mutex_);
-                if (pending_.empty()) {
-                    delivering_ = false;   // hand the baton back
-                    return;
-                }
+                if (pending_.empty()) return;   // guard hands the baton back
                 ev = pending_.front();
                 pending_.erase(pending_.begin());
             }
@@ -1879,7 +1927,16 @@ private:
                 }
             }
             for (const auto& cb : cbs) {
-                cb(ev);   // NO lock held here. This is the whole point.
+                // Contain each listener. One that throws must not cost the
+                // others their event, and must not propagate out of an SDK
+                // call the integrator made for an unrelated reason.
+                try {
+                    cb(ev);   // NO lock held here. This is the whole point.
+                } catch (...) {
+                    // Swallowed deliberately: see the LISTENER CONTRACT on
+                    // subscribe(). There is nowhere to report it — notify_()
+                    // runs on whatever thread moved the state.
+                }
             }
         }
     }

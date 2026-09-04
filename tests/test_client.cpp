@@ -13,6 +13,7 @@
 #include <map>
 #include <thread>
 #include <vector>
+#include <stdexcept>
 
 using namespace keylight;
 
@@ -1650,6 +1651,113 @@ TEST_CASE("Client: a listener may call back into the Client") {
         delete sub; delete client; delete offline;
         delete store; delete nowv; delete calls;
     }
+}
+
+TEST_CASE("Client: a listener that throws does not kill the event channel") {
+    // The delivery baton is a plain bool, not a lock_guard, so it does not
+    // release on unwind. An exception escaping a listener would leave it stuck
+    // and every later notify_() would take the "someone else is draining"
+    // exit — the channel dead for the life of the Client while state() kept
+    // moving. A caching subscriber (JUCE's audio-thread snapshot) would then
+    // hold its last value forever, which on a rolled-back clock is a
+    // permanent fail-open.
+    auto cfg = make_config();
+
+    std::atomic<int64_t> now{VALID_ACTIVE_NOW};
+    FailingTransport     offline;
+    MemoryStore          store;
+
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW);
+
+    Client client(cfg, offline, store, [&]{ return now.load(); });
+    REQUIRE(client.state() == State::Licensed);
+
+    // A listener that throws once, and a well-behaved one after it.
+    std::atomic<int> thrower_calls{0};
+    auto bad = client.subscribe([&](State) {
+        if (thrower_calls.fetch_add(1) == 0) throw std::runtime_error("listener");
+    });
+
+    std::vector<State> seen;
+    std::mutex         seen_mutex;
+    auto good = client.subscribe([&](State s) {
+        std::lock_guard<std::mutex> lock(seen_mutex);
+        seen.push_back(s);
+    });
+
+    // The event the bad listener throws on must still reach the good one.
+    now.store(VALID_ACTIVE_NOW - 2 * 3600);
+    REQUIRE_NOTHROW(client.refreshIfNeeded());
+
+    {
+        std::lock_guard<std::mutex> lock(seen_mutex);
+        REQUIRE(seen.size() == 1);
+        CHECK(seen.back() == State::Invalid);
+    }
+
+    // And the channel must still be alive afterwards.
+    now.store(VALID_ACTIVE_NOW);
+    client.refreshIfNeeded();
+
+    std::lock_guard<std::mutex> lock(seen_mutex);
+    REQUIRE(seen.size() == 2);
+    CHECK(seen.back() == State::Licensed);
+    CHECK(seen.back() == client.state());
+}
+
+TEST_CASE("Client: auto-validation restarts after a listener stopped it") {
+    // "Stop polling when the licence goes invalid, restart when the user
+    // activates" is an ordinary integration pattern. The listener here is
+    // delivered ON the auto-validation thread, so stopAutoValidation() cannot
+    // join itself: it signals and returns, leaving av_thread_ joinable. A
+    // finished thread is still joinable(), so a later start must REAP it
+    // rather than mistake it for a live worker and no-op forever.
+    auto cfg = make_config();
+    cfg.autoValidationIntervalMs = 20;
+
+    std::atomic<int64_t> now{VALID_ACTIVE_NOW};
+    std::atomic<int>     ticks{0};
+    FailingTransport     offline;
+    MemoryStore          store;
+
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW);
+
+    Client client(cfg, offline, store, [&]{ ticks.fetch_add(1); return now.load(); });
+
+    std::atomic<bool> self_stopped{false};
+    auto sub = client.subscribe([&](State s) {
+        if (s == State::Invalid && !self_stopped.exchange(true)) {
+            client.stopAutoValidation();   // from the worker thread itself
+        }
+    });
+
+    auto count_ticks = [&](std::chrono::milliseconds window) {
+        const int before = ticks.load();
+        std::this_thread::sleep_for(window);
+        return ticks.load() - before;
+    };
+
+    client.startAutoValidation();
+    REQUIRE(count_ticks(std::chrono::milliseconds(200)) > 0);
+
+    // Roll the clock back: the worker's next tick raises the guard's event,
+    // delivers it on its own thread, and the listener stops it from there.
+    now.store(VALID_ACTIVE_NOW - 2 * 3600);
+    for (int i = 0; i < 100 && !self_stopped.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    REQUIRE(self_stopped.load());
+
+    (void)count_ticks(std::chrono::milliseconds(100));   // let it wind down
+    REQUIRE(count_ticks(std::chrono::milliseconds(200)) == 0);
+
+    // The user activates; the host restarts polling. This must actually
+    // restart — not silently no-op on an unreaped thread.
+    now.store(VALID_ACTIVE_NOW);
+    client.startAutoValidation();
+    CHECK(count_ticks(std::chrono::milliseconds(200)) > 0);
+
+    client.stopAutoValidation();
 }
 
 TEST_CASE("Client: an anchor ahead of the clock does not pass the maxOfflineDays bound") {
