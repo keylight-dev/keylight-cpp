@@ -271,7 +271,10 @@ public:
             // Called INLINE on purpose. dispatch_() joins the background
             // thread this callback normally runs on, so routing through it
             // would make the thread join itself. The SDK debounces to one
-            // request per 24h per state, so the usual cost is a lock and a
+            // request per 24h per state — but that arm only suppresses a
+            // REPEAT of the same state, and notify_() already dedupes on the
+            // reported value, so this callback fires only on a change. The
+            // usual cost here is therefore a full HTTP POST, not a lock and a
             // comparison. Licensed/Invalid are not keyless states.
             //
             // The callback runs on whichever thread is DRAINING the SDK's
@@ -332,10 +335,13 @@ public:
     // separate waits, and the likelier one is not the SDK's:
     //
     //   step ④ — joins OUR OWN worker thread, the one dispatch_() starts for
-    //            activate/validate/deactivate. If the user taps Activate and
-    //            closes the session before the request returns, this is a full
-    //            HTTP round trip on the message thread. A button press away,
-    //            not a timer coincidence.
+    //            activate, validate, deactivate, checkOnLaunch, startTrial and
+    //            reportKeylessState. If the session closes while one is in
+    //            flight, this is a full HTTP round trip on the message thread
+    //            — plus the inline keyless POST and any of your listeners, if
+    //            that thread is delivering. A button press away, not a timer
+    //            coincidence, and note dispatch_() does the same join on every
+    //            ordinary call, not just here.
     //
     //   step ⑤ — destroys the Client, which joins the SDK's auto-validation
     //            worker. Usually free: ~Client() wakes that worker before it
@@ -363,17 +369,27 @@ public:
         //   that safe, not this call.
         client_->stopAutoValidation();
 
-        // ④ Join any pending activate/validate/deactivate worker thread.
+        // ④ Join any pending dispatched worker thread — activate, validate,
+        //   deactivate, checkOnLaunch, startTrial or reportKeylessState.
         //   These callAsync lambdas only capture result+cb, not this, so they
         //   are safe even without the flag — but joining here keeps ordering
         //   well-defined.
         //
         //   COST: this is the teardown block you are most likely to actually
-        //   hit. That thread is inside JuceUrlTransport::request(), so if the
-        //   user closed the session mid-activation this waits out the whole
-        //   HTTP round trip on the MESSAGE THREAD. Nothing cancels it; the
-        //   transport has no interrupt. If teardown latency matters, do not
-        //   let a session close while a request is in flight.
+        //   hit, and it is more than one round trip. That thread is inside
+        //   JuceUrlTransport::request(), so if the session closed mid-request
+        //   this waits out the whole HTTP round trip on the MESSAGE THREAD —
+        //   nothing cancels it, the transport has no interrupt.
+        //
+        //   AND THEN some. That thread is also the one that moved the state,
+        //   so it holds the SDK's delivery baton and runs the subscription
+        //   callback below inline: a second blocking POST via
+        //   reportKeylessState, plus any listener the integrator registered
+        //   directly through underlying().subscribe(). Your listeners set that
+        //   ceiling, so like step ⑤ it has no fixed upper bound.
+        //
+        //   checkOnLaunch() is the likeliest one to be in flight, since a DAW
+        //   instantiates and destroys plugins while scanning.
         join_worker_();
 
         // ⑤ Destroy the Client HERE, in the destructor body, not in member
@@ -658,7 +674,22 @@ private:
     }
 
     // Dispatch a callable to a background std::thread.
-    // Joins the previous thread first (our operations are short, sequential).
+    //
+    // BLOCKS THE CALLER. join_worker_() waits for the previous dispatched
+    // operation to finish, and every caller of this — activate, validate,
+    // deactivate, checkOnLaunch, startTrial, reportKeylessState — is
+    // documented "call from the message thread". So a second call made while
+    // the first request is still in flight stalls the message thread for the
+    // remainder of that HTTP round trip, bounded only by JuceUrlTransport's
+    // 15 s connection timeout.
+    //
+    // That is reachable in ordinary use, not just at teardown: the documented
+    // integration calls checkOnLaunch() at construction, and a user tapping
+    // Activate a second later joins it. Measured ~280 ms with a 300 ms request
+    // in flight.
+    //
+    // One at a time is deliberate — it keeps the SDK calls sequential — but do
+    // not read "our operations are short" into it. They are network calls.
     template <typename Fn>
     void dispatch_(Fn&& fn)
     {

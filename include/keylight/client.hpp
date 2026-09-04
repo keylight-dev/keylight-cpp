@@ -293,8 +293,9 @@ public:
         // the integrator's code and nothing caps how long one may take. A
         // JUCE ~Licensing() runs on the message thread, so a slow listener
         // stalls a plugin teardown for as long as it likes. The LISTENER
-        // CONTRACT bars re-entering destruction and throwing; it says nothing
-        // about how long a listener may take, because it cannot.
+        // CONTRACT bars re-entering destruction and throwing, and asks for
+        // short listeners for exactly this reason — but asking is all it can
+        // do; nothing here enforces a bound.
     }
 
     // ── Sync API ──────────────────────────────────────────────────────────

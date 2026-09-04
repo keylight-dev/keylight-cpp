@@ -6,6 +6,10 @@
   which the API requires, so every deactivation was rejected before any mutation
   ran while the SDK reported success. Apps believed they were deactivated; the
   seat stayed consumed until the customer hit their activation limit.
+- **Busy-spin on a misconfigured auto-validation interval.** A non-positive
+  `Config::autoValidationIntervalMs` made the background thread's wait return
+  immediately, so it hammered `refreshIfNeeded()` instead of polling. Clamped
+  to 1 ms.
 - `maxOfflineDays` is now applied when state is resolved at launch. It was
   previously ignored on that path, so a tenant configuring 2 days still got the
   lease's full 7-day TTL offline.
@@ -104,9 +108,6 @@
   polling at once, depending on the timing.
 - A listener that throws no longer costs the other listeners their event, and
   no longer propagates out of the SDK call that delivered it.
-- A non-positive `Config::autoValidationIntervalMs` is clamped to 1 ms. It
-  previously made the background thread's wait return immediately, turning it
-  into a busy-spin over `refreshIfNeeded()`.
 - **Breaking:** `deactivate()` returns the server's error instead of always
   succeeding. The local cache is still cleared either way.
 - Errors from the API now carry the server's message ("License key not found",

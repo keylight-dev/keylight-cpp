@@ -265,7 +265,7 @@ SDK deliberately makes no network call on that path.
 
 | Method / event                          | Thread               |
 |-----------------------------------------|----------------------|
-| Constructor, `checkOnLaunch`, `activate`, `validate`, `deactivate`, `startTrial` | Call from **message thread** |
+| Constructor, `checkOnLaunch`, `activate`, `validate`, `deactivate`, `startTrial` | Call from **message thread** — may block; see below |
 | Completion callbacks (`activate`, etc.) | Delivered on **message thread** via `callAsync` |
 | `onStateChanged`                        | Fires on **message thread** |
 | `state()`                               | **Any thread** (atomic load) |
@@ -302,10 +302,28 @@ own thread.
 the worker and returns immediately; whatever waiting is left moved to the
 destructor.
 
+### An SDK call can block the message thread too
+
+`activate()`, `validate()`, `deactivate()`, `checkOnLaunch()`, `startTrial()`
+and `reportKeylessState()` all run on a single background worker thread, and
+each one **joins the previous** before starting. So calling a second while the
+first is still in flight stalls the message thread for the remainder of that
+HTTP round trip — bounded only by `JuceUrlTransport`'s 15-second connection
+timeout.
+
+This is ordinary use, not an edge case. The documented integration calls
+`checkOnLaunch()` at construction; a user tapping *Activate* a second later
+joins it. Measured at ~280 ms against a 300 ms request.
+
+One at a time is deliberate — it keeps the SDK calls sequential and the
+completion callbacks ordered. If you cannot afford the stall, gate your UI on
+the completion callback of the previous call rather than issuing a second one
+into an in-flight request.
+
 `JuceUrlTransport::request()` calls `juce::URL::createInputStream()`, which
 blocks synchronously on whichever thread runs it. The audio thread never runs
-it. The message thread never runs it either — but it does *join* it during
-teardown, per the first paragraph above.
+it, and never joins it. The message thread never runs it — but it does *join*
+it, and not only at teardown. See below.
 
 ---
 

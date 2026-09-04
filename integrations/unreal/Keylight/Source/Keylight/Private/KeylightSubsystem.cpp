@@ -70,6 +70,14 @@ void UKeylightSubsystem::Deinitialize()
 {
     // Stop background auto-validation, then tear down the client.
     //
+    // SAME DANGLING-POINTER HAZARD AS Configure(), and harder to avoid here.
+    // An in-flight Activate()/Validate() AsyncTask holds a raw ClientPtr to
+    // this Client_ and dereferences it before any WeakThis check; resetting
+    // Client_ under it is a use-after-free. Configure() can be gated on "no
+    // request in flight", but Deinitialize() is called by the engine at
+    // shutdown, where an integrator often cannot. If that matters for your
+    // title, keep your own in-flight counter and drain it before shutdown.
+    //
     // Since 0.2.0 stopAutoValidation() does NOT wait for the worker — it
     // retires it and returns. The waiting, if any, happens in ~Client() via
     // Client_.Reset(), which is what guarantees no worker outlives the client.

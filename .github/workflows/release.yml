@@ -9,7 +9,8 @@
 # What this workflow does:
 #   1. Build + ctest matrix (Ubuntu / macOS / Windows) — conformance vectors run here.
 #   2. Regenerate keylight_single.hpp on Linux and verify it's in sync.
-#   3. Verify version.hpp / vcpkg.json / conanfile.py all match the tag.
+#   3. Verify the release checklist: version.hpp / vcpkg.json / conanfile.py
+#      all match the tag, and CHANGELOG.md has a finalised heading for it.
 #   4. Create a GitHub Release and attach keylight_single.hpp as an artifact.
 
 name: Release
@@ -90,31 +91,50 @@ jobs:
             echo "name=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Verify the version bump matches the tag
+      - name: Verify the release checklist was completed
         run: |
           TAG="${{ steps.tag.outputs.name }}"
           VERSION="${TAG#v}"
+          if [ -z "$VERSION" ]; then
+            echo "ERROR: could not determine a version from the tag"
+            exit 1
+          fi
           fail=0
           check() {
-            if ! grep -q "$2" "$1"; then
+            if ! grep -Eq "$2" "$1"; then
               echo "ERROR: $1 does not declare version ${VERSION}"
               grep -n "$3" "$1" || true
               fail=1
             fi
           }
+          # Regexes, not fixed strings: tolerate reformatting of whitespace by
+          # jq/black/an editor without failing with a misleading message.
           check include/keylight/version.hpp \
-                "#define KEYLIGHT_SDK_VERSION \"${VERSION}\"" \
+                "^#define[[:space:]]+KEYLIGHT_SDK_VERSION[[:space:]]+\"${VERSION}\"" \
                 'KEYLIGHT_SDK_VERSION'
-          check vcpkg.json      "\"version\": \"${VERSION}\""  '"version"'
-          check conanfile.py    "version = \"${VERSION}\""      'version ='
+          check vcpkg.json \
+                "\"version\"[[:space:]]*:[[:space:]]*\"${VERSION}\"" \
+                '"version"'
+          check conanfile.py \
+                "^[[:space:]]*version[[:space:]]*=[[:space:]]*\"${VERSION}\"" \
+                'version ='
+          # The fourth checklist item, and the one this workflow depends on:
+          # the release body is extracted with awk '/^## \[x.y.z\]/'. A
+          # heading still reading "## x.y.z (unreleased)" publishes a stub.
+          if ! grep -Eq "^## \[${VERSION}\]" CHANGELOG.md; then
+            echo "ERROR: CHANGELOG.md has no '## [${VERSION}] - YYYY-MM-DD' heading"
+            grep -n "^## " CHANGELOG.md | head -5
+            fail=1
+          fi
           if [ "$fail" -ne 0 ]; then
             echo ""
-            echo "The three-place version bump in CONTRIBUTING.md was not done."
-            echo "Without this check a v${VERSION} release ships reporting the"
-            echo "previous version in every install's telemetry."
+            echo "The release checklist in CONTRIBUTING.md was not completed."
+            echo "Unchecked, a v${VERSION} release ships reporting the previous"
+            echo "version in every install's telemetry, and/or publishes release"
+            echo "notes reading 'See CHANGELOG.md for details.'"
             exit 1
           fi
-          echo "version ${VERSION} declared consistently in all three places"
+          echo "version ${VERSION} declared consistently, CHANGELOG heading present"
 
       - name: Create GitHub Release and attach keylight_single.hpp
         env:
