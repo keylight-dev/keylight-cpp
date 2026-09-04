@@ -236,12 +236,25 @@ public:
             // automatically; keylight::Client deliberately never does, so the
             // adapter does it here.
             //
-            // Called INLINE on purpose. This callback already runs on our
-            // background thread (never the audio or message thread), and
-            // dispatch_() joins that same thread — routing through it here
+            // Called INLINE on purpose. dispatch_() joins the background
+            // thread this callback normally runs on, so routing through it
             // would make the thread join itself. The SDK debounces to one
             // request per 24h per state, so the usual cost is a lock and a
             // comparison. Licensed/Invalid are not keyless states.
+            //
+            // The callback runs on whichever thread caused the transition:
+            // our own background thread for a dispatched call, and the SDK's
+            // auto-validation thread for a tick. Never the audio thread. It
+            // CAN reach the message thread if you call the SDK directly off
+            // underlying() from there — README recommends refreshIfNeeded()
+            // on focus/resume — in which case this POST blocks the UI for one
+            // round trip, once per 24h. Wrap that call in your own thread if
+            // that matters to you.
+            //
+            // Do not call back into the SDK from here beyond this: the SDK
+            // serialises event delivery, so re-entering it deadlocks. The
+            // calls below are safe — reportKeylessState and hasEntitlement
+            // never raise a state change.
             switch (newState)
             {
                 case keylight::State::Trial:
