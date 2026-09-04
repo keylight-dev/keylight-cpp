@@ -287,7 +287,7 @@ public:
         bool activated = j["activated"].as_bool();
         if (!activated) {
             // Server declined — keep existing state
-            return Result<State>::ok(state_.load());
+            return report_(state_.load());
         }
 
         // Parse optional lease (present when the object has sub-keys)
@@ -333,7 +333,7 @@ public:
 
         new_state = resolve_with_trial_(new_state);
         set_state_(new_state);
-        return Result<State>::ok(new_state);
+        return report_(new_state);
     }
 
     /// Validate the stored license online.  Returns the resulting State.
@@ -356,7 +356,7 @@ public:
         auto hr = transport_.request("POST", url, json_headers_(), body);
         if (!hr.is_ok()) {
             // Network failure: keep existing state
-            return Result<State>::ok(state_.load());
+            return report_(state_.load());
         }
         const auto& resp = hr.value();
         if (resp.status != 200) {
@@ -367,15 +367,15 @@ public:
             if (resp.status == 422) {
                 auto rejected = handle_validate_rejection_(resp.body, now_fn_());
                 if (rejected.has_value()) {
-                    return Result<State>::ok(*rejected);
+                    return report_(*rejected);
                 }
             }
-            return Result<State>::ok(state_.load());
+            return report_(state_.load());
         }
 
         auto jr = Json::parse(resp.body);
         if (!jr.is_ok()) {
-            return Result<State>::ok(state_.load());
+            return report_(state_.load());
         }
         const Json& j = jr.value();
 
@@ -415,7 +415,7 @@ public:
         // trial instead of dropping a trialling user to Invalid.
         State new_state = resolve_with_trial_(resolve_from_lease_(lease));
         set_state_(new_state);
-        return Result<State>::ok(new_state);
+        return report_(new_state);
     }
 
     /// Deactivate this device.  Clears the local cache regardless of the
@@ -569,7 +569,7 @@ public:
     Result<State> startTrial() {
         if (cfg_.trialDurationDays <= 0) {
             // Trials disabled — nothing is persisted and no state changes.
-            return Result<State>::ok(state_.load());
+            return report_(state_.load());
         }
 
         bool started = false;
@@ -589,7 +589,7 @@ public:
 
         State new_state = resolve_current_state_();
         set_state_(new_state);
-        return Result<State>::ok(new_state);
+        return report_(new_state);
     }
 
     /// Current local trial status. Never performs I/O beyond reading the
@@ -708,14 +708,10 @@ public:
     Result<State> checkOnLaunch() {
         // The cache is already primed on construction via refresh_state_from_store_().
         if (has_stored_license_()) {
-            auto r = validate_and_reconcile_();
             // Report what state() reports. Offline, the grace window would
             // otherwise hand back Licensed against a clock that has moved
             // backward — the launch path and the paywall must not disagree.
-            if (r.is_ok() && clock_untrusted_()) {
-                return Result<State>::ok(State::Invalid);
-            }
-            return r;
+            return report_(validate_and_reconcile_());
         }
         // No paid license: resolve the persisted local trial offline. This
         // never *starts* a trial — a DAW scanning or instantiating a plugin
@@ -723,8 +719,7 @@ public:
         // that, and only when the user asks for it.
         State new_state = resolve_current_state_();
         set_state_(new_state);
-        if (clock_untrusted_()) return Result<State>::ok(State::Invalid);
-        return Result<State>::ok(new_state);
+        return report_(new_state);
     }
 
     /// Apply the timer model: refresh debounce 5min, stale 6h, near-expiry 24h.
@@ -745,7 +740,7 @@ public:
             // reaches subscribers. Still purely local — no network call.
             State new_state = resolve_current_state_();
             set_state_(new_state);
-            return Result<State>::ok(new_state);
+            return report_(new_state);
         }
 
         int64_t now          = now_fn_();
@@ -754,7 +749,7 @@ public:
 
         // Debounce: skip if validated within the last 5 minutes
         if (has_lvo && (now - last_lvo) < REFRESH_DEBOUNCE) {
-            return Result<State>::ok(state_.load());
+            return report_(state_.load());
         }
 
         // Near-expiry check: refresh if lease expires within 24h
@@ -772,10 +767,10 @@ public:
             || near_expiry;
 
         if (!do_refresh) {
-            return Result<State>::ok(state_.load());
+            return report_(state_.load());
         }
 
-        return validate_and_reconcile_();
+        return report_(validate_and_reconcile_());
     }
 
     // ── Events API ────────────────────────────────────────────────────────
@@ -847,8 +842,9 @@ private:
 
     /// True when the system clock has moved backward, beyond tolerance, since
     /// the last recorded server contact. Every state read point consults this
-    /// so they cannot disagree: state(), hasEntitlement() and what
-    /// checkOnLaunch() reports all fail closed together.
+    /// so they cannot disagree: state(), hasEntitlement() and — through
+    /// report_() — every State a public method hands back all fail closed
+    /// together.
     ///
     /// Reads the ATOMIC anchor mirror, never the mutex-guarded field, so it
     /// stays usable from noexcept, lock-free, audio-thread-safe state().
@@ -858,6 +854,31 @@ private:
     bool clock_untrusted_() const noexcept {
         const int64_t anchor = last_validated_online_atomic_.load();
         return anchor != 0 && clock_rolled_back(anchor, now_fn_());
+    }
+
+    /// Every public entry point hands its State back through here, so no
+    /// caller can be told something state() would contradict. Without it the
+    /// guard covers only the paywall: refreshIfNeeded() is what long-running
+    /// hosts poll between launches, and it would keep reporting Licensed from
+    /// the debounce and staleness short-circuits — no server contact, cached
+    /// state, moved clock — while state() answered Invalid.
+    ///
+    /// A successful round-trip re-anchors the clock before returning, so on
+    /// the online paths this is a no-op; it bites exactly on the offline and
+    /// short-circuit returns, which is where it must.
+    ///
+    /// Errors pass through untouched: an error is not a state claim, and
+    /// rewriting it to Invalid would lose the failure the caller needs.
+    Result<State> report_(State s) const {
+        if (clock_untrusted_()) return Result<State>::ok(State::Invalid);
+        return Result<State>::ok(s);
+    }
+
+    Result<State> report_(Result<State> r) const {
+        if (r.is_ok() && clock_untrusted_()) {
+            return Result<State>::ok(State::Invalid);
+        }
+        return r;
     }
 
     // ── Dependencies ──────────────────────────────────────────────────────

@@ -1382,6 +1382,51 @@ TEST_CASE("Client: a rolled-back clock denies state, entitlements and checkOnLau
     CHECK(r.value() == State::Invalid);
 }
 
+TEST_CASE("Client: a rolled-back clock denies refreshIfNeeded and validate too") {
+    // checkOnLaunch() is not the only path that reports a State. A JUCE or
+    // Unreal host polls refreshIfNeeded() on focus/resume for the whole
+    // session, and its debounce and staleness short-circuits return the
+    // cached state without any server contact. Guarding only the launch path
+    // leaves the long-running case -- the one that lasts hours -- reporting
+    // Licensed against a clock state() calls Invalid.
+    auto cfg = make_config();
+
+    int64_t          now = VALID_ACTIVE_NOW;
+    FailingTransport offline;
+    MemoryStore      store;
+
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW);
+
+    Client client(cfg, offline, store, [&]{ return now; });
+    REQUIRE(client.state() == State::Licensed);
+
+    // Honest clock, inside the 5-minute debounce: the short-circuit hands
+    // back the cached Licensed, and that is correct here.
+    auto honest = client.refreshIfNeeded();
+    REQUIRE(honest.is_ok());
+    REQUIRE(honest.value() == State::Licensed);
+
+    // NTP corrects the clock backward past the tolerance. `now - anchor` is
+    // now negative, so the debounce short-circuit still fires -- it just must
+    // not report Licensed any more.
+    now = VALID_ACTIVE_NOW - 2 * 3600;
+
+    auto refreshed = client.refreshIfNeeded();
+    REQUIRE(refreshed.is_ok());
+    CHECK(refreshed.value() == State::Invalid);
+
+    // validate()'s network-failure path keeps the existing state; offline on
+    // a moved clock that state is no longer reportable either.
+    auto validated = client.validate();
+    REQUIRE(validated.is_ok());
+    CHECK(validated.value() == State::Invalid);
+
+    // The guard clears on its own once the clock is honest again -- it denies
+    // a moved clock, it does not brick the install.
+    now = VALID_ACTIVE_NOW;
+    CHECK(client.refreshIfNeeded().value() == State::Licensed);
+}
+
 TEST_CASE("Client: an anchor ahead of the clock does not pass the maxOfflineDays bound") {
     // A clock pushed forward across a validate leaves the persisted anchor
     // ahead of real time. `now - anchor` is then NEGATIVE, so a bare
