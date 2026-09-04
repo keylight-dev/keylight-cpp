@@ -41,6 +41,15 @@
   a `Limited` arm. Unreal Blueprint users: `EKeylightState` enum is appended
   with `FreeTier` and `Limited`; ensure your state-switch logic covers both
   values (existing serialized state values are unchanged).
+- **JUCE:** `Licensing::hasFeature()` takes `juce::StringRef` instead of
+  `const juce::String&`. Source-compatible — a literal or a `juce::String`
+  both convert — but it fixes a heap allocation on the audio thread: binding
+  `hasFeature("pro")` to a `const String&` materialised a temporary
+  `juce::String` on every `processBlock` call, in release builds too.
+- **JUCE:** `hasFeature()` is documented as returning `false` for every key
+  other than `"pro"`. That was always the behaviour; the docstring claimed it
+  cached the last subscribed feature. Cache additional entitlements yourself —
+  the README shows the pattern.
 - **JUCE:** The state switch (`Licensing::onStateChanged`) now handles
   `State::Limited`, so a fallback lease from a signing-key incident surfaces as
   the degraded state rather than being treated as expired.
