@@ -277,27 +277,35 @@ SDK deliberately makes no network call on that path.
 
 ### Destruction can block the message thread
 
-`~Licensing()` destroys the SDK client last, and `~keylight::Client` joins the
-auto-validation worker — that is what guarantees no worker outlives the client.
+`~Licensing()` waits on **two** threads, and the likelier one is not the SDK's.
 
-**Usually it returns at once.** The destructor wakes the worker before it
-joins, so a worker parked in its interval wait exits without another cycle, and
-on the default 30-minute interval it is parked essentially all the time.
+**Your in-flight request (the one you will actually hit).** `activate()`,
+`validate()` and `deactivate()` run on a worker thread this class owns, and the
+destructor joins it. If the user taps *Activate* and then closes the session
+before the response arrives, teardown waits out the whole HTTP round trip on
+the message thread. Nothing cancels it — `JuceUrlTransport` has no interrupt.
+That is a button press away, not a timing coincidence, so if teardown latency
+matters, do not let a session close with a request in flight.
 
-It blocks only when the worker is mid-cycle, and then by up to one network
-round trip — plus every listener callback for every queued event, if that
-worker happens to be the one delivering. **Your listeners set that ceiling.**
-Nothing in the SDK caps how long one may take, so a slow listener can stall a
-plugin teardown for as long as it likes. Keep them short, or hand off to your
+**The SDK's auto-validation worker.** `~keylight::Client` joins it, which is
+what guarantees no worker outlives the client. This one is **usually free**:
+the destructor wakes the worker before it joins, so one parked in its interval
+wait exits without another cycle, and on the default 30-minute interval it is
+parked essentially all the time. It costs only when that worker is mid-cycle —
+up to one network round trip, plus every listener callback for every queued
+event if it happens to be the thread delivering. **Your listeners set that
+ceiling.** Nothing in the SDK caps how long one may take, so a slow listener
+stalls teardown for as long as it likes. Keep them short, or hand off to your
 own thread.
 
-`stopAutoValidation()` does **not** shorten this. Since 0.2.0 it retires the
-worker and returns immediately; whatever waiting is left moved to the
+`stopAutoValidation()` does **not** shorten either wait. Since 0.2.0 it retires
+the worker and returns immediately; whatever waiting is left moved to the
 destructor.
 
-`JuceUrlTransport::request()` calls `juce::URL::createInputStream()` which
-blocks the background thread synchronously.  The audio thread and message
-thread are never blocked.
+`JuceUrlTransport::request()` calls `juce::URL::createInputStream()`, which
+blocks synchronously on whichever thread runs it. The audio thread never runs
+it. The message thread never runs it either — but it does *join* it during
+teardown, per the first paragraph above.
 
 ---
 

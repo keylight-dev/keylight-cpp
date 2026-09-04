@@ -9,7 +9,8 @@
 # What this workflow does:
 #   1. Build + ctest matrix (Ubuntu / macOS / Windows) — conformance vectors run here.
 #   2. Regenerate keylight_single.hpp on Linux and verify it's in sync.
-#   3. Create a GitHub Release and attach keylight_single.hpp as an artifact.
+#   3. Verify version.hpp / vcpkg.json / conanfile.py all match the tag.
+#   4. Create a GitHub Release and attach keylight_single.hpp as an artifact.
 
 name: Release
 
@@ -88,6 +89,32 @@ jobs:
           else
             echo "name=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Verify the version bump matches the tag
+        run: |
+          TAG="${{ steps.tag.outputs.name }}"
+          VERSION="${TAG#v}"
+          fail=0
+          check() {
+            if ! grep -q "$2" "$1"; then
+              echo "ERROR: $1 does not declare version ${VERSION}"
+              grep -n "$3" "$1" || true
+              fail=1
+            fi
+          }
+          check include/keylight/version.hpp \
+                "#define KEYLIGHT_SDK_VERSION \"${VERSION}\"" \
+                'KEYLIGHT_SDK_VERSION'
+          check vcpkg.json      "\"version\": \"${VERSION}\""  '"version"'
+          check conanfile.py    "version = \"${VERSION}\""      'version ='
+          if [ "$fail" -ne 0 ]; then
+            echo ""
+            echo "The three-place version bump in CONTRIBUTING.md was not done."
+            echo "Without this check a v${VERSION} release ships reporting the"
+            echo "previous version in every install's telemetry."
+            exit 1
+          fi
+          echo "version ${VERSION} declared consistently in all three places"
 
       - name: Create GitHub Release and attach keylight_single.hpp
         env:

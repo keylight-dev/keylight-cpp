@@ -328,11 +328,22 @@ public:
     // Destructor — retires auto-validation, joins our own worker thread, then
     // destroys the SDK client (which joins the SDK's worker).
     //
-    // Call from the MESSAGE THREAD, and know that it can block there. Usually
-    // it returns at once. It waits only when an SDK worker is mid-cycle: up to
-    // one round trip, plus every queued listener callback if that worker is
-    // delivering events. Since listeners are your code, that has no fixed
-    // upper bound — see step ⑤.
+    // Call from the MESSAGE THREAD, and know that it can block there. TWO
+    // separate waits, and the likelier one is not the SDK's:
+    //
+    //   step ④ — joins OUR OWN worker thread, the one dispatch_() starts for
+    //            activate/validate/deactivate. If the user taps Activate and
+    //            closes the session before the request returns, this is a full
+    //            HTTP round trip on the message thread. A button press away,
+    //            not a timer coincidence.
+    //
+    //   step ⑤ — destroys the Client, which joins the SDK's auto-validation
+    //            worker. Usually free: ~Client() wakes that worker before it
+    //            joins, so one parked on the (default 30-minute) interval
+    //            exits without another cycle. It costs only when that worker
+    //            is mid-cycle — up to one round trip, plus every queued
+    //            listener callback if it holds the delivery baton. Your
+    //            listeners set that ceiling, so it has no fixed upper bound.
     // -----------------------------------------------------------------------
     ~Licensing()
     {
@@ -356,6 +367,13 @@ public:
         //   These callAsync lambdas only capture result+cb, not this, so they
         //   are safe even without the flag — but joining here keeps ordering
         //   well-defined.
+        //
+        //   COST: this is the teardown block you are most likely to actually
+        //   hit. That thread is inside JuceUrlTransport::request(), so if the
+        //   user closed the session mid-activation this waits out the whole
+        //   HTTP round trip on the MESSAGE THREAD. Nothing cancels it; the
+        //   transport has no interrupt. If teardown latency matters, do not
+        //   let a session close while a request is in flight.
         join_worker_();
 
         // ⑤ Destroy the Client HERE, in the destructor body, not in member
