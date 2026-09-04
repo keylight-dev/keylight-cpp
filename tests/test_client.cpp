@@ -1478,6 +1478,63 @@ TEST_CASE("Client: subscribers are told what state() reports, rollback included"
     CHECK(seen.back() == client.state());
 }
 
+TEST_CASE("Client: concurrent notifiers cannot deliver events out of order") {
+    // Publishing the dedupe and THEN delivering lets two notifiers interleave:
+    // both pass the dedupe, then deliver in whatever order the scheduler
+    // picks, and because the dedupe is already satisfied no later poll ever
+    // corrects it. The subscriber is left permanently contradicting state().
+    //
+    // Not hypothetical for the shipped adapters: JUCE's callback does a
+    // blocking HTTP POST and an ed25519 verify before returning, while the
+    // auto-validation thread ticks refreshIfNeeded() concurrently with any
+    // dispatched validate().
+    auto cfg = make_config();
+
+    std::atomic<int64_t> now{VALID_ACTIVE_NOW};
+    FailingTransport     offline;
+    MemoryStore          store;
+
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW);
+
+    Client client(cfg, offline, store, [&]{ return now.load(); });
+    REQUIRE(client.state() == State::Licensed);
+
+    std::mutex         seen_mutex;
+    std::vector<State> seen;
+
+    // A deliberately slow subscriber, slower on the state the FIRST notifier
+    // carries, so an unserialised delivery inverts: the second notifier
+    // overtakes the first and the last event seen is the STALE one.
+    auto sub = client.subscribe([&](State s) {
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(s == State::Invalid ? 200 : 10));
+        std::lock_guard<std::mutex> lock(seen_mutex);
+        seen.push_back(s);
+    });
+
+    // Notifier A sees a rolled-back clock.
+    now.store(VALID_ACTIVE_NOW - 2 * 3600);
+    std::thread a([&]{ client.refreshIfNeeded(); });
+
+    // Notifier B sees the clock corrected, and starts while A is still inside
+    // its callback.
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    now.store(VALID_ACTIVE_NOW);
+    std::thread b([&]{ client.refreshIfNeeded(); });
+
+    a.join();
+    b.join();
+
+    std::lock_guard<std::mutex> lock(seen_mutex);
+    REQUIRE_FALSE(seen.empty());
+
+    // The contract that matters: whatever the interleaving, the LAST thing a
+    // subscriber was told matches what state() answers. Anything else is a
+    // paywall and a feature gate that disagree, with no event left to fix it.
+    CHECK(seen.back() == client.state());
+    CHECK(seen.back() == State::Licensed);
+}
+
 TEST_CASE("Client: an anchor ahead of the clock does not pass the maxOfflineDays bound") {
     // A clock pushed forward across a validate leaves the persisted anchor
     // ahead of real time. `now - anchor` is then NEGATIVE, so a bare

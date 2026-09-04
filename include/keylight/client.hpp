@@ -344,6 +344,11 @@ public:
 
     /// Validate the stored license online.  Returns the resulting State.
     Result<State> validate() {
+        // Poll the clock guard, for the same reason refreshIfNeeded() does:
+        // a host that polls validate() on its own timer would otherwise get
+        // the guard in state() and never in its callback.
+        notify_();
+
         // Need license_key and instance_id from cache (Worker requires both)
         std::string license_key  = load_license_key_();
         std::string instance_id  = load_instance_id_();
@@ -800,6 +805,20 @@ public:
     }
 
     /// Subscribe to all state transitions. Returns a Subscription RAII handle.
+    ///
+    /// The callback receives what state() would return, so an event-driven
+    /// paywall and a query-driven one cannot disagree.
+    ///
+    /// LISTENER CONTRACT: the callback MUST NOT call back into this Client
+    /// (validate(), refreshIfNeeded(), activate(), …). Delivery is serialised
+    /// so that events cannot be reordered, and re-entering from inside a
+    /// callback deadlocks. Unsubscribing from inside your own callback IS
+    /// supported. If you need to act on the SDK in response to an event, hand
+    /// off to your own thread — this is what the JUCE adapter does.
+    ///
+    /// The callback runs on whichever thread caused the transition, which for
+    /// startAutoValidation() is the SDK's background thread. Marshal to your
+    /// UI thread yourself.
     Subscription subscribe(std::function<void(State)> cb) {
         std::lock_guard<std::mutex> lock(listeners_mutex_);
         uint64_t id = ++next_listener_id_;
@@ -852,6 +871,16 @@ public:
 private:
     // ── Clock trust ───────────────────────────────────────────────────────
 
+    // state() promises the audio thread "atomics only, no lock". On a target
+    // where these are mutex-backed that promise is silently false, and the
+    // failure mode is a priority-inverted audio dropout, not a test failure.
+    static_assert(std::atomic<int64_t>::is_always_lock_free,
+                  "keylight::Client::state() is documented audio-thread safe; "
+                  "std::atomic<int64_t> is not lock-free on this target");
+    static_assert(std::atomic<State>::is_always_lock_free,
+                  "keylight::Client::state() is documented audio-thread safe; "
+                  "std::atomic<State> is not lock-free on this target");
+
     /// True when the system clock has moved backward, beyond tolerance, since
     /// the last recorded server contact. Every state read point consults this
     /// so they cannot disagree: state(), hasEntitlement() and — through
@@ -863,16 +892,6 @@ private:
     /// An anchor of 0 means "never validated online" — there is nothing to
     /// compare against, and the offline bound in refresh_state_from_store_()
     /// already fails that case closed.
-    // state() promises the audio thread "atomics only, no lock". On a target
-    // where these are mutex-backed that promise is silently false, and the
-    // failure mode is a priority-inverted audio dropout, not a test failure.
-    static_assert(std::atomic<int64_t>::is_always_lock_free,
-                  "keylight::Client::state() is documented audio-thread safe; "
-                  "std::atomic<int64_t> is not lock-free on this target");
-    static_assert(std::atomic<State>::is_always_lock_free,
-                  "keylight::Client::state() is documented audio-thread safe; "
-                  "std::atomic<State> is not lock-free on this target");
-
     bool clock_untrusted_() const noexcept {
         const int64_t anchor = last_validated_online_atomic_.load();
         return anchor != 0 && clock_rolled_back(anchor, now_fn_());
@@ -945,6 +964,10 @@ private:
     mutable std::mutex        listeners_mutex_;
     std::vector<Listener>     listeners_;
     uint64_t                  next_listener_id_ = 0;
+    // Serialises the whole notify_() sequence — dedupe AND delivery — so two
+    // notifiers cannot deliver out of order. Always acquired BEFORE
+    // listeners_mutex_ and never while holding cache_mutex_ or av_mutex_.
+    std::mutex                notify_mutex_;
 
     // ── Background auto-validation ────────────────────────────────────────
     // av_mutex_ guards av_stop_ and av_thread_.
@@ -1741,6 +1764,11 @@ private:
     /// Set the raw resolved state, then let notify_() decide whether that is
     /// a change worth reporting. state_ stays the raw resolution — it is what
     /// gets persisted reasoning and what the guard is applied *to*.
+    ///
+    /// Anything that changes state_ AFTER construction must go through here.
+    /// The bare state_.store() calls in refresh_state_from_store_() are safe
+    /// only because its sole caller is the constructor, where nobody can have
+    /// subscribed yet; a second caller would silently swallow a transition.
     void set_state_(State new_state) {
         state_.store(new_state);
         notify_();
@@ -1764,11 +1792,30 @@ private:
     /// refreshIfNeeded() polls this, and startAutoValidation() ticks
     /// refreshIfNeeded(), so both the rollback and the later correction
     /// reach subscribers without any new machinery.
+    /// THREAD SAFETY: notify_mutex_ is held across the callbacks, not just
+    /// across the dedupe. Publishing the dedupe and THEN delivering lets two
+    /// notifiers interleave — both pass the dedupe, then deliver in whatever
+    /// order the scheduler picks, and because the dedupe is already satisfied
+    /// no later poll ever corrects it. That leaves a subscriber permanently
+    /// contradicting state(), in both directions: stale-Invalid for a paying
+    /// customer, and stale-Licensed on a rolled-back clock, which is the very
+    /// fail-open this guard exists to close. It is not hypothetical — the JUCE
+    /// callback does a blocking HTTP POST and an ed25519 verify before it
+    /// returns, while the auto-validation thread ticks refreshIfNeeded()
+    /// concurrently with any dispatched validate().
+    ///
+    /// The cost is a listener contract: a listener MUST NOT call back into
+    /// this Client. See subscribe(). That was never safe anyway — before this
+    /// guard existed, a listener calling validate() would recurse straight
+    /// back into the delivery loop.
     void notify_() {
+        std::lock_guard<std::mutex> notify_lock(notify_mutex_);
+
         const State reported = state();
         if (last_reported_.exchange(reported) == reported) return;
 
-        // Collect callbacks under the lock, fire outside it to avoid re-entrancy.
+        // Copy the callbacks out so a listener can unsubscribe from inside
+        // its own callback without invalidating the iteration.
         std::vector<std::function<void(State)>> cbs;
         {
             std::lock_guard<std::mutex> lock(listeners_mutex_);
