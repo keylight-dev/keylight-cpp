@@ -1427,6 +1427,57 @@ TEST_CASE("Client: a rolled-back clock denies refreshIfNeeded and validate too")
     CHECK(client.refreshIfNeeded().value() == State::Licensed);
 }
 
+TEST_CASE("Client: subscribers are told what state() reports, rollback included") {
+    // subscribe() is the documented way an integrator drives a paywall, and
+    // the JUCE adapter caches the callback's value in an audio-thread atomic.
+    // If the event channel hands out the raw state while state() applies the
+    // guard, the paywall and the gate disagree -- the same fail-open split
+    // the guard exists to close, just on the event path.
+    //
+    // A rolled-back clock also changes no RAW state, so a raw-value dedupe
+    // would emit nothing at all and a cached-last-event host would sit on a
+    // stale Licensed for the rest of the session.
+    auto cfg = make_config();
+
+    int64_t          now = VALID_ACTIVE_NOW;
+    FailingTransport offline;
+    MemoryStore      store;
+
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW);
+
+    Client client(cfg, offline, store, [&]{ return now; });
+    REQUIRE(client.state() == State::Licensed);
+
+    std::vector<State> seen;
+    auto sub = client.subscribe([&](State s){ seen.push_back(s); });
+
+    // Booting does not re-announce the state we started in.
+    client.refreshIfNeeded();
+    CHECK(seen.empty());
+
+    // NTP corrects the clock backward past the tolerance. No raw state
+    // changes -- the lease is untouched -- but what we may report does.
+    now = VALID_ACTIVE_NOW - 2 * 3600;
+    client.refreshIfNeeded();
+
+    REQUIRE(seen.size() == 1);
+    CHECK(seen.back() == State::Invalid);
+    CHECK(seen.back() == client.state());   // the two channels agree
+
+    // Polling again while still rolled back is not a new event.
+    client.refreshIfNeeded();
+    CHECK(seen.size() == 1);
+
+    // The clock comes back. The guard releases, and the subscriber is told --
+    // otherwise a host caching the last event stays locked forever.
+    now = VALID_ACTIVE_NOW;
+    client.refreshIfNeeded();
+
+    REQUIRE(seen.size() == 2);
+    CHECK(seen.back() == State::Licensed);
+    CHECK(seen.back() == client.state());
+}
+
 TEST_CASE("Client: an anchor ahead of the clock does not pass the maxOfflineDays bound") {
     // A clock pushed forward across a validate leaves the persisted anchor
     // ahead of real time. `now - anchor` is then NEGATIVE, so a bare

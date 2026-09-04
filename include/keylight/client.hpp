@@ -9,7 +9,9 @@
 // Validate:     POST /{tenantId}/{productId}/validate
 // Deactivate:   POST /{tenantId}/{productId}/deactivate
 //
-// Thread-safety: state() reads std::atomics only — audio-thread safe.
+// Thread-safety: state() reads std::atomics and the injected clock, and takes
+//                no lock — audio-thread safe. See the NOW-FUNCTION CONTRACT
+//                below for what that requires of the clock.
 //                hasEntitlement / cachedLicenseExpiresAt / listener list are
 //                guarded by a mutex.
 //
@@ -238,6 +240,10 @@ public:
     {
         // Prime state from persisted store (if any) on construction.
         refresh_state_from_store_();
+        // Seed the event dedupe with what we booted with. Nobody can have
+        // subscribed yet, so this is not a suppressed event -- it stops the
+        // first notify_() poll from reporting the initial state as a change.
+        last_reported_.store(state());
     }
 
     // Destructor: stops and joins any running auto-validation thread so the
@@ -729,6 +735,12 @@ public:
     /// This in-session cadence is unchanged by the always-validate-on-launch
     /// fix: it still governs long-running hosts between launches.
     Result<State> refreshIfNeeded() {
+        // Poll the clock guard first. Every return below this line can
+        // short-circuit without touching state_, and a clock that moved
+        // changes no raw state — so without this, a rollback would reach
+        // state() and never reach a single subscriber.
+        notify_();
+
         if (!has_stored_license_()) {
             // No paid license — nothing to revalidate online, but the local
             // trial may have elapsed since the last resolve. keylight-rust and
@@ -851,6 +863,16 @@ private:
     /// An anchor of 0 means "never validated online" — there is nothing to
     /// compare against, and the offline bound in refresh_state_from_store_()
     /// already fails that case closed.
+    // state() promises the audio thread "atomics only, no lock". On a target
+    // where these are mutex-backed that promise is silently false, and the
+    // failure mode is a priority-inverted audio dropout, not a test failure.
+    static_assert(std::atomic<int64_t>::is_always_lock_free,
+                  "keylight::Client::state() is documented audio-thread safe; "
+                  "std::atomic<int64_t> is not lock-free on this target");
+    static_assert(std::atomic<State>::is_always_lock_free,
+                  "keylight::Client::state() is documented audio-thread safe; "
+                  "std::atomic<State> is not lock-free on this target");
+
     bool clock_untrusted_() const noexcept {
         const int64_t anchor = last_validated_online_atomic_.load();
         return anchor != 0 && clock_rolled_back(anchor, now_fn_());
@@ -891,6 +913,10 @@ private:
 
     // ── State ─────────────────────────────────────────────────────────────
     std::atomic<State>       state_;
+    // Last value handed to subscribers. Distinct from state_ because the
+    // clock guard can change what we report without state_ changing at all,
+    // and because two raw states can report as the same guarded one.
+    std::atomic<State>       last_reported_{State::Invalid};
     // Atomic mirror of cached_last_validated_online_, so the clock guard can
     // run inside noexcept, lock-free state(). The mutex-protected field stays
     // the source of truth for persistence; this is written alongside it.
@@ -1712,10 +1738,35 @@ private:
         return Result<State>::ok(current);
     }
 
-    /// Set state_ and fire event listeners if the state changed.
+    /// Set the raw resolved state, then let notify_() decide whether that is
+    /// a change worth reporting. state_ stays the raw resolution — it is what
+    /// gets persisted reasoning and what the guard is applied *to*.
     void set_state_(State new_state) {
-        State old_state = state_.exchange(new_state);
-        if (old_state == new_state) return; // no transition — no event
+        state_.store(new_state);
+        notify_();
+    }
+
+    /// Fire listeners when what state() reports has changed since the last
+    /// event. This is the SDK's event channel; nothing else calls listeners.
+    ///
+    /// It reports the GUARDED state for the same reason every other read
+    /// point does. A transition resolved while the clock is untrusted would
+    /// otherwise deliver, say, Trial to a subscriber while state() answered
+    /// Invalid — the paywall driven by subscribe() and the one driven by
+    /// state() would disagree, which is the exact split the guard exists to
+    /// close.
+    ///
+    /// Deduping on the REPORTED value, not the raw one, is what gives the
+    /// guard an event of its own. A clock rolled back mid-session changes no
+    /// raw state, so a raw-value dedupe would never fire and a host that
+    /// caches the last event — JUCE's audio-thread snapshot does exactly
+    /// that — would sit on a stale Licensed for the rest of the session.
+    /// refreshIfNeeded() polls this, and startAutoValidation() ticks
+    /// refreshIfNeeded(), so both the rollback and the later correction
+    /// reach subscribers without any new machinery.
+    void notify_() {
+        const State reported = state();
+        if (last_reported_.exchange(reported) == reported) return;
 
         // Collect callbacks under the lock, fire outside it to avoid re-entrancy.
         std::vector<std::function<void(State)>> cbs;
@@ -1727,7 +1778,7 @@ private:
             }
         }
         for (const auto& cb : cbs) {
-            cb(new_state);
+            cb(reported);
         }
     }
 
