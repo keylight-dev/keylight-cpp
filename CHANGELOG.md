@@ -70,11 +70,21 @@
   different thread. Do not destroy the `Client` from a callback.
 - Because `validate()` also raises the guard's event, a `validate()` that spans
   a clock correction now emits `Invalid` where it previously emitted nothing —
-  followed, on the success path only, by the resolved state. Offline (network
-  failure, non-200, bad JSON) `validate()` returns early and emits just the
-  `Invalid`; the next poll corrects it, and it fails closed meanwhile. Both
-  events are accurate — during the round trip `state()` genuinely reported
-  `Invalid` — but debounce your paywall if you drive UI straight off events.
+  followed by the resolved state on the success path, and on a decodable 422
+  (revoke, deactivated instance, expired lease), which also resolves a state.
+  A network failure, a bad-JSON body, another non-200 or an undecodable 422
+  returns early and emits just the `Invalid`; the next poll corrects it, and it
+  fails closed meanwhile. Both events are accurate — during the round trip
+  `state()` genuinely reported `Invalid` — but debounce your paywall if you
+  drive UI straight off events.
+- `startAutoValidation()` is restartable. A `stopAutoValidation()` called from
+  a state-change listener delivered on the worker thread leaves that thread
+  signalled but unjoined, and a finished thread is still `joinable()` — so the
+  next `startAutoValidation()` used to mistake it for a live worker and return
+  silently, permanently. It now reaps the stopped worker first, and a start
+  racing a stop can no longer resurrect it into a second poller.
+- A listener that throws no longer costs the other listeners their event, and
+  no longer propagates out of the SDK call that delivered it.
 - `stopAutoValidation()` called from a state-change listener that was delivered
   on the auto-validation thread no longer self-joins. It previously threw
   `EDEADLK` from `join()` and then aborted the process via `std::terminate` in

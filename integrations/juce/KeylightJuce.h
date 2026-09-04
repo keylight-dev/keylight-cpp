@@ -16,8 +16,9 @@
  *   std::atomic<bool>             pro_enabled_       — mirrors hasEntitlement("pro")
  *
  * These are updated in the subscription callback, on whichever thread is
- * draining the SDK's event queue, after every SDK state transition.  No mutex, no allocation, no juce::String
- * construction happens on the audio thread — just two relaxed atomic loads.
+ * draining the SDK's event queue, after every SDK state transition.  No mutex,
+ * no allocation, no juce::String construction happens on the audio thread —
+ * just two relaxed atomic loads.
  *
  * state_snapshot_ mirrors Client::state(), which fails closed when the system
  * clock has been rolled back.  The SDK's subscription callback delivers that
@@ -221,7 +222,20 @@ public:
         // alive_ is captured BY VALUE (a shared_ptr copy) and checked before
         // anything touches `this`. Dropping subscription_ in ~Licensing does
         // not fence a delivery already in flight on another thread, so the
-        // flag — not the unsubscribe — is what makes this safe.
+        // unsubscribe alone does not make this safe.
+        //
+        // KNOWN LIMITATION, be honest about it: the flag NARROWS the window,
+        // it does not close it. This is a check-then-use — the callback can
+        // pass the check, ~Licensing can then run to completion, and the
+        // callback proceeds into state_snapshot_/refresh_entitlement_cache_()
+        // on a destroyed object. ~Licensing joins only ITS OWN dispatch
+        // thread, and delivery may be on a thread it does not join (an app
+        // thread calling refreshIfNeeded() on focus/resume). Closing it needs
+        // a fence in the SDK — an unsubscribe() that waits out an in-flight
+        // delivery for that listener — which is a deliberate follow-up, not
+        // something this header can do alone. Destroy Licensing from the
+        // message thread with auto-validation stopped and the window is not
+        // reachable in practice.
         subscription_ = client_->subscribe(
             [this, aliveCopy = alive_](keylight::State newState)
         {

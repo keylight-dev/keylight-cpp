@@ -178,7 +178,7 @@ existing values do not renumber.
 #### The keyless beacon
 
 The adapter reports an anonymous funnel signal (`trial` / `free_tier` /
-`expired`) on every state transition, on its background thread. You do not call
+`expired`) on every state transition. You do not call
 it. It carries a random per-install id and, where the OS exposes one, a one-way
 hash of a machine identifier — never a licence key, and never a raw device id.
 It is debounced to one request per 24 hours per state, and a failed request is
@@ -295,7 +295,9 @@ std::atomic<bool>             pro_enabled_
 These are updated by an SDK event subscription registered in the `Licensing`
 constructor.  Whenever the `keylight::Client` transitions state — after
 activate, validate, auto-validation, or offline-grace expiry — it fires the
-registered callback on the background network thread.  The callback:
+registered callback on whichever thread is draining the SDK's event queue —
+usually this class's background thread, but under concurrency it can be another
+one, and it is never the audio thread.  The callback:
 
 1. Stores the new state into `state_snapshot_` (relaxed atomic store).
 2. Calls `client_->hasEntitlement("pro")` (with mutex, off the audio thread)
