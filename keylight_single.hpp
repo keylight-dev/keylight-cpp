@@ -2761,6 +2761,19 @@ public:
                           [this]{ return deactivate(); });
     }
 
+    /// Claims the start/stop transition for the duration of a scope, so no
+    /// other caller can act on av_thread_ while it is moved out for a join.
+    /// Releases on unwind — a std::thread constructor that throws must not
+    /// wedge every later start and stop.
+    struct TransitionGuard {
+        Client* self;
+        explicit TransitionGuard(Client* c) : self(c) { self->av_transition_ = true; }
+        ~TransitionGuard() {
+            self->av_transition_ = false;
+            self->av_transition_cv_.notify_all();
+        }
+    };
+
     // ── Background auto-validation ────────────────────────────────────────
 
     /// Spawn a single background thread that periodically calls
@@ -2778,24 +2791,34 @@ public:
     /// a finished thread is still joinable(), so this reaps it rather than
     /// mistaking it for a live worker and no-opping forever.
     void startAutoValidation() {
-        std::thread stale;
-        {
-            std::lock_guard<std::mutex> lock(av_mutex_);
-            if (av_thread_.joinable()) {
-                if (!av_stop_) return;   // genuinely running — no-op
-                // Cannot reap ourselves; the caller is the worker. It exits
-                // when this listener returns, and the next start reaps it.
-                if (av_thread_.get_id() == std::this_thread::get_id()) return;
-                stale = std::move(av_thread_);
-            }
-        }
-        // Join outside the lock — the worker needs av_mutex_ to exit — and
-        // BEFORE clearing av_stop_, or the old worker would see the flag drop
-        // and keep running.
-        if (stale.joinable()) stale.join();
+        std::unique_lock<std::mutex> lock(av_mutex_);
 
-        std::lock_guard<std::mutex> lock(av_mutex_);
-        if (av_thread_.joinable()) return;   // another caller won the race
+        // Only one start/stop transition at a time. Both release av_mutex_ to
+        // join, and av_thread_ is empty across that window — so without this a
+        // concurrent start sees "no worker", skips the reap, clears av_stop_
+        // and spawns a SECOND worker while the first has not yet observed the
+        // stop. Result: two workers polling forever, and the reaper's join()
+        // blocked until something else sets av_stop_ again.
+        av_transition_cv_.wait(lock, [this]{ return !av_transition_; });
+
+        if (av_thread_.joinable()) {
+            if (!av_stop_) return;   // genuinely running — no-op
+            // Cannot reap ourselves; the caller is the worker. It exits when
+            // this listener returns, and the next start reaps it.
+            if (av_thread_.get_id() == std::this_thread::get_id()) return;
+        }
+
+        TransitionGuard transition{this};
+
+        if (av_thread_.joinable()) {
+            std::thread stale = std::move(av_thread_);
+            // Join outside the lock — the worker needs av_mutex_ to exit — and
+            // BEFORE clearing av_stop_, or the old worker would see the flag
+            // drop and keep running as a second poller.
+            lock.unlock();
+            stale.join();
+            lock.lock();
+        }
 
         av_stop_ = false;
         av_thread_ = std::thread([this] {
@@ -2819,28 +2842,30 @@ public:
     /// Returns promptly — the thread wakes up via the condition variable
     /// instead of blocking for the full interval.
     void stopAutoValidation() {
-        std::thread to_join;
-        {
-            std::lock_guard<std::mutex> lock(av_mutex_);
-            if (!av_thread_.joinable()) return; // not running — no-op
-            av_stop_ = true;
-            av_cv_.notify_all();
+        std::unique_lock<std::mutex> lock(av_mutex_);
+        // Same reason as startAutoValidation(): do not act on av_thread_ while
+        // another transition has it moved out.
+        av_transition_cv_.wait(lock, [this]{ return !av_transition_; });
 
-            // Called from the auto-validation thread itself — i.e. from a
-            // state-change listener, which is delivered on whichever thread
-            // caused the transition. Joining here would self-join: join()
-            // throws EDEADLK, the std::thread is destroyed still-joinable,
-            // and ~thread() calls std::terminate() — an abort no caller can
-            // catch. Leave the thread owned by av_thread_ instead: it has
-            // been signalled, so it exits as soon as this listener returns,
-            // and the next stopAutoValidation() or ~Client() from any other
-            // thread joins it properly.
-            if (av_thread_.get_id() == std::this_thread::get_id()) return;
+        if (!av_thread_.joinable()) return; // not running — no-op
+        av_stop_ = true;
+        av_cv_.notify_all();
 
-            to_join = std::move(av_thread_); // move out before unlocking
-        }
+        // Called from the auto-validation thread itself — a listener can be
+        // delivered on it. Joining here would self-join: join() throws
+        // EDEADLK, the std::thread is destroyed still-joinable, and ~thread()
+        // calls std::terminate() — an abort no caller can catch. Leave the
+        // thread owned by av_thread_ instead: it has been signalled, so it
+        // exits as soon as this listener returns, and the next start or stop
+        // from any other thread reaps it.
+        if (av_thread_.get_id() == std::this_thread::get_id()) return;
+
+        TransitionGuard transition{this};
+        std::thread to_join = std::move(av_thread_); // move out before unlocking
         // Join outside the lock so the worker can re-acquire av_mutex_ to exit.
+        lock.unlock();
         if (to_join.joinable()) to_join.join();
+        lock.lock();
     }
 
     // ── Launch / refresh API ──────────────────────────────────────────────
@@ -3138,6 +3163,10 @@ private:
     // cache_mutex_ / listeners_mutex_) to avoid deadlock.
     std::mutex              av_mutex_;
     std::condition_variable av_cv_;
+    // True while a start or stop is mid-transition, i.e. has av_thread_ moved
+    // out and av_mutex_ released for a join. Guarded by av_mutex_.
+    bool                    av_transition_ = false;
+    std::condition_variable av_transition_cv_;
     bool                    av_stop_  = false;
     std::thread             av_thread_;
 
@@ -3988,10 +4017,15 @@ private:
         {
             std::lock_guard<std::mutex> lock(notify_mutex_);
             const State reported = state();
-            if (last_reported_.exchange(reported) == reported) return;
+            if (last_reported_.load() == reported) return;
             // Order is decided HERE, atomically with the dedupe. Everything
             // after this point may run in any order on any thread.
+            //
+            // Push BEFORE consuming the dedupe: a bad_alloc from push_back
+            // must not leave last_reported_ claiming an event nobody queued,
+            // which would lose that transition permanently.
             pending_.push_back(reported);
+            last_reported_.store(reported);
             if (delivering_) return;   // another thread owns the baton
             delivering_ = true;
         }
@@ -4004,9 +4038,20 @@ private:
         // state() kept moving: a caching subscriber like JUCE's audio-thread
         // snapshot would hold its last value forever, which on a rolled-back
         // clock is a permanent fail-open.
+        //
+        // It is ONLY the unwind net. The normal exit disarms it and hands the
+        // baton back atomically with the emptiness check that makes doing so
+        // safe — see the loop. Clearing delivering_ in a SECOND critical
+        // section would open a window where the queue is empty but the baton
+        // is still held: a notifier arriving there pushes, sees delivering_,
+        // and returns believing we will drain it, and we then return having
+        // already decided the queue was empty. That event is stranded, and
+        // because the dedupe consumed its value no later poll re-queues it.
         struct BatonGuard {
             Client* self;
+            bool    armed = true;
             ~BatonGuard() {
+                if (!armed) return;
                 std::lock_guard<std::mutex> lock(self->notify_mutex_);
                 self->delivering_ = false;
             }
@@ -4016,7 +4061,11 @@ private:
             State ev;
             {
                 std::lock_guard<std::mutex> lock(notify_mutex_);
-                if (pending_.empty()) return;   // guard hands the baton back
+                if (pending_.empty()) {
+                    delivering_        = false;   // atomic with the check
+                    baton_guard.armed  = false;
+                    return;
+                }
                 ev = pending_.front();
                 pending_.erase(pending_.begin());
             }
