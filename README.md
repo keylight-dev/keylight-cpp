@@ -177,7 +177,10 @@ int main() {
 > `refreshIfNeeded()` on meaningful events (window focus, purchase, resume). The state machine
 > applies a 5-minute debounce and refreshes automatically when the cached lease is stale or
 > within 24 hours of expiry. An optional background thread is available via
-> `client.startAutoValidation()` for daemon or headless applications.
+> `client.startAutoValidation()` for daemon or headless applications. Both it and
+> `stopAutoValidation()` are safe from any thread, including from a state-change
+> listener, and neither blocks. Note `stopAutoValidation()` retires the worker rather
+> than waiting for it: one more tick can land after it returns. `~Client()` joins.
 
 ## Unreal Engine
 

@@ -77,19 +77,25 @@
   fails closed meanwhile. Both events are accurate — during the round trip
   `state()` genuinely reported `Invalid` — but debounce your paywall if you
   drive UI straight off events.
-- `startAutoValidation()` is restartable. A `stopAutoValidation()` called from
-  a state-change listener delivered on the worker thread leaves that thread
-  signalled but unjoined, and a finished thread is still `joinable()` — so the
-  next `startAutoValidation()` used to mistake it for a live worker and return
-  silently, permanently. It now reaps the stopped worker first, and a start
-  racing a stop can no longer resurrect it into a second poller.
+- **Breaking (auto-validation):** `stopAutoValidation()` no longer waits for
+  the background worker to exit. It retires the worker and returns
+  immediately; a worker already inside `refreshIfNeeded()` finishes that call
+  first, so one more tick — and possibly one more state-change event — can
+  land shortly after the call returns. `~Client()` still joins, so a worker can
+  never outlive the `Client`. If you relied on "stopped means stopped", gate on
+  your own flag rather than on the call returning.
+
+  Workers are now retired by epoch instead of being joined, which is what makes
+  the rest of this section true. `startAutoValidation()` and
+  `stopAutoValidation()` are safe from any thread, including from a
+  state-change listener delivered on the worker thread itself; neither ever
+  blocks on the other or on a listener; both are idempotent; and stop-then-
+  start restarts polling, including when the stop came from such a listener.
+  Previously that combination could self-join and abort the process via
+  `std::terminate`, deadlock, silently no-op forever, or leave two workers
+  polling at once, depending on the timing.
 - A listener that throws no longer costs the other listeners their event, and
   no longer propagates out of the SDK call that delivered it.
-- `stopAutoValidation()` called from a state-change listener that was delivered
-  on the auto-validation thread no longer self-joins. It previously threw
-  `EDEADLK` from `join()` and then aborted the process via `std::terminate` in
-  `~thread()`; it now signals the thread and returns, leaving the join to the
-  next caller.
 - **Breaking:** `deactivate()` returns the server's error instead of always
   succeeding. The local cache is still cleared either way.
 - Errors from the API now carry the server's message ("License key not found",
