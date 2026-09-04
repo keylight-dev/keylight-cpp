@@ -263,17 +263,27 @@ SDK deliberately makes no network call on that path.
 
 ## Threading contract
 
-| Method / event                          | Thread               |
-|-----------------------------------------|----------------------|
-| Constructor, `checkOnLaunch`, `activate`, `validate`, `deactivate`, `startTrial` | Call from **message thread** — may block; see below |
-| Completion callbacks (`activate`, etc.) | Delivered on **message thread** via `callAsync` |
-| `onStateChanged`                        | Fires on **message thread** |
-| `state()`                               | **Any thread** (atomic load) |
-| `hasFeature(feature)`                   | **Any thread** — audio-thread safe (atomic load) |
-| `hasEntitlement(feature)` (SDK mutex)   | Message thread only  |
-| `trialStatus()` / `trialDaysLeft()` (SDK mutex) | Message thread only  |
-| `JuceUrlTransport::request()`           | Background `std::thread` only — never the audio thread |
-| `~Licensing()`                          | **Message thread** — may block; see below |
+Every entry says both which thread may call it **and what it costs there**.
+It covers every callable public member of `Licensing` — copy and move are
+deleted, and there is nothing else.
+
+| Method / event | Thread | Blocks? |
+|---|---|---|
+| `state()` | **Any thread**, audio-thread safe | **No.** Two relaxed atomic loads |
+| `hasFeature(feature)` | **Any thread**, audio-thread safe | **No.** One relaxed atomic load |
+| `startAutoValidation()` / `stopAutoValidation()` | **Any thread** | **No.** Neither joins nor waits |
+| `onStateChanged` | Fires on **message thread** via `callAsync` | n/a — your callback's cost is yours |
+| Completion callbacks (`activate`, etc.) | Delivered on **message thread** via `callAsync` | n/a |
+| Constructor | Message thread | **Yes, briefly.** Reads the lease off disk and runs one Ed25519 verify. No network. A DAW pays this per instance during a scan |
+| `hasEntitlement(feature)` | Message thread | **Yes, briefly.** SDK mutex plus an Ed25519 verify |
+| `trialStatus()` / `trialDaysLeft()` | Message thread | **Yes, briefly.** SDK mutex, arithmetic only |
+| `activate` `validate` `deactivate` `checkOnLaunch` `startTrial` `reportKeylessState` | Message thread | **Yes, and unboundedly.** Joins the previous one of these — see *An SDK call can block the message thread too* |
+| `~Licensing()` | Message thread | **Yes, and unboundedly.** See *Destruction can block the message thread* |
+| `underlying()` | Message thread | Whatever you call on it. `refreshIfNeeded()` and `validate()` are network calls |
+| `JuceUrlTransport::request()` | Background `std::thread` only — never the audio thread | Yes, synchronously, on whichever thread runs it |
+
+The audio thread never blocks anywhere in this table, which is the point of
+`state()` and `hasFeature()` being atomic mirrors.
 
 ### Destruction can block the message thread
 

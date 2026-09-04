@@ -34,6 +34,11 @@
  * snapshot only moves on real state changes and a mid-session rollback would
  * never reach the audio thread.
  *
+ * For what every public member costs on the thread you call it from, see the
+ * threading-contract table in integrations/juce/README.md. It covers all of
+ * them, including the two that block unboundedly: the dispatched SDK calls
+ * and the destructor.
+ *
  * JUCE version compatibility: JUCE 7 and JUCE 8.
  *
  * Manual verification pending: compile in a real JUCE plugin project.
