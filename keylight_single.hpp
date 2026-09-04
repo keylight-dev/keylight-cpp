@@ -2362,16 +2362,17 @@ public:
     // can still call into it; the LISTENER CONTRACT's "do not destroy from a
     // callback" is the special case, not the whole rule.
     ~Client() {
-        std::vector<AvWorker> to_join;
+        Reaper to_join;
         {
             std::lock_guard<std::mutex> lock(av_mutex_);
             ++av_epoch_;              // retire every worker, current or not
             av_cv_.notify_all();
+            to_join.workers.reserve(av_retired_.size() + 1);
             if (av_current_.thread.joinable()) {
-                to_join.push_back(std::move(av_current_));
+                to_join.workers.push_back(std::move(av_current_));
                 av_current_ = AvWorker{};
             }
-            for (auto& w : av_retired_) to_join.push_back(std::move(w));
+            for (auto& w : av_retired_) to_join.workers.push_back(std::move(w));
             av_retired_.clear();
         }
         // The only join in the lifecycle. Outside the lock, because a worker
@@ -2382,7 +2383,10 @@ public:
         // forbidden by the LISTENER CONTRACT and left loud on purpose: the
         // alternative is a silent use-after-free, since the thread returns
         // into av_loop_ and touches av_mutex_ after this destructor is done.
-        for (auto& w : to_join) if (w.thread.joinable()) w.thread.join();
+        //
+        // This can block for a listener callback plus a network round trip —
+        // the cost stopAutoValidation() used to pay is concentrated here now.
+        // A JUCE ~Licensing() runs on the message thread, so budget for it.
     }
 
     // ── Sync API ──────────────────────────────────────────────────────────
@@ -2822,10 +2826,16 @@ public:
     /// first. ~Client() is what joins, so the thread can never outlive the
     /// Client.
     void startAutoValidation() {
-        std::vector<AvWorker> reap;
+        // Reaper, not a bare vector: it holds JOINABLE threads, and destroying
+        // a joinable std::thread is std::terminate. Anything that throws below
+        // — make_shared, or the std::thread constructor on EAGAIN, which a DAW
+        // hosting many plugin instances near RLIMIT_NPROC can really hit —
+        // would otherwise abort the host uncatchably from inside a licensing
+        // SDK. This is the job the deleted TransitionGuard used to do.
+        Reaper reap;
         {
             std::lock_guard<std::mutex> lock(av_mutex_);
-            reap = take_exited_();
+            reap.workers = take_exited_();
 
             // A joinable current worker means one is running the current
             // epoch. Retired workers live in av_retired_, so this cannot be
@@ -2842,10 +2852,20 @@ public:
                 });
             }
         }
-        // Outside the lock. Every worker here has already left av_loop_, so
-        // join() is bounded by thread teardown — it cannot wait on the network
-        // and it cannot wait on a listener.
-        for (auto& w : reap) w.thread.join();
+        // ~Reaper joins outside the lock. Every worker it holds has already
+        // left av_loop_, so join() is bounded by thread teardown — it cannot
+        // wait on the network and it cannot wait on a listener.
+    }
+
+    /// TEST SEAM — internal, unstable, not part of the supported API.
+    ///
+    /// Number of retired workers awaiting a reap. Exposed because without it
+    /// take_exited_() has no coverage at all: a reaper that silently stops
+    /// working leaks a thread stack per stop/start cycle and every
+    /// black-box symptom of that is far too slow to assert in a test.
+    std::size_t retiredWorkerCount_ForTest() const {
+        std::lock_guard<std::mutex> lock(av_mutex_);
+        return av_retired_.size();
     }
 
     /// Retire the auto-validation worker. Safe from any thread, including
@@ -2858,10 +2878,10 @@ public:
     /// a state-change event can still land shortly after this returns.
     /// ~Client() joins, so no worker outlives the Client.
     void stopAutoValidation() {
-        std::vector<AvWorker> reap;
+        Reaper reap;   // joins on unwind — see startAutoValidation()
         {
             std::lock_guard<std::mutex> lock(av_mutex_);
-            reap = take_exited_();
+            reap.workers = take_exited_();
 
             if (av_current_.thread.joinable()) {
                 ++av_epoch_;              // retires the current worker
@@ -2870,7 +2890,6 @@ public:
                 av_current_ = AvWorker{};
             }
         }
-        for (auto& w : reap) w.thread.join();
     }
 
     // ── Launch / refresh API ──────────────────────────────────────────────
@@ -3170,7 +3189,7 @@ private:
     // interval wait, then RELEASES it before calling refreshIfNeeded() (which
     // acquires cache_mutex_ / notify_mutex_ / listeners_mutex_) to avoid
     // deadlock and to keep start/stop responsive during a round trip.
-    std::mutex              av_mutex_;
+    mutable std::mutex      av_mutex_;
     std::condition_variable av_cv_;
 
     // Monotone. A worker captures this at spawn and exits when it changes.
@@ -3186,12 +3205,25 @@ private:
         std::shared_ptr<std::atomic<bool>> done;
     };
 
+    // Holds workers on their way to a join, and joins them however the scope
+    // exits. A bare vector of joinable std::threads is a std::terminate
+    // waiting for an exception.
+    struct Reaper {
+        std::vector<AvWorker> workers;
+        ~Reaper() {
+            for (auto& w : workers) if (w.thread.joinable()) w.thread.join();
+        }
+    };
+
     // The worker running the CURRENT epoch. A joinable thread here is the
     // definition of "auto-validation is running".
     AvWorker                av_current_;
-    // Retired workers, awaiting a reap. Bounded: entries are moved out by
-    // take_exited_() on the next start or stop once they have finished, and
-    // ~Client() joins whatever is left.
+    // Retired workers, awaiting a reap. Entries are moved out by take_exited_()
+    // on the next start or stop once they have finished, and ~Client() joins
+    // whatever is left. Not bounded by a constant — the bound is (in-flight
+    // refresh duration / stop-start period), so a program that cycles faster
+    // than its round trips holds more. Never unbounded growth: a worker that
+    // has finished is reaped by the very next start or stop.
     std::vector<AvWorker>   av_retired_;
 
     // ── Private helpers ───────────────────────────────────────────────────
@@ -4001,6 +4033,10 @@ private:
     /// user controls, which is why the flag exists rather than just joining.
     std::vector<AvWorker> take_exited_() {
         std::vector<AvWorker> exited, still_running;
+        // Reserve BEFORE moving anything: a bad_alloc partway through would
+        // leave joinable threads in a vector that is about to unwind.
+        exited.reserve(av_retired_.size());
+        still_running.reserve(av_retired_.size());
         for (auto& w : av_retired_) {
             if (w.done && w.done->load()) exited.push_back(std::move(w));
             else                          still_running.push_back(std::move(w));
