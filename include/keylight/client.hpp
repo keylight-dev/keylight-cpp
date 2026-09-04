@@ -50,6 +50,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <memory>
 #include <ctime>
 #include <future>
 #include <functional>
@@ -257,7 +258,27 @@ public:
     // can still call into it; the LISTENER CONTRACT's "do not destroy from a
     // callback" is the special case, not the whole rule.
     ~Client() {
-        stopAutoValidation();
+        std::vector<AvWorker> to_join;
+        {
+            std::lock_guard<std::mutex> lock(av_mutex_);
+            ++av_epoch_;              // retire every worker, current or not
+            av_cv_.notify_all();
+            if (av_current_.thread.joinable()) {
+                to_join.push_back(std::move(av_current_));
+                av_current_ = AvWorker{};
+            }
+            for (auto& w : av_retired_) to_join.push_back(std::move(w));
+            av_retired_.clear();
+        }
+        // The only join in the lifecycle. Outside the lock, because a worker
+        // mid-refresh needs av_mutex_ to notice the epoch moved.
+        //
+        // Destroying a Client from its own worker thread — i.e. from a
+        // state-change listener — self-joins and terminates. That is
+        // forbidden by the LISTENER CONTRACT and left loud on purpose: the
+        // alternative is a silent use-after-free, since the thread returns
+        // into av_loop_ and touches av_mutex_ after this destructor is done.
+        for (auto& w : to_join) if (w.thread.joinable()) w.thread.join();
     }
 
     // ── Sync API ──────────────────────────────────────────────────────────
@@ -671,111 +692,81 @@ public:
     /// cfg_.autoValidationIntervalMs.  Never started implicitly — the host
     /// application must call this explicitly.
     ///
-    /// Idempotent: calling startAutoValidation() while a thread is already
-    /// running is a no-op (the existing thread continues).
+    /// Idempotent: a second call while a worker is running is a no-op.
+    /// Restartable: stop-then-start works from any thread, including from a
+    /// state-change listener delivered on the worker thread itself.
     ///
-    /// Restartable: stop-then-start is an ordinary pattern (stop polling when
-    /// the licence goes invalid, restart when the user activates), including
-    /// after a stopAutoValidation() that came from a listener on the worker
-    /// thread itself — that path deliberately leaves the thread unjoined, and
-    /// a finished thread is still joinable(), so this reaps it rather than
-    /// mistaking it for a live worker and no-opping forever.
+    /// LIFECYCLE MODEL — read this before changing anything here.
+    ///
+    /// Workers are retired by EPOCH, and start/stop NEVER join. A worker
+    /// captures av_epoch_ when it is spawned and exits the first time it sees
+    /// a different one; stop simply bumps the epoch and wakes it. Neither
+    /// function ever releases av_mutex_ mid-body, so there is no window for a
+    /// concurrent caller to act on a half-changed state, and no caller ever
+    /// blocks on another thread.
+    ///
+    /// That is the entire point. The previous model had start and stop join
+    /// the worker, which meant releasing av_mutex_ mid-body, which needed a
+    /// transition flag to cover the gap, which needed "am I the worker?"
+    /// special cases so a listener calling back in did not block on that flag.
+    /// Four rounds of review found a hang in each layer. Joining was the root
+    /// cause; this removes it rather than guarding it.
+    ///
+    /// THE COST, stated plainly: stopAutoValidation() no longer guarantees the
+    /// worker has EXITED when it returns — only that it will not run another
+    /// cycle. A worker already inside refreshIfNeeded() finishes that call
+    /// first. ~Client() is what joins, so the thread can never outlive the
+    /// Client.
     void startAutoValidation() {
-        std::unique_lock<std::mutex> lock(av_mutex_);
+        std::vector<AvWorker> reap;
+        {
+            std::lock_guard<std::mutex> lock(av_mutex_);
+            reap = take_exited_();
 
-        // Recognise ourselves FIRST, before any wait. A listener can be
-        // delivered on the worker thread and call back in here — the contract
-        // permits it — and the worker must never block on a transition, or it
-        // deadlocks against the very stop that is waiting to join it.
-        //
-        // The id is tracked separately because av_thread_ is MOVED OUT during
-        // a transition, so av_thread_.get_id() is the null id exactly when the
-        // worker most needs to identify itself.
-        if (std::this_thread::get_id() == av_worker_id_) return;
-
-        // Only one start/stop transition at a time. Both release av_mutex_ to
-        // join, and av_thread_ is empty across that window — so without this a
-        // concurrent start sees "no worker", skips the reap, clears av_stop_
-        // and spawns a SECOND worker while the first has not yet observed the
-        // stop. Result: two workers polling forever, and the reaper's join()
-        // blocked until something else sets av_stop_ again.
-        av_transition_cv_.wait(lock, [this]{ return !av_transition_; });
-
-        if (av_thread_.joinable() && !av_stop_) return;   // running — no-op
-
-        TransitionGuard transition{this};
-
-        if (av_thread_.joinable()) {
-            std::thread stale = std::move(av_thread_);
-            // Join outside the lock — the worker needs av_mutex_ to exit — and
-            // BEFORE clearing av_stop_, or the old worker would see the flag
-            // drop and keep running as a second poller.
-            lock.unlock();
-            stale.join();
-            lock.lock();
-            av_worker_id_ = std::thread::id{};   // reaped; ids get recycled
-        }
-
-        av_stop_ = false;
-        av_thread_ = std::thread([this] {
-            auto interval = std::chrono::milliseconds(cfg_.autoValidationIntervalMs);
-            std::unique_lock<std::mutex> lk(av_mutex_);
-            while (!av_stop_) {
-                // Interruptible wait: wakes immediately on stopAutoValidation().
-                av_cv_.wait_for(lk, interval, [this]{ return av_stop_; });
-                if (av_stop_) break;
-                // Release the mutex while calling refreshIfNeeded so it can
-                // acquire cache_mutex_ / listeners_mutex_ without deadlock.
-                lk.unlock();
-                refreshIfNeeded();
-                lk.lock();
+            // A joinable current worker means one is running the current
+            // epoch. Retired workers live in av_retired_, so this cannot be
+            // confused by a finished-but-unjoined thread.
+            if (!av_current_.thread.joinable()) {
+                const uint64_t epoch = ++av_epoch_;
+                auto done = std::make_shared<std::atomic<bool>>(false);
+                av_current_.done   = done;
+                av_current_.thread = std::thread([this, epoch, done] {
+                    av_loop_(epoch);
+                    // Last act: publish that the loop is over, so a later
+                    // reaper can join without blocking on a round trip.
+                    done->store(true);
+                });
             }
-        });
-        av_worker_id_ = av_thread_.get_id();
+        }
+        // Outside the lock. Every worker here has already left av_loop_, so
+        // join() is bounded by thread teardown — it cannot wait on the network
+        // and it cannot wait on a listener.
+        for (auto& w : reap) w.thread.join();
     }
 
-    /// Signal the background thread to stop and join it.
-    /// Idempotent: safe to call when no thread is running.
-    /// Returns promptly — the thread wakes up via the condition variable
-    /// instead of blocking for the full interval.
+    /// Retire the auto-validation worker. Safe from any thread, including
+    /// from a state-change listener delivered on the worker thread itself.
+    /// Idempotent: safe when nothing is running.
+    ///
+    /// Returns immediately. It does NOT join — see the lifecycle model on
+    /// startAutoValidation(). The worker will not begin another cycle, but one
+    /// already inside refreshIfNeeded() finishes that call first, so a tick or
+    /// a state-change event can still land shortly after this returns.
+    /// ~Client() joins, so no worker outlives the Client.
     void stopAutoValidation() {
-        std::unique_lock<std::mutex> lock(av_mutex_);
+        std::vector<AvWorker> reap;
+        {
+            std::lock_guard<std::mutex> lock(av_mutex_);
+            reap = take_exited_();
 
-        // Called from the auto-validation thread itself — a listener can be
-        // delivered on it, and the contract permits calling back in. Signal
-        // and return: never wait, never join.
-        //
-        // Waiting would deadlock against a concurrent external stop that is
-        // already parked in join() waiting for THIS thread. Joining would
-        // self-join: join() throws EDEADLK, the std::thread is destroyed
-        // still-joinable, and ~thread() calls std::terminate() — an abort no
-        // caller can catch. Signalled and left owned by av_thread_, the worker
-        // exits as soon as this listener returns, and the next start or stop
-        // from any other thread reaps it.
-        //
-        // Tracked separately from av_thread_.get_id() because av_thread_ is
-        // MOVED OUT during a transition, so its id is null exactly when the
-        // worker most needs to identify itself.
-        if (std::this_thread::get_id() == av_worker_id_) {
-            av_stop_ = true;
-            av_cv_.notify_all();
-            return;
+            if (av_current_.thread.joinable()) {
+                ++av_epoch_;              // retires the current worker
+                av_cv_.notify_all();      // wake it out of its interval wait
+                av_retired_.push_back(std::move(av_current_));
+                av_current_ = AvWorker{};
+            }
         }
-
-        // Do not act on av_thread_ while another transition has it moved out.
-        av_transition_cv_.wait(lock, [this]{ return !av_transition_; });
-
-        if (!av_thread_.joinable()) return; // not running — no-op
-        av_stop_ = true;
-        av_cv_.notify_all();
-
-        TransitionGuard transition{this};
-        std::thread to_join = std::move(av_thread_); // move out before unlocking
-        // Join outside the lock so the worker can re-acquire av_mutex_ to exit.
-        lock.unlock();
-        if (to_join.joinable()) to_join.join();
-        lock.lock();
-        av_worker_id_ = std::thread::id{};   // reaped; ids get recycled
+        for (auto& w : reap) w.thread.join();
     }
 
     // ── Launch / refresh API ──────────────────────────────────────────────
@@ -1067,36 +1058,37 @@ private:
     bool                      delivering_ = false;   // the delivery baton
 
     // ── Background auto-validation ────────────────────────────────────────
-    // av_mutex_ guards av_stop_ and av_thread_.
-    // The worker holds a unique_lock<av_mutex_> for its wait/flag check,
-    // then RELEASES it before calling refreshIfNeeded() (which acquires
-    // cache_mutex_ / listeners_mutex_) to avoid deadlock.
+    // av_mutex_ guards every field below. Neither startAutoValidation() nor
+    // stopAutoValidation() releases it mid-body, so there is no half-changed
+    // state for a concurrent caller to observe.
+    //
+    // The worker holds a unique_lock<av_mutex_> for its epoch check and
+    // interval wait, then RELEASES it before calling refreshIfNeeded() (which
+    // acquires cache_mutex_ / notify_mutex_ / listeners_mutex_) to avoid
+    // deadlock and to keep start/stop responsive during a round trip.
     std::mutex              av_mutex_;
     std::condition_variable av_cv_;
-    // True while a start or stop is mid-transition, i.e. has av_thread_ moved
-    // out and av_mutex_ released for a join. Guarded by av_mutex_.
-    bool                    av_transition_ = false;
-    std::condition_variable av_transition_cv_;
-    // The worker's id, kept separately because av_thread_ is moved out during
-    // a transition. Cleared after every join — thread ids are recycled, and a
-    // stale one would let an unrelated thread believe it is the worker.
-    // Guarded by av_mutex_.
-    std::thread::id         av_worker_id_{};
 
-    /// Claims the start/stop transition for the duration of a scope, so no
-    /// other caller can act on av_thread_ while it is moved out for a join.
-    /// Releases on unwind — a std::thread constructor that throws must not
-    /// wedge every later start and stop.
-    struct TransitionGuard {
-        Client* self;
-        explicit TransitionGuard(Client* c) : self(c) { self->av_transition_ = true; }
-        ~TransitionGuard() {
-            self->av_transition_ = false;
-            self->av_transition_cv_.notify_all();
-        }
+    // Monotone. A worker captures this at spawn and exits when it changes.
+    // Bumping it is how stopAutoValidation() and ~Client() retire a worker
+    // without joining.
+    uint64_t                av_epoch_ = 0;
+
+    // A spawned worker. `done` is set by the thread as its very last act, so a
+    // reaper can distinguish "already left av_loop_" (join returns at once)
+    // from "still inside a round trip" (join would block on the network).
+    struct AvWorker {
+        std::thread                        thread;
+        std::shared_ptr<std::atomic<bool>> done;
     };
-    bool                    av_stop_  = false;
-    std::thread             av_thread_;
+
+    // The worker running the CURRENT epoch. A joinable thread here is the
+    // definition of "auto-validation is running".
+    AvWorker                av_current_;
+    // Retired workers, awaiting a reap. Bounded: entries are moved out by
+    // take_exited_() on the next start or stop once they have finished, and
+    // ~Client() joins whatever is left.
+    std::vector<AvWorker>   av_retired_;
 
     // ── Private helpers ───────────────────────────────────────────────────
 
@@ -1878,6 +1870,39 @@ private:
             return Result<State>::ok(State::Expired);
         }
         return Result<State>::ok(current);
+    }
+
+    /// The auto-validation worker. Runs until the epoch it was spawned with
+    /// is no longer current — which is how both stopAutoValidation() and
+    /// ~Client() retire it, without either of them joining.
+    void av_loop_(uint64_t epoch) {
+        const auto interval =
+            std::chrono::milliseconds(cfg_.autoValidationIntervalMs);
+        std::unique_lock<std::mutex> lk(av_mutex_);
+        while (av_epoch_ == epoch) {
+            // Interruptible wait: wakes immediately when the epoch moves.
+            av_cv_.wait_for(lk, interval, [this, epoch]{ return av_epoch_ != epoch; });
+            if (av_epoch_ != epoch) break;
+            // Release the mutex while calling refreshIfNeeded so it can
+            // acquire cache_mutex_ / notify_mutex_ / listeners_mutex_ without
+            // deadlock, and so start/stop stay responsive during a round trip.
+            lk.unlock();
+            refreshIfNeeded();
+            lk.lock();
+        }
+    }
+
+    /// Move out every retired worker that has finished its loop. Caller holds
+    /// av_mutex_. Joining these outside the lock cannot block on anything a
+    /// user controls, which is why the flag exists rather than just joining.
+    std::vector<AvWorker> take_exited_() {
+        std::vector<AvWorker> exited, still_running;
+        for (auto& w : av_retired_) {
+            if (w.done && w.done->load()) exited.push_back(std::move(w));
+            else                          still_running.push_back(std::move(w));
+        }
+        av_retired_ = std::move(still_running);
+        return exited;
     }
 
     /// Set the raw resolved state, then let notify_() decide whether that is
