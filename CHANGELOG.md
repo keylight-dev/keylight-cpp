@@ -81,9 +81,13 @@
   the background worker to exit. It retires the worker and returns
   immediately; a worker already inside `refreshIfNeeded()` finishes that call
   first, so one more tick — and possibly one more state-change event — can
-  land shortly after the call returns. `~Client()` still joins, so a worker can
-  never outlive the `Client`. If you relied on "stopped means stopped", gate on
-  your own flag rather than on the call returning.
+  land shortly after the call returns. If you relied on "stopped means
+  stopped", gate on your own flag rather than on the call returning.
+
+  `~Client()` still joins, so a worker can never outlive the `Client` — but
+  note the cost moved rather than vanished: the destructor can now block for
+  one listener callback plus one network round trip. That matters if you
+  destroy the client on a UI thread (JUCE's `~Licensing` does).
 
   Workers are now retired by epoch instead of being joined, which is what makes
   the rest of this section true. `startAutoValidation()` and

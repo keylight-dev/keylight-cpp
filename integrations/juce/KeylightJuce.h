@@ -228,14 +228,24 @@ public:
         // it does not close it. This is a check-then-use — the callback can
         // pass the check, ~Licensing can then run to completion, and the
         // callback proceeds into state_snapshot_/refresh_entitlement_cache_()
-        // on a destroyed object. ~Licensing joins only ITS OWN dispatch
-        // thread, and delivery may be on a thread it does not join (an app
-        // thread calling refreshIfNeeded() on focus/resume). Closing it needs
-        // a fence in the SDK — an unsubscribe() that waits out an in-flight
-        // delivery for that listener — which is a deliberate follow-up, not
-        // something this header can do alone. Destroy Licensing from the
-        // message thread with auto-validation stopped and the window is not
-        // reachable in practice.
+        // on a destroyed object.
+        //
+        // ~Licensing closes the AUTO-VALIDATION half: step ⑤ destroys the
+        // Client last, and ~Client() joins the worker, so a delivery on that
+        // thread finishes while every member it can touch is still alive.
+        //
+        // What remains is delivery on an APP thread — the SDK hands the baton
+        // to whichever thread is draining, so an app thread calling
+        // refreshIfNeeded() on focus/resume can be the one in your callback,
+        // and nothing here joins that thread. Closing it needs a fence in the
+        // SDK, and a naive one reintroduces a deadlock (an unsubscribe() that
+        // waits blocks the caller on user callback code), so it is a
+        // deliberate follow-up rather than an oversight.
+        //
+        // NOTE: stopping auto-validation first does NOT help — since 0.2.0
+        // stopAutoValidation() does not wait for anything. Destroy Licensing
+        // from the message thread, and do not call into the SDK off
+        // underlying() from another thread while doing so.
         subscription_ = client_->subscribe(
             [this, aliveCopy = alive_](keylight::State newState)
         {
