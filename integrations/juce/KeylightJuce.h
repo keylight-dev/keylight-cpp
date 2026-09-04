@@ -15,8 +15,8 @@
  *   std::atomic<keylight::State>  state_snapshot_   — mirrors Client::state()
  *   std::atomic<bool>             pro_enabled_       — mirrors hasEntitlement("pro")
  *
- * These are updated from the message thread (in the subscription callback)
- * after every SDK state transition.  No mutex, no allocation, no juce::String
+ * These are updated in the subscription callback, on whichever thread is
+ * draining the SDK's event queue, after every SDK state transition.  No mutex, no allocation, no juce::String
  * construction happens on the audio thread — just two relaxed atomic loads.
  *
  * state_snapshot_ mirrors Client::state(), which fails closed when the system
@@ -214,14 +214,22 @@ public:
         refresh_entitlement_cache_();
 
         // Subscribe to SDK state-change events.
-        // The callback fires on whatever thread changes the state (i.e. the
-        // background network thread managed by this class). We update the
-        // atomics there, then post a UI notification via callAsync so the
-        // editor can repaint.
-        subscription_ = client_->subscribe([this](keylight::State newState)
+        // The callback fires on whatever thread is draining the SDK's event
+        // queue. We update the atomics there, then post a UI notification via
+        // callAsync so the editor can repaint.
+        //
+        // alive_ is captured BY VALUE (a shared_ptr copy) and checked before
+        // anything touches `this`. Dropping subscription_ in ~Licensing does
+        // not fence a delivery already in flight on another thread, so the
+        // flag — not the unsubscribe — is what makes this safe.
+        subscription_ = client_->subscribe(
+            [this, aliveCopy = alive_](keylight::State newState)
         {
-            // Update atomics (may be called from any thread, but always from
-            // our own background thread — never from the audio thread).
+            if (!aliveCopy->load())   // Licensing destroyed mid-delivery
+                return;
+
+            // Update atomics. Called from whichever thread is draining the
+            // SDK's queue — never the audio thread.
             //
             // `newState` IS the guarded state: the SDK reports subscription
             // events through the same clock guard as Client::state(). Use it
@@ -242,14 +250,16 @@ public:
             // request per 24h per state, so the usual cost is a lock and a
             // comparison. Licensed/Invalid are not keyless states.
             //
-            // The callback runs on whichever thread caused the transition:
-            // our own background thread for a dispatched call, and the SDK's
-            // auto-validation thread for a tick. Never the audio thread. It
-            // CAN reach the message thread if you call the SDK directly off
-            // underlying() from there — README recommends refreshIfNeeded()
-            // on focus/resume — in which case this POST blocks the UI for one
-            // round trip, once per 24h. Wrap that call in your own thread if
-            // that matters to you.
+            // The callback runs on whichever thread is DRAINING the SDK's
+            // event queue — usually the thread that caused the transition
+            // (our background thread for a dispatched call, the SDK's
+            // auto-validation thread for a tick), but under concurrency a
+            // thread already delivering picks up the event instead. Never the
+            // audio thread. It CAN reach the message thread if you call the
+            // SDK directly off underlying() from there — the root README
+            // recommends refreshIfNeeded() on focus/resume — in which case
+            // this POST blocks the UI for one round trip, once per 24h. Wrap
+            // that call in your own thread if that matters to you.
             //
             // Calling back into the SDK from here is allowed — it holds no
             // lock during delivery, and a re-entrant call queues its event
@@ -280,7 +290,6 @@ public:
             // Capture alive_ by value (copies the shared_ptr, keeping the
             // flag alive even after ~Licensing runs) so the lambda can
             // safely check whether this is still valid before touching members.
-            auto aliveCopy = alive_;
             juce::MessageManager::callAsync([this, aliveCopy, newState]()
             {
                 if (!aliveCopy->load())  // Licensing destroyed; drop safely
