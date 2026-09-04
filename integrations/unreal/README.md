@@ -200,14 +200,23 @@ every listener callback for every queued event if that worker is delivering.
 **Your listeners set that ceiling** — nothing in the SDK caps it. `Configure()`
 is the one to watch, since it runs mid-session where a hitch is visible.
 
+Blocking is not the only hazard here. An in-flight `Activate()`/`Validate()`
+`AsyncTask` holds a raw pointer to the `Client` and dereferences it before any
+weak-pointer check, so destroying the client under it is a use-after-free.
+`Configure()` you can gate on "no request in flight"; `Deinitialize()` is called
+by the engine at shutdown, where you often cannot — keep your own in-flight
+counter and drain it before shutdown if that matters for your title.
+
 `GetState()` forwards to `keylight::Client::state()`, which is `noexcept` and
 calls the clock function the `Client` was constructed with. The default
 (`std::time`) is non-throwing, non-blocking and allocation-free; if you supply
 your own it must be too, or the "any thread" guarantee no longer holds.
 
 `FHttpTransport::request()` is called on a UE background worker thread and
-blocks that thread (via `FEvent::Wait()`) until the HTTP response arrives.
-The **game thread is never blocked**.
+blocks that thread (via `FEvent::Wait()`) until the HTTP response arrives. The
+game thread never *runs* a request — but it does wait on the SDK during
+teardown, so see *Teardown can block the game thread* above rather than reading
+this as "never blocked".
 
 ---
 

@@ -269,29 +269,35 @@ deleted, and there is nothing else.
 
 | Method / event | Thread | Blocks? |
 |---|---|---|
-| `state()` | **Any thread**, audio-thread safe | **No.** Two relaxed atomic loads |
-| `hasFeature(feature)` | **Any thread**, audio-thread safe | **No.** One relaxed atomic load |
+| `state()` | **Any thread**, audio-thread safe | **No.** One relaxed atomic load |
+| `hasFeature(feature)` | **Any thread**, audio-thread safe | **No.** A `juce::String` comparison, then one relaxed atomic load. See the caveat below |
 | `startAutoValidation()` / `stopAutoValidation()` | **Any thread** | **No.** Neither joins nor waits |
 | `onStateChanged` | Fires on **message thread** via `callAsync` | n/a — your callback's cost is yours |
 | Completion callbacks (`activate`, etc.) | Delivered on **message thread** via `callAsync` | n/a |
-| Constructor | Message thread | **Yes, briefly.** Reads the lease off disk and runs one Ed25519 verify. No network. A DAW pays this per instance during a scan |
+| Constructor | Message thread | **Yes, briefly.** Reads the lease off disk and runs **two** Ed25519 verifies — one in `keylight::Client`'s constructor, one from the entitlement cache seed. No network. A DAW pays this per instance during a scan |
 | `hasEntitlement(feature)` | Message thread | **Yes, briefly.** SDK mutex plus an Ed25519 verify |
 | `trialStatus()` / `trialDaysLeft()` | Message thread | **Yes, briefly.** SDK mutex, arithmetic only |
 | `activate` `validate` `deactivate` `checkOnLaunch` `startTrial` `reportKeylessState` | Message thread | **Yes, and unboundedly.** Joins the previous one of these — see *An SDK call can block the message thread too* |
 | `~Licensing()` | Message thread | **Yes, and unboundedly.** See *Destruction can block the message thread* |
-| `underlying()` | Message thread | Whatever you call on it. `refreshIfNeeded()` and `validate()` are network calls |
+| `underlying()` | **Any thread** — it just returns the reference | Nothing. But what you call on it can: `refreshIfNeeded()` and `validate()` are network calls, and the `Client` has its own threading rules |
 | `JuceUrlTransport::request()` | Background `std::thread` only — never the audio thread | Yes, synchronously, on whichever thread runs it |
 
-The audio thread never blocks anywhere in this table, which is the point of
-`state()` and `hasFeature()` being atomic mirrors.
+The audio thread never blocks in a release build, which is the point of
+`state()` and `hasFeature()` being atomic mirrors. One caveat on `hasFeature()`:
+it compares a `juce::String` before the atomic load, and in JUCE **debug**
+builds that comparison may invoke instrumentation that allocates. Only the
+atomics themselves are unconditionally lock-free — so in a debug build, prefer
+caching the result outside `processBlock`.
 
 ### Destruction can block the message thread
 
 `~Licensing()` waits on **two** threads, and the likelier one is not the SDK's.
 
 **Your in-flight request (the one you will actually hit).** `activate()`,
-`validate()` and `deactivate()` run on a worker thread this class owns, and the
-destructor joins it. If the user taps *Activate* and then closes the session
+`validate()`, `deactivate()`, `checkOnLaunch()`, `startTrial()` and
+`reportKeylessState()` all run on one worker thread this class owns, and the
+destructor joins it. `checkOnLaunch()` is the likeliest to be in flight, since
+a DAW instantiates and destroys plugins while scanning. If the user taps *Activate* and then closes the session
 before the response arrives, teardown waits out the whole HTTP round trip on
 the message thread. Nothing cancels it — `JuceUrlTransport` has no interrupt.
 That is a button press away, not a timing coincidence, so if teardown latency
@@ -333,7 +339,7 @@ into an in-flight request.
 `JuceUrlTransport::request()` calls `juce::URL::createInputStream()`, which
 blocks synchronously on whichever thread runs it. The audio thread never runs
 it, and never joins it. The message thread never runs it — but it does *join*
-it, and not only at teardown. See below.
+it, and not only at teardown; see the two sections above.
 
 ---
 
@@ -421,8 +427,9 @@ The adapter code is written against the JUCE 7/8 public API
 and the Keylight C++ SDK public API (`keylight::Client`, `keylight::Transport`,
 `keylight::Config`, `keylight::FileStore`, `keylight::Subscription`).
 
-No JUCE toolchain is present in the keylight-cpp CI environment.  Before
-shipping to end users, a developer with JUCE installed must:
+CI covers compilation and the offline query API. What it does **not** cover is
+a live plugin round-trip, so before shipping to end users a developer with a
+DAW should still:
 
 1. Copy `KeylightJuce.h` into the plugin project and add the SDK include path.
 2. Add a `Licensing` member to the `AudioProcessor`, call `checkOnLaunch()`.

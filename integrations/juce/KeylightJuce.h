@@ -41,8 +41,10 @@
  *
  * JUCE version compatibility: JUCE 7 and JUCE 8.
  *
- * Manual verification pending: compile in a real JUCE plugin project.
- * (No JUCE toolchain is available in keylight-cpp CI.)
+ * Compiled in CI: .github/workflows/juce.yml builds integrations/juce/citest
+ * against JUCE 8.0.6 on Linux, macOS and Windows, and JUCE 7.0.12 on Linux and
+ * Windows, then runs a CTest smoke test that constructs Licensing and asserts
+ * the audio-thread-safe accessors.
  */
 
 #pragma once
@@ -276,11 +278,19 @@ public:
             // Called INLINE on purpose. dispatch_() joins the background
             // thread this callback normally runs on, so routing through it
             // would make the thread join itself. The SDK debounces to one
-            // request per 24h per state — but that arm only suppresses a
-            // REPEAT of the same state, and notify_() already dedupes on the
-            // reported value, so this callback fires only on a change. The
-            // usual cost here is therefore a full HTTP POST, not a lock and a
-            // comparison. Licensed/Invalid are not keyless states.
+            // request per 24h per state. Do not reason from notify_()'s dedupe
+            // to "so this is always a POST": the two dedupe on DIFFERENT
+            // values. notify_() dedupes on State (six values); the beacon
+            // dedupes on the keyless wire string (three), and that cache
+            // persists across the states that send nothing. So
+            // Trial -> Licensed -> Trial is a genuine state change each time,
+            // yet the second beacon repeats the wire "trial" and the 24h arm
+            // does suppress it.
+            //
+            // Cost is therefore either a lock and a comparison or a full
+            // blocking POST, depending on what came before. Assume the POST
+            // when reasoning about teardown latency, since that is the
+            // expensive branch. Licensed/Invalid are not keyless states.
             //
             // The callback runs on whichever thread is DRAINING the SDK's
             // event queue — usually the thread that caused the transition
@@ -388,8 +398,9 @@ public:
         //
         //   AND THEN some. That thread is also the one that moved the state,
         //   so it holds the SDK's delivery baton and runs the subscription
-        //   callback below inline: a second blocking POST via
-        //   reportKeylessState, plus any listener the integrator registered
+        //   callback below inline: possibly a second blocking POST via
+        //   reportKeylessState (see the note there — it may or may not be
+        //   debounced away), plus any listener the integrator registered
         //   directly through underlying().subscribe(). Your listeners set that
         //   ceiling, so like step ⑤ it has no fixed upper bound.
         //
