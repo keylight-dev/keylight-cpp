@@ -1546,6 +1546,18 @@ TEST_CASE("Client: concurrent notifiers cannot deliver events out of order") {
 // that hangs forever is worse than one that fails: it takes CI down with it
 // and tells you nothing. On timeout we fail loudly and deliberately leak the
 // scenario rather than tearing down objects threads are still parked in.
+// Spin until `pred`, but never forever — an unbounded wait in a test hangs the
+// whole suite and tells you nothing about which assertion was going to fail.
+static bool spin_until(std::chrono::milliseconds limit, std::function<bool()> pred)
+{
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    while (!pred()) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::yield();
+    }
+    return true;
+}
+
 static bool completes_within(std::chrono::milliseconds limit,
                              std::function<void()>     body)
 {
@@ -1760,49 +1772,62 @@ TEST_CASE("Client: auto-validation restarts after a listener stopped it") {
     client.stopAutoValidation();
 }
 
-TEST_CASE("Client: concurrent notifiers quiesce with the subscriber agreeing with state()") {
-    // End-to-end invariant under concurrency: once no notifier is running,
-    // the last thing a subscriber was told equals state(). It catches a
-    // reordered or dropped delivery that survives quiescence.
+TEST_CASE("Client: delivery quiesces in agreement with state() under contention") {
+    // Review caught the earlier version of this test producing exactly ONE
+    // event per round — the second thread always deduped, so there was no
+    // order for the channel to get wrong and the assertion was trivial. This
+    // version toggles the clock from four threads so events genuinely queue
+    // behind a delivery in progress, which is the path that has to stay
+    // ordered.
     //
-    // Honest limitation: it does NOT reliably catch the baton hand-back
-    // ordering (clearing delivering_ in a second critical section instead of
-    // atomically with the emptiness check). That window is a few instructions
-    // wide; review measured ~35 strand-condition hits per 30,000 rounds with
-    // instrumentation, but only one that became black-box observable. Do not
-    // read a green run here as proof of that ordering — read the comment in
-    // notify_() instead.
+    // Honest limitation, unchanged: this does NOT reliably catch the baton
+    // HAND-BACK ordering (clearing delivering_ in a second critical section).
+    // That window is a few instructions wide and needs instrumentation to see.
+    // What it does catch is a delivery that is dropped or left stale once the
+    // notifiers have quiesced. Read notify_()'s comment for the ordering
+    // argument; do not read a green run here as proof of it.
     auto cfg = make_config();
 
-    for (int round = 0; round < 200; ++round) {
-        std::atomic<int64_t> now{VALID_ACTIVE_NOW};
-        FailingTransport     offline;
-        MemoryStore          store;
+    std::atomic<int64_t> now{VALID_ACTIVE_NOW};
+    FailingTransport     offline;
+    MemoryStore          store;
 
-        seed_store_with_valid_lease(store, VALID_ACTIVE_NOW);
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW);
 
-        Client client(cfg, offline, store, [&]{ return now.load(); });
-        REQUIRE(client.state() == State::Licensed);
+    Client client(cfg, offline, store, [&]{ return now.load(); });
+    REQUIRE(client.state() == State::Licensed);
 
-        std::mutex         seen_mutex;
-        std::vector<State> seen;
-        auto sub = client.subscribe([&](State s) {
-            std::lock_guard<std::mutex> lock(seen_mutex);
-            seen.push_back(s);
-        });
-
-        std::thread a([&]{
-            now.store(VALID_ACTIVE_NOW - 2 * 3600);
-            client.refreshIfNeeded();
-        });
-        std::thread b([&]{ client.refreshIfNeeded(); });
-        a.join();
-        b.join();
-
+    std::mutex         seen_mutex;
+    std::vector<State> seen;
+    auto sub = client.subscribe([&](State s) {
         std::lock_guard<std::mutex> lock(seen_mutex);
-        REQUIRE_FALSE(seen.empty());
-        REQUIRE(seen.back() == client.state());
+        seen.push_back(s);
+    });
+
+    constexpr int kThreads = 4;
+    constexpr int kRounds  = 5000;
+
+    std::vector<std::thread> workers;
+    for (int t = 0; t < kThreads; ++t) {
+        workers.emplace_back([&, t]{
+            for (int r = 0; r < kRounds; ++r) {
+                now.store(((r + t) % 2) ? VALID_ACTIVE_NOW - 2 * 3600
+                                        : VALID_ACTIVE_NOW);
+                client.refreshIfNeeded();
+            }
+        });
     }
+    for (auto& w : workers) w.join();
+
+    // Quiesced. Settle the clock and poll once so the final state is
+    // unambiguous, then require the subscriber to have been told it.
+    now.store(VALID_ACTIVE_NOW);
+    client.refreshIfNeeded();
+
+    std::lock_guard<std::mutex> lock(seen_mutex);
+    REQUIRE_FALSE(seen.empty());
+    CHECK(seen.back() == State::Licensed);
+    CHECK(seen.back() == client.state());
 }
 
 TEST_CASE("Client: a start racing a stop cannot resurrect the stopped worker") {
@@ -1841,7 +1866,7 @@ TEST_CASE("Client: a start racing a stop cannot resurrect the stopped worker") {
 
     // Force a transition so the worker is parked inside the slow listener.
     nowv->store(VALID_ACTIVE_NOW - 2 * 3600);
-    while (!in_callback->load()) std::this_thread::yield();
+    REQUIRE(spin_until(std::chrono::seconds(5), [in_callback]{ return in_callback->load(); }));
 
     const bool ok = completes_within(std::chrono::seconds(10), [=] {
         std::thread s([=]{ client->stopAutoValidation(); });
@@ -1863,6 +1888,91 @@ TEST_CASE("Client: a start racing a stop cannot resurrect the stopped worker") {
 
     delete sub; delete client; delete store;
     delete offline; delete ticks; delete nowv; delete in_callback;
+}
+
+TEST_CASE("Client: a listener may stop or restart auto-validation while a stop is joining") {
+    // The worker must recognise ITSELF before it waits on anything. A listener
+    // is delivered on the worker thread and the contract permits it to call
+    // back in; if it blocks on the start/stop transition flag, it deadlocks
+    // against the very external stop that is parked in join() waiting for this
+    // thread to exit.
+    //
+    // av_thread_ is MOVED OUT during that transition, so its id is null
+    // exactly when the worker needs to identify itself — the id has to be
+    // tracked separately. Both the stop-from-listener and restart-from-
+    // listener shapes are covered.
+    auto  cfg = make_config();
+    cfg.autoValidationIntervalMs = 10;
+
+    // Heap-allocated and leaked on timeout: a hung run has threads parked
+    // inside these objects.
+    auto* nowv    = new std::atomic<int64_t>(VALID_ACTIVE_NOW);
+    auto* offline = new FailingTransport();
+    auto* store   = new MemoryStore();
+
+    seed_store_with_valid_lease(*store, VALID_ACTIVE_NOW);
+
+    auto* client = new Client(cfg, *offline, *store, [nowv]{ return nowv->load(); });
+
+    auto* in_callback = new std::atomic<bool>(false);
+    auto* released    = new std::atomic<bool>(false);
+    auto* did_call    = new std::atomic<bool>(false);
+
+    SUBCASE("the listener stops") {
+        auto* sub = new Subscription(client->subscribe(
+            [client, in_callback, released, did_call](State) {
+                in_callback->store(true);
+                // Stay inside the callback long enough for an external stop to
+                // reach join(), then call back in from the worker thread.
+                spin_until(std::chrono::seconds(5), [released]{ return released->load(); });
+                client->stopAutoValidation();
+                did_call->store(true);
+            }));
+
+        client->startAutoValidation();
+        nowv->store(VALID_ACTIVE_NOW - 2 * 3600);
+        REQUIRE(spin_until(std::chrono::seconds(5), [in_callback]{ return in_callback->load(); }));
+
+        const bool ok = completes_within(std::chrono::seconds(10), [=] {
+            std::thread ext([=]{ client->stopAutoValidation(); });
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            released->store(true);   // let the listener call back in
+            ext.join();
+        });
+
+        REQUIRE(ok);
+        CHECK(did_call->load());
+        if (ok) delete sub;
+    }
+
+    SUBCASE("the listener restarts") {
+        auto* sub = new Subscription(client->subscribe(
+            [client, in_callback, released, did_call](State) {
+                in_callback->store(true);
+                spin_until(std::chrono::seconds(5), [released]{ return released->load(); });
+                client->startAutoValidation();
+                did_call->store(true);
+            }));
+
+        client->startAutoValidation();
+        nowv->store(VALID_ACTIVE_NOW - 2 * 3600);
+        REQUIRE(spin_until(std::chrono::seconds(5), [in_callback]{ return in_callback->load(); }));
+
+        const bool ok = completes_within(std::chrono::seconds(10), [=] {
+            std::thread ext([=]{ client->stopAutoValidation(); });
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            released->store(true);
+            ext.join();
+        });
+
+        REQUIRE(ok);
+        CHECK(did_call->load());
+        if (ok) delete sub;
+    }
+
+    client->stopAutoValidation();
+    delete client; delete store; delete offline;
+    delete nowv; delete in_callback; delete released; delete did_call;
 }
 
 TEST_CASE("Client: an anchor ahead of the clock does not pass the maxOfflineDays bound") {

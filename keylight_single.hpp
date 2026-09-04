@@ -2353,6 +2353,14 @@ public:
 
     // Destructor: stops and joins any running auto-validation thread so the
     // thread cannot outlive the Client (no detached threads, no std::terminate).
+    //
+    // It does NOT fence an event delivery already in flight. The thread
+    // draining the event queue need not be the auto-validation worker — any
+    // thread that calls refreshIfNeeded()/validate() can be holding the
+    // delivery baton — so destroying a Client while another thread is inside
+    // notify_() is a use-after-free. Own the Client for as long as any thread
+    // can still call into it; the LISTENER CONTRACT's "do not destroy from a
+    // callback" is the special case, not the whole rule.
     ~Client() {
         stopAutoValidation();
     }
@@ -2761,19 +2769,6 @@ public:
                           [this]{ return deactivate(); });
     }
 
-    /// Claims the start/stop transition for the duration of a scope, so no
-    /// other caller can act on av_thread_ while it is moved out for a join.
-    /// Releases on unwind — a std::thread constructor that throws must not
-    /// wedge every later start and stop.
-    struct TransitionGuard {
-        Client* self;
-        explicit TransitionGuard(Client* c) : self(c) { self->av_transition_ = true; }
-        ~TransitionGuard() {
-            self->av_transition_ = false;
-            self->av_transition_cv_.notify_all();
-        }
-    };
-
     // ── Background auto-validation ────────────────────────────────────────
 
     /// Spawn a single background thread that periodically calls
@@ -2793,6 +2788,16 @@ public:
     void startAutoValidation() {
         std::unique_lock<std::mutex> lock(av_mutex_);
 
+        // Recognise ourselves FIRST, before any wait. A listener can be
+        // delivered on the worker thread and call back in here — the contract
+        // permits it — and the worker must never block on a transition, or it
+        // deadlocks against the very stop that is waiting to join it.
+        //
+        // The id is tracked separately because av_thread_ is MOVED OUT during
+        // a transition, so av_thread_.get_id() is the null id exactly when the
+        // worker most needs to identify itself.
+        if (std::this_thread::get_id() == av_worker_id_) return;
+
         // Only one start/stop transition at a time. Both release av_mutex_ to
         // join, and av_thread_ is empty across that window — so without this a
         // concurrent start sees "no worker", skips the reap, clears av_stop_
@@ -2801,12 +2806,7 @@ public:
         // blocked until something else sets av_stop_ again.
         av_transition_cv_.wait(lock, [this]{ return !av_transition_; });
 
-        if (av_thread_.joinable()) {
-            if (!av_stop_) return;   // genuinely running — no-op
-            // Cannot reap ourselves; the caller is the worker. It exits when
-            // this listener returns, and the next start reaps it.
-            if (av_thread_.get_id() == std::this_thread::get_id()) return;
-        }
+        if (av_thread_.joinable() && !av_stop_) return;   // running — no-op
 
         TransitionGuard transition{this};
 
@@ -2818,6 +2818,7 @@ public:
             lock.unlock();
             stale.join();
             lock.lock();
+            av_worker_id_ = std::thread::id{};   // reaped; ids get recycled
         }
 
         av_stop_ = false;
@@ -2835,6 +2836,7 @@ public:
                 lk.lock();
             }
         });
+        av_worker_id_ = av_thread_.get_id();
     }
 
     /// Signal the background thread to stop and join it.
@@ -2843,22 +2845,34 @@ public:
     /// instead of blocking for the full interval.
     void stopAutoValidation() {
         std::unique_lock<std::mutex> lock(av_mutex_);
-        // Same reason as startAutoValidation(): do not act on av_thread_ while
-        // another transition has it moved out.
+
+        // Called from the auto-validation thread itself — a listener can be
+        // delivered on it, and the contract permits calling back in. Signal
+        // and return: never wait, never join.
+        //
+        // Waiting would deadlock against a concurrent external stop that is
+        // already parked in join() waiting for THIS thread. Joining would
+        // self-join: join() throws EDEADLK, the std::thread is destroyed
+        // still-joinable, and ~thread() calls std::terminate() — an abort no
+        // caller can catch. Signalled and left owned by av_thread_, the worker
+        // exits as soon as this listener returns, and the next start or stop
+        // from any other thread reaps it.
+        //
+        // Tracked separately from av_thread_.get_id() because av_thread_ is
+        // MOVED OUT during a transition, so its id is null exactly when the
+        // worker most needs to identify itself.
+        if (std::this_thread::get_id() == av_worker_id_) {
+            av_stop_ = true;
+            av_cv_.notify_all();
+            return;
+        }
+
+        // Do not act on av_thread_ while another transition has it moved out.
         av_transition_cv_.wait(lock, [this]{ return !av_transition_; });
 
         if (!av_thread_.joinable()) return; // not running — no-op
         av_stop_ = true;
         av_cv_.notify_all();
-
-        // Called from the auto-validation thread itself — a listener can be
-        // delivered on it. Joining here would self-join: join() throws
-        // EDEADLK, the std::thread is destroyed still-joinable, and ~thread()
-        // calls std::terminate() — an abort no caller can catch. Leave the
-        // thread owned by av_thread_ instead: it has been signalled, so it
-        // exits as soon as this listener returns, and the next start or stop
-        // from any other thread reaps it.
-        if (av_thread_.get_id() == std::this_thread::get_id()) return;
 
         TransitionGuard transition{this};
         std::thread to_join = std::move(av_thread_); // move out before unlocking
@@ -2866,6 +2880,7 @@ public:
         lock.unlock();
         if (to_join.joinable()) to_join.join();
         lock.lock();
+        av_worker_id_ = std::thread::id{};   // reaped; ids get recycled
     }
 
     // ── Launch / refresh API ──────────────────────────────────────────────
@@ -3167,6 +3182,24 @@ private:
     // out and av_mutex_ released for a join. Guarded by av_mutex_.
     bool                    av_transition_ = false;
     std::condition_variable av_transition_cv_;
+    // The worker's id, kept separately because av_thread_ is moved out during
+    // a transition. Cleared after every join — thread ids are recycled, and a
+    // stale one would let an unrelated thread believe it is the worker.
+    // Guarded by av_mutex_.
+    std::thread::id         av_worker_id_{};
+
+    /// Claims the start/stop transition for the duration of a scope, so no
+    /// other caller can act on av_thread_ while it is moved out for a join.
+    /// Releases on unwind — a std::thread constructor that throws must not
+    /// wedge every later start and stop.
+    struct TransitionGuard {
+        Client* self;
+        explicit TransitionGuard(Client* c) : self(c) { self->av_transition_ = true; }
+        ~TransitionGuard() {
+            self->av_transition_ = false;
+            self->av_transition_cv_.notify_all();
+        }
+    };
     bool                    av_stop_  = false;
     std::thread             av_thread_;
 
@@ -4071,7 +4104,10 @@ private:
             }
 
             // Copy the callbacks out so a listener can unsubscribe from inside
-            // its own callback without invalidating the iteration.
+            // its own callback without invalidating the iteration. A bad_alloc
+            // here strands whatever is left in pending_ — the guard hands the
+            // baton back and nothing re-queues those events. OOM-only, and
+            // strictly better than the wedged channel it replaced.
             std::vector<std::function<void(State)>> cbs;
             {
                 std::lock_guard<std::mutex> lock(listeners_mutex_);
