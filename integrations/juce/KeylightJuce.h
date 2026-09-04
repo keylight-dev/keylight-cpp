@@ -19,12 +19,19 @@
  * after every SDK state transition.  No mutex, no allocation, no juce::String
  * construction happens on the audio thread — just two relaxed atomic loads.
  *
- * state_snapshot_ is re-read from client_->state() on every transition — it is
- * NOT the State handed to the subscription callback.  Those two differ: the
- * callback carries the raw resolved state, while Client::state() additionally
- * fails closed when the system clock has been rolled back.  Storing the
- * callback's parameter would drop that guard on the first transition and leave
- * the plugin unlocked against a moved clock.
+ * state_snapshot_ mirrors Client::state(), which fails closed when the system
+ * clock has been rolled back.  The SDK's subscription callback delivers that
+ * same guarded value — the SDK reports every event through the guard and
+ * dedupes on the reported value — so storing the callback's parameter is both
+ * correct and the only way the audio thread, the message thread and
+ * client_->state() cannot disagree.
+ * Do not "optimise" any of the three to a different source.
+ *
+ * The guard also emits its own events: a rolled-back clock changes no raw
+ * state, so the SDK fires the transition off refreshIfNeeded(), which
+ * startAutoValidation() ticks.  Call startAutoValidation(): without it the
+ * snapshot only moves on real state changes and a mid-session rollback would
+ * never reach the audio thread.
  *
  * JUCE version compatibility: JUCE 7 and JUCE 8.
  *
@@ -216,12 +223,13 @@ public:
             // Update atomics (may be called from any thread, but always from
             // our own background thread — never from the audio thread).
             //
-            // Store client_->state(), NOT `newState`. The callback carries the
-            // raw resolved state; Client::state() additionally fails closed on
-            // a rolled-back system clock. Storing the parameter would overwrite
-            // the guarded seed on the very first transition and disable the
-            // guard for the rest of the session. Still a single atomic store.
-            state_snapshot_.store(client_->state(), std::memory_order_relaxed);
+            // `newState` IS the guarded state: the SDK reports subscription
+            // events through the same clock guard as Client::state(). Use it
+            // rather than re-reading client_->state(), so the value latched
+            // for the audio thread is byte-for-byte the one handed to the
+            // message thread below — re-reading could straddle a clock change
+            // and leave the two disagreeing. Still a single atomic store.
+            state_snapshot_.store(newState, std::memory_order_relaxed);
             refresh_entitlement_cache_();
 
             // Anonymous funnel beacon. Swift's LicenseManager reports
