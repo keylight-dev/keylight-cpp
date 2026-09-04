@@ -697,6 +697,18 @@ public:
             if (!av_thread_.joinable()) return; // not running — no-op
             av_stop_ = true;
             av_cv_.notify_all();
+
+            // Called from the auto-validation thread itself — i.e. from a
+            // state-change listener, which is delivered on whichever thread
+            // caused the transition. Joining here would self-join: join()
+            // throws EDEADLK, the std::thread is destroyed still-joinable,
+            // and ~thread() calls std::terminate() — an abort no caller can
+            // catch. Leave the thread owned by av_thread_ instead: it has
+            // been signalled, so it exits as soon as this listener returns,
+            // and the next stopAutoValidation() or ~Client() from any other
+            // thread joins it properly.
+            if (av_thread_.get_id() == std::this_thread::get_id()) return;
+
             to_join = std::move(av_thread_); // move out before unlocking
         }
         // Join outside the lock so the worker can re-acquire av_mutex_ to exit.
@@ -809,12 +821,19 @@ public:
     /// The callback receives what state() would return, so an event-driven
     /// paywall and a query-driven one cannot disagree.
     ///
-    /// LISTENER CONTRACT: the callback MUST NOT call back into this Client
-    /// (validate(), refreshIfNeeded(), activate(), …). Delivery is serialised
-    /// so that events cannot be reordered, and re-entering from inside a
-    /// callback deadlocks. Unsubscribing from inside your own callback IS
-    /// supported. If you need to act on the SDK in response to an event, hand
-    /// off to your own thread — this is what the JUCE adapter does.
+    /// LISTENER CONTRACT:
+    ///   - No lock is held while your callback runs, so it may call back into
+    ///     this Client (validate(), refreshIfNeeded(), …) and may take your
+    ///     own locks. A re-entrant call queues its event rather than
+    ///     recursing; it may be delivered by a different thread.
+    ///   - Unsubscribing from inside your own callback is supported.
+    ///   - Do NOT destroy this Client from a callback. ~Client() joins the
+    ///     auto-validation thread, and a listener delivered on that thread
+    ///     cannot join itself. stopAutoValidation() handles that case (it
+    ///     signals and returns); the destructor cannot.
+    ///   - Events are delivered in order, but not synchronously: the call
+    ///     that caused a transition may return before the event has been
+    ///     delivered by whichever thread holds the delivery baton.
     ///
     /// The callback runs on whichever thread caused the transition, which for
     /// startAutoValidation() is the SDK's background thread. Marshal to your
@@ -964,10 +983,13 @@ private:
     mutable std::mutex        listeners_mutex_;
     std::vector<Listener>     listeners_;
     uint64_t                  next_listener_id_ = 0;
-    // Serialises the whole notify_() sequence — dedupe AND delivery — so two
-    // notifiers cannot deliver out of order. Always acquired BEFORE
-    // listeners_mutex_ and never while holding cache_mutex_ or av_mutex_.
+    // Guards the event ORDER (pending_ + delivering_ + the dedupe), never the
+    // delivery itself — see notify_(). Always acquired BEFORE listeners_mutex_
+    // and never while holding cache_mutex_ or av_mutex_. Never held across a
+    // callback, so it cannot participate in an application's lock cycle.
     std::mutex                notify_mutex_;
+    std::vector<State>        pending_;              // events in delivery order
+    bool                      delivering_ = false;   // the delivery baton
 
     // ── Background auto-validation ────────────────────────────────────────
     // av_mutex_ guards av_stop_ and av_thread_.
@@ -1789,43 +1811,76 @@ private:
     /// raw state, so a raw-value dedupe would never fire and a host that
     /// caches the last event — JUCE's audio-thread snapshot does exactly
     /// that — would sit on a stale Licensed for the rest of the session.
-    /// refreshIfNeeded() polls this, and startAutoValidation() ticks
-    /// refreshIfNeeded(), so both the rollback and the later correction
-    /// reach subscribers without any new machinery.
-    /// THREAD SAFETY: notify_mutex_ is held across the callbacks, not just
-    /// across the dedupe. Publishing the dedupe and THEN delivering lets two
+    /// refreshIfNeeded() and validate() both poll this, and
+    /// startAutoValidation() ticks refreshIfNeeded(), so both the rollback and
+    /// the later correction reach subscribers without any new machinery.
+    /// THREAD SAFETY: the ORDER of events is fixed under notify_mutex_; the
+    /// DELIVERY of them happens with no lock held.
+    ///
+    /// Both halves are load-bearing, and each was a shipped bug at some point
+    /// in this branch:
+    ///
+    /// Publishing the dedupe and then delivering outside any lock lets two
     /// notifiers interleave — both pass the dedupe, then deliver in whatever
     /// order the scheduler picks, and because the dedupe is already satisfied
-    /// no later poll ever corrects it. That leaves a subscriber permanently
-    /// contradicting state(), in both directions: stale-Invalid for a paying
-    /// customer, and stale-Licensed on a rolled-back clock, which is the very
-    /// fail-open this guard exists to close. It is not hypothetical — the JUCE
-    /// callback does a blocking HTTP POST and an ed25519 verify before it
-    /// returns, while the auto-validation thread ticks refreshIfNeeded()
-    /// concurrently with any dispatched validate().
+    /// no later poll corrects it. The subscriber is left permanently
+    /// contradicting state(), including stale-Licensed on a rolled-back clock,
+    /// which is the very fail-open this guard exists to close.
     ///
-    /// The cost is a listener contract: a listener MUST NOT call back into
-    /// this Client. See subscribe(). That was never safe anyway — before this
-    /// guard existed, a listener calling validate() would recurse straight
-    /// back into the delivery loop.
+    /// Holding the lock across the callbacks fixes that and buys a deadlock.
+    /// It puts an SDK-internal lock into the APPLICATION's lock-order graph:
+    /// a callback that takes the app's own model mutex — the most obvious
+    /// thing a state-change handler does — deadlocks against any thread that
+    /// holds that mutex across a Client call, and refreshIfNeeded() on
+    /// focus/resume is exactly that. No contract can rescue it, because the
+    /// rule would have to be "your callback must not touch any lock any
+    /// thread holds across any Client call", which nobody can audit.
+    ///
+    /// So: append to pending_ under the lock, atomically with the dedupe, and
+    /// let ONE thread hold the delivery baton and drain the queue with no lock
+    /// held. Order is total, no application lock can invert against ours, and
+    /// a callback may re-enter the Client freely — it just queues.
+    ///
+    /// Consequence to know: validate()/refreshIfNeeded() can return before an
+    /// event queued concurrently has been delivered by the thread holding the
+    /// baton. Delivery is ordered, not synchronous.
     void notify_() {
-        std::lock_guard<std::mutex> notify_lock(notify_mutex_);
-
-        const State reported = state();
-        if (last_reported_.exchange(reported) == reported) return;
-
-        // Copy the callbacks out so a listener can unsubscribe from inside
-        // its own callback without invalidating the iteration.
-        std::vector<std::function<void(State)>> cbs;
         {
-            std::lock_guard<std::mutex> lock(listeners_mutex_);
-            cbs.reserve(listeners_.size());
-            for (const auto& l : listeners_) {
-                cbs.push_back(l.cb);
-            }
+            std::lock_guard<std::mutex> lock(notify_mutex_);
+            const State reported = state();
+            if (last_reported_.exchange(reported) == reported) return;
+            // Order is decided HERE, atomically with the dedupe. Everything
+            // after this point may run in any order on any thread.
+            pending_.push_back(reported);
+            if (delivering_) return;   // another thread owns the baton
+            delivering_ = true;
         }
-        for (const auto& cb : cbs) {
-            cb(reported);
+
+        for (;;) {
+            State ev;
+            {
+                std::lock_guard<std::mutex> lock(notify_mutex_);
+                if (pending_.empty()) {
+                    delivering_ = false;   // hand the baton back
+                    return;
+                }
+                ev = pending_.front();
+                pending_.erase(pending_.begin());
+            }
+
+            // Copy the callbacks out so a listener can unsubscribe from inside
+            // its own callback without invalidating the iteration.
+            std::vector<std::function<void(State)>> cbs;
+            {
+                std::lock_guard<std::mutex> lock(listeners_mutex_);
+                cbs.reserve(listeners_.size());
+                for (const auto& l : listeners_) {
+                    cbs.push_back(l.cb);
+                }
+            }
+            for (const auto& cb : cbs) {
+                cb(ev);   // NO lock held here. This is the whole point.
+            }
         }
     }
 

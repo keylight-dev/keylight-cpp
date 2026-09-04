@@ -1502,10 +1502,15 @@ TEST_CASE("Client: concurrent notifiers cannot deliver events out of order") {
     std::mutex         seen_mutex;
     std::vector<State> seen;
 
+    // Set once A is provably inside its callback, so B starts from a known
+    // point instead of a sleep the CI scheduler is free to ignore.
+    std::atomic<bool> a_delivering{false};
+
     // A deliberately slow subscriber, slower on the state the FIRST notifier
-    // carries, so an unserialised delivery inverts: the second notifier
+    // carries, so an unordered delivery inverts: the second notifier
     // overtakes the first and the last event seen is the STALE one.
     auto sub = client.subscribe([&](State s) {
+        a_delivering.store(true);
         std::this_thread::sleep_for(
             std::chrono::milliseconds(s == State::Invalid ? 200 : 10));
         std::lock_guard<std::mutex> lock(seen_mutex);
@@ -1516,9 +1521,10 @@ TEST_CASE("Client: concurrent notifiers cannot deliver events out of order") {
     now.store(VALID_ACTIVE_NOW - 2 * 3600);
     std::thread a([&]{ client.refreshIfNeeded(); });
 
-    // Notifier B sees the clock corrected, and starts while A is still inside
-    // its callback.
-    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    // Notifier B sees the clock corrected, and starts only once A is actually
+    // delivering. Without this the two can both dedupe to nothing and the
+    // test would pass vacuously on a heavily loaded machine.
+    while (!a_delivering.load()) std::this_thread::yield();
     now.store(VALID_ACTIVE_NOW);
     std::thread b([&]{ client.refreshIfNeeded(); });
 
@@ -1533,6 +1539,117 @@ TEST_CASE("Client: concurrent notifiers cannot deliver events out of order") {
     // paywall and a feature gate that disagree, with no event left to fix it.
     CHECK(seen.back() == client.state());
     CHECK(seen.back() == State::Licensed);
+}
+
+// Run `body` with a watchdog. A regression here is a DEADLOCK, and a test
+// that hangs forever is worse than one that fails: it takes CI down with it
+// and tells you nothing. On timeout we fail loudly and deliberately leak the
+// scenario rather than tearing down objects threads are still parked in.
+static bool completes_within(std::chrono::milliseconds limit,
+                             std::function<void()>     body)
+{
+    auto done = std::make_shared<std::atomic<bool>>(false);
+    std::thread runner([done, body]{ body(); done->store(true); });
+
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    while (!done->load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    if (done->load()) { runner.join(); return true; }
+    runner.detach();   // parked on a lock; joining would hang the suite
+    return false;
+}
+
+TEST_CASE("Client: a listener may hold the application's own locks") {
+    // Holding an SDK lock across a listener puts that lock into the
+    // APPLICATION's lock-order graph, and the cycle needs no contract
+    // violation to close:
+    //
+    //   listener (SDK thread): holds SDK lock -> wants app_mutex
+    //   app thread:            holds app_mutex -> calls refreshIfNeeded()
+    //                                             -> wants SDK lock
+    //
+    // Taking your own mutex in a state-change handler is the most ordinary
+    // thing a handler does, and README recommends refreshIfNeeded() on
+    // focus/resume. So delivery must happen with no SDK lock held.
+    //
+    // Leaked on timeout, hence the raw new: a deadlocked run has threads
+    // parked inside these objects.
+    auto* store = new MemoryStore();
+    auto* offline = new FailingTransport();
+    auto* nowv = new std::atomic<int64_t>(VALID_ACTIVE_NOW);
+
+    seed_store_with_valid_lease(*store, VALID_ACTIVE_NOW);
+
+    auto  cfg    = make_config();
+    auto* client = new Client(cfg, *offline, *store, [nowv]{ return nowv->load(); });
+    REQUIRE(client->state() == State::Licensed);
+
+    auto* app_mutex   = new std::mutex();
+    auto* in_callback = new std::atomic<bool>(false);
+
+    auto* sub = new Subscription(client->subscribe([app_mutex, in_callback](State) {
+        in_callback->store(true);
+        std::lock_guard<std::mutex> lock(*app_mutex);   // the app's own lock
+    }));
+
+    const bool ok = completes_within(std::chrono::seconds(5), [=] {
+        // The SDK thread: transition while the app thread holds its mutex.
+        nowv->store(VALID_ACTIVE_NOW - 2 * 3600);
+        std::thread sdk([=]{ client->refreshIfNeeded(); });
+
+        {
+            std::lock_guard<std::mutex> lock(*app_mutex);
+            while (!in_callback->load()) std::this_thread::yield();
+            // The app thread, holding its own lock, calls into the SDK.
+            client->refreshIfNeeded();
+        }
+
+        sdk.join();
+    });
+
+    CHECK(ok);
+
+    if (ok) {
+        delete sub; delete client; delete offline;
+        delete store; delete nowv; delete app_mutex; delete in_callback;
+    }
+}
+
+TEST_CASE("Client: a listener may call back into the Client") {
+    // Delivery holds no lock, so re-entry queues rather than recursing or
+    // hanging. An integrator should not have to hand off to their own thread
+    // just to act on an event.
+    auto* store   = new MemoryStore();
+    auto* offline = new FailingTransport();
+    auto* nowv    = new std::atomic<int64_t>(VALID_ACTIVE_NOW);
+
+    seed_store_with_valid_lease(*store, VALID_ACTIVE_NOW);
+
+    auto  cfg    = make_config();
+    auto* client = new Client(cfg, *offline, *store, [nowv]{ return nowv->load(); });
+    REQUIRE(client->state() == State::Licensed);
+
+    auto* calls = new std::atomic<int>(0);
+    auto* sub   = new Subscription(client->subscribe([client, calls](State) {
+        if (calls->fetch_add(1) == 0) {
+            (void)client->validate();          // re-enter
+            (void)client->refreshIfNeeded();   // and again
+        }
+    }));
+
+    const bool ok = completes_within(std::chrono::seconds(5), [=] {
+        nowv->store(VALID_ACTIVE_NOW - 2 * 3600);
+        client->refreshIfNeeded();
+    });
+
+    CHECK(ok);
+    if (ok) {
+        CHECK(calls->load() >= 1);
+        delete sub; delete client; delete offline;
+        delete store; delete nowv; delete calls;
+    }
 }
 
 TEST_CASE("Client: an anchor ahead of the clock does not pass the maxOfflineDays bound") {
