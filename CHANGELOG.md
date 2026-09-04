@@ -56,18 +56,28 @@
   its own.** Subscribers registered with `subscribe()` / `on()` are handed
   what `state()` would return, so a paywall driven by the event stream cannot
   disagree with one driven by the query API. Because a clock that moves
-  changes no underlying state, the event is raised from `refreshIfNeeded()` —
-  which `startAutoValidation()` already ticks — in both directions: once when
-  the rollback is detected, and again when the clock becomes honest. Events
+  changes no underlying state, the event is raised from `refreshIfNeeded()` and
+  `validate()` — `startAutoValidation()` already ticks the former — in both
+  directions: once when the rollback is detected, and again when the clock
+  becomes honest. Events
   are deduplicated on the reported value, so a host that caches the last one
   cannot be left holding a stale `Licensed`.
-- **Breaking (listener contract):** state-change delivery is now serialised, so
-  concurrent notifiers cannot reorder events and leave a subscriber holding a
-  value `state()` contradicts. A listener therefore **must not call back into
-  the `Client`** — it will deadlock. Unsubscribing from inside your own
-  callback is still supported. Re-entering was never safe (a listener calling
-  `validate()` recursed straight back into delivery), but it now fails loudly
-  instead of quietly.
+  Events are ordered: concurrent notifiers cannot deliver out of order and
+  leave a subscriber holding a value `state()` contradicts. Ordering is fixed
+  under an SDK lock, but delivery happens with **no lock held**, so a callback
+  may take your own locks and may call back into the `Client` — a re-entrant
+  call queues its event rather than recursing, and may be delivered by a
+  different thread. Do not destroy the `Client` from a callback.
+- Because `validate()` also raises the guard's event, a `validate()` that spans
+  a clock correction now emits two events (`Invalid`, then the resolved state)
+  where it previously emitted none. Both are accurate — during the round trip
+  `state()` genuinely reported `Invalid` — but debounce your paywall if you
+  drive UI straight off the event.
+- `stopAutoValidation()` called from a state-change listener that was delivered
+  on the auto-validation thread no longer self-joins. It previously threw
+  `EDEADLK` from `join()` and then aborted the process via `std::terminate` in
+  `~thread()`; it now signals the thread and returns, leaving the join to the
+  next caller.
 - **Breaking:** `deactivate()` returns the server's error instead of always
   succeeding. The local cache is still cleared either way.
 - Errors from the API now carry the server's message ("License key not found",

@@ -251,9 +251,10 @@ are detected on a refresh, and a plugin instance can live for days.
 The clock-rollback guard is the one worth spelling out. `Licensing::state()`
 and `hasFeature()` read atomics that are updated from the SDK's state-change
 events, and a clock that moves changes no underlying state — so the SDK raises
-that event from `refreshIfNeeded()`, which `startAutoValidation()` ticks. Skip
-the tick and a mid-session rollback reaches `underlying().state()` but never
-reaches the audio thread, which keeps reporting the state it last saw.
+that event from `refreshIfNeeded()` or `validate()`, and `startAutoValidation()`
+ticks the former. Skip the tick and a mid-session rollback reaches
+`underlying().state()` but never reaches the audio thread, which keeps
+reporting the state it last saw.
 
 We do not start it for you: DAWs instantiate plugins while scanning, and the
 SDK deliberately makes no network call on that path.

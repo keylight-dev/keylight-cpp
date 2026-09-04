@@ -270,14 +270,16 @@ allocation-free — an exception escaping it is `std::terminate`, on whichever t
 `state()`. The default (`std::time`) already satisfies this.
 
 Subscribers registered with `subscribe()` receive the same value `state()` would return, so a
-paywall driven by events and one driven by the query API cannot disagree. Delivery is
-serialised, so concurrent notifiers cannot reorder events — the price is that your callback
-**must not call back into the `Client`**, which deadlocks. Unsubscribing from inside your own
-callback is fine; anything else, hand off to your own thread. The clock-rollback
-guard raises its own event in both directions — once when the rollback is detected, and again
-when the clock becomes honest — but only from `refreshIfNeeded()`, since a moving clock changes
-no underlying state. Call `startAutoValidation()` (or `refreshIfNeeded()` on focus/resume) in a
-long-running host, or a mid-session rollback will reach `state()` and never reach your callback.
+paywall driven by events and one driven by the query API cannot disagree. Events are delivered
+in order, with no SDK lock held — your callback may take your own locks and may call back into
+the `Client`; a re-entrant call queues its event rather than recursing, so it may be delivered
+by a different thread. The one thing not to do is destroy the `Client` from a callback.
+
+The clock-rollback guard raises its own event in both directions — once when the rollback is
+detected, and again when the clock becomes honest. Because a moving clock changes no underlying
+state, that event comes from `refreshIfNeeded()` or `validate()`. Call `startAutoValidation()`
+(or one of those on focus/resume) in a long-running host, or a mid-session rollback will reach
+`state()` and never reach your callback.
 
 ## Trials
 

@@ -251,10 +251,10 @@ public:
             // round trip, once per 24h. Wrap that call in your own thread if
             // that matters to you.
             //
-            // Do not call back into the SDK from here beyond this: the SDK
-            // serialises event delivery, so re-entering it deadlocks. The
-            // calls below are safe — reportKeylessState and hasEntitlement
-            // never raise a state change.
+            // Calling back into the SDK from here is allowed — it holds no
+            // lock during delivery, and a re-entrant call queues its event
+            // rather than recursing. The one thing not to do is destroy the
+            // Client (or this Licensing) from inside the callback.
             switch (newState)
             {
                 case keylight::State::Trial:
