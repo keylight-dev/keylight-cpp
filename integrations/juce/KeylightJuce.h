@@ -10,15 +10,21 @@
  * The audio render thread (processBlock) MUST NOT block, allocate, or lock.
  * All licensing network I/O runs on a background std::thread and delivers
  * results to the message thread via juce::MessageManager::callAsync.
- * The only data the audio thread ever touches are two std::atomic fields:
+ * The only data the audio thread ever touches are three std::atomic fields:
  *
- *   std::atomic<keylight::State>  state_snapshot_   — mirrors Client::state()
- *   std::atomic<bool>             pro_enabled_       — mirrors hasEntitlement("pro")
+ *   std::atomic<keylight::State>  state_snapshot_             — Client::state()
+ *   std::atomic<bool>             pro_enabled_                — hasEntitlement("pro")
+ *   std::atomic<bool>             generic_entitlement_enabled_ — always false
  *
- * These are updated in the subscription callback, on whichever thread is
- * draining the SDK's event queue, after every SDK state transition.  No mutex,
- * no allocation, no juce::String construction happens on the audio thread —
- * just two relaxed atomic loads.
+ * The first two are updated in the subscription callback, on whichever thread
+ * is draining the SDK's event queue, after every SDK state transition. The
+ * third is a placeholder nothing writes — see hasFeature().
+ *
+ * No mutex, no allocation and no juce::String construction happens on the
+ * audio thread: state() is one relaxed load, and hasFeature() takes a
+ * juce::StringRef so a "pro" literal never materialises a temporary
+ * juce::String. That last part is why the signature is StringRef and not
+ * const juce::String&.
  *
  * state_snapshot_ mirrors Client::state(), which fails closed when the system
  * clock has been rolled back.  The SDK's subscription callback delivers that
@@ -600,25 +606,30 @@ public:
     /// the SDK subscription.
     ///
     /// For the common "pro" entitlement: call hasFeature("pro") — reads
-    /// pro_enabled_ atomically.  For other entitlements, reads the generic
-    /// snapshot (which caches the last hasEntitlement result for exactly the
-    /// feature key last subscribed).
+    /// pro_enabled_ atomically.
     ///
-    /// If you gate on multiple entitlements, pre-cache each one in a separate
-    /// std::atomic<bool> member via the subscription callback (see README).
-    // NOTE: noexcept / lock-free guarantee is for RELEASE builds.  In JUCE
-    // debug builds, juce::String comparison may invoke debug instrumentation
-    // that allocates; only the atomics themselves are unconditionally lock-free.
-    bool hasFeature(const juce::String& feature) const noexcept
+    /// ANY OTHER KEY ALWAYS RETURNS FALSE. generic_entitlement_enabled_ is a
+    /// placeholder that nothing ever writes; it is not a cache of "the feature
+    /// key last subscribed". If you gate on a second entitlement, pre-cache it
+    /// yourself in your own std::atomic<bool>, refreshed from the subscription
+    /// callback (see README). Fails closed, but silently — do not discover
+    /// this from behaviour.
+    ///
+    /// Takes juce::StringRef, NOT const juce::String&. That is load-bearing:
+    /// binding a "pro" literal to a const String& materialises a temporary
+    /// juce::String, which HEAP-ALLOCATES — in every build, release included —
+    /// and the documented call site for this method is inside processBlock.
+    /// StringRef wraps the pointer without copying, so the audio thread does
+    /// no allocation. Do not "simplify" this signature back.
+    bool hasFeature(juce::StringRef feature) const noexcept
     {
         // Fast path for the canonical "pro" entitlement — atomic bool.
         // This covers the vast majority of plugins that have a single pro tier.
         if (feature == "pro")
             return pro_enabled_.load(std::memory_order_relaxed);
 
-        // Fallback: read generic cached entitlement flag.
-        // Updated by refresh_entitlement_cache_ on state transitions.
-        // Still lock-free (atomic bool).
+        // Any other key: always false. See the note above — nothing writes
+        // generic_entitlement_enabled_.
         return generic_entitlement_enabled_.load(std::memory_order_relaxed);
     }
 

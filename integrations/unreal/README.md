@@ -200,9 +200,10 @@ every listener callback for every queued event if that worker is delivering.
 **Your listeners set that ceiling** — nothing in the SDK caps it. `Configure()`
 is the one to watch, since it runs mid-session where a hitch is visible.
 
-Blocking is not the only hazard here. An in-flight `Activate()`/`Validate()`
-`AsyncTask` holds a raw pointer to the `Client` and dereferences it before any
-weak-pointer check, so destroying the client under it is a use-after-free.
+Blocking is not the only hazard here. An in-flight `Activate()`, `Validate()`
+or `Deactivate()` `AsyncTask` holds a raw pointer to the `Client` and
+dereferences it before any weak-pointer check, so destroying the client under
+it is a use-after-free.
 `Configure()` you can gate on "no request in flight"; `Deinitialize()` is called
 by the engine at shutdown, where you often cannot — keep your own in-flight
 counter and drain it before shutdown if that matters for your title.

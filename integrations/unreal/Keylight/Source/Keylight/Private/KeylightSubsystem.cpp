@@ -71,7 +71,7 @@ void UKeylightSubsystem::Deinitialize()
     // Stop background auto-validation, then tear down the client.
     //
     // SAME DANGLING-POINTER HAZARD AS Configure(), and harder to avoid here.
-    // An in-flight Activate()/Validate() AsyncTask holds a raw ClientPtr to
+    // An in-flight Activate()/Validate()/Deactivate() AsyncTask holds a raw ClientPtr to
     // this Client_ and dereferences it before any WeakThis check; resetting
     // Client_ under it is a use-after-free. Configure() can be gated on "no
     // request in flight", but Deinitialize() is called by the engine at

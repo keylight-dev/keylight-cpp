@@ -270,8 +270,8 @@ deleted, and there is nothing else.
 | Method / event | Thread | Blocks? |
 |---|---|---|
 | `state()` | **Any thread**, audio-thread safe | **No.** One relaxed atomic load |
-| `hasFeature(feature)` | **Any thread**, audio-thread safe | **No.** A `juce::String` comparison, then one relaxed atomic load. See the caveat below |
-| `startAutoValidation()` / `stopAutoValidation()` | **Any thread** | **No.** Neither joins nor waits |
+| `hasFeature(feature)` | **Any thread**, audio-thread safe | **No.** Takes `juce::StringRef`, so a literal allocates nothing; then one relaxed atomic load. Any key other than `"pro"` is always `false` — see below |
+| `startAutoValidation()` / `stopAutoValidation()` | **Any thread** | **Effectively no.** Neither waits on a worker, a network call or a listener. Each does reap already-exited workers, so the only cost is thread teardown |
 | `onStateChanged` | Fires on **message thread** via `callAsync` | n/a — your callback's cost is yours |
 | Completion callbacks (`activate`, etc.) | Delivered on **message thread** via `callAsync` | n/a |
 | Constructor | Message thread | **Yes, briefly.** Reads the lease off disk and runs **two** Ed25519 verifies — one in `keylight::Client`'s constructor, one from the entitlement cache seed. No network. A DAW pays this per instance during a scan |
@@ -282,12 +282,28 @@ deleted, and there is nothing else.
 | `underlying()` | **Any thread** — it just returns the reference | Nothing. But what you call on it can: `refreshIfNeeded()` and `validate()` are network calls, and the `Client` has its own threading rules |
 | `JuceUrlTransport::request()` | Background `std::thread` only — never the audio thread | Yes, synchronously, on whichever thread runs it |
 
-The audio thread never blocks in a release build, which is the point of
-`state()` and `hasFeature()` being atomic mirrors. One caveat on `hasFeature()`:
-it compares a `juce::String` before the atomic load, and in JUCE **debug**
-builds that comparison may invoke instrumentation that allocates. Only the
-atomics themselves are unconditionally lock-free — so in a debug build, prefer
-caching the result outside `processBlock`.
+The audio thread never blocks, in any build, which is the point of `state()`
+and `hasFeature()` being atomic mirrors.
+
+`hasFeature()` takes `juce::StringRef`, not `const juce::String&`, and that is
+deliberate: binding a `"pro"` literal to a `const String&` would materialise a
+temporary `juce::String` and heap-allocate on the audio thread — in release
+builds too. `StringRef` wraps the pointer without copying.
+
+**`hasFeature()` only answers for `"pro"`.** Any other key returns `false`
+unconditionally; the generic slot behind it is a placeholder nothing writes. To
+gate on a second entitlement, cache it yourself:
+
+```cpp
+std::atomic<bool> stemsEnabled_ { false };
+
+licensing_->onStateChanged = [this](keylight::State) {
+    // Message thread. hasEntitlement() takes a mutex and verifies — never
+    // call it from processBlock.
+    stemsEnabled_.store(licensing_->underlying().hasEntitlement("stems"),
+                        std::memory_order_relaxed);
+};
+```
 
 ### Destruction can block the message thread
 
@@ -372,12 +388,16 @@ The audio thread only ever executes:
 ```cpp
 return pro_enabled_.load(std::memory_order_relaxed);
 ```
-No lock.  No allocation.  No JUCE string construction in the hot path.
+No lock.  No allocation.  No JUCE string construction in the hot path — the
+last of those is why `hasFeature()` takes `juce::StringRef` rather than
+`const juce::String&`, which would materialise a temporary from a literal.
 
 ### Gating on multiple entitlements
 
 `hasFeature("pro")` uses the pre-cached `pro_enabled_` atomic.  For other
-feature keys, it falls back to `generic_entitlement_enabled_` (also atomic).
+feature keys it returns `generic_entitlement_enabled_`, which nothing ever
+writes — so **any key other than `"pro"` is permanently `false`**.  It fails
+closed, but silently, so do not discover this from behaviour.
 If your plugin needs multiple independent feature flags, extend `Licensing`
 (or subclass it) by adding your own `std::atomic<bool>` fields and populating
 them inside a custom `onStateChanged` lambda before passing it to the base

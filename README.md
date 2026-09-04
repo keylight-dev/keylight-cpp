@@ -219,8 +219,9 @@ A JUCE adapter lives in [`integrations/juce/`](integrations/juce/) and provides:
 
 Compiles against JUCE 7 and JUCE 8 with zero extra dependencies beyond `juce_core`.
 
-> **Manual build required.** No JUCE toolchain is available in CI. A developer with JUCE 7 or 8
-> installed must compile and smoke-test before shipping. See
+> **Compiled in CI** (`.github/workflows/juce.yml`) against JUCE 8.0.6 on Linux, macOS and
+> Windows, and JUCE 7.0.12 on Linux and Windows, with an offline smoke test of the
+> query API. A live plugin round-trip in a DAW is still manual. See
 > [`integrations/juce/README.md`](integrations/juce/README.md).
 
 ## License Lifecycle
