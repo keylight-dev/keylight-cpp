@@ -2053,6 +2053,63 @@ TEST_CASE("Client: stop returns without waiting on an in-flight cycle") {
     // ~Client() is what joins, so the worker still cannot outlive the Client.
 }
 
+// A transport that throws rather than returning an error. Nothing documents
+// Transport or LicenseStore as non-throwing — only now_fn is — and the SDK's
+// own JuceUrlTransport builds juce::String and std::string with no guard, so
+// bad_alloc alone reaches the worker through our code.
+class ThrowingTransport : public Transport {
+public:
+    std::atomic<int> calls{0};
+    Result<HttpResponse> request(const std::string&,
+                                 const std::string&,
+                                 const std::map<std::string, std::string>&,
+                                 const std::string&) override
+    {
+        calls.fetch_add(1);
+        throw std::runtime_error("transport");
+    }
+};
+
+TEST_CASE("Client: a throwing transport on the worker does not abort the process") {
+    // An exception escaping a thread's entry point is std::terminate — an
+    // uncatchable abort of the host, from a licensing SDK's background thread.
+    // The synchronous path lets it propagate to the caller, which is right;
+    // the worker has nobody to propagate to, so it has to contain it.
+    //
+    // The catch must live inside av_loop_, not around it: catching outside
+    // would leave the worker's thread object joinable with a dead thread
+    // behind it, and startAutoValidation() would no-op forever after.
+    auto cfg = make_config();
+    cfg.autoValidationIntervalMs = 10;
+
+    std::atomic<int64_t> now{VALID_ACTIVE_NOW};
+    ThrowingTransport    transport;
+    MemoryStore          store;
+
+    // Seed a lease old enough that refreshIfNeeded() actually reaches the
+    // transport rather than short-circuiting on the debounce.
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW, 1781681046LL,
+                                VALID_ACTIVE_NOW - 7 * 3600);
+
+    Client client(cfg, transport, store, [&]{ return now.load(); });
+
+    // Synchronous: the caller gets the exception. Unchanged, and correct.
+    CHECK_THROWS_AS(client.validate(), std::runtime_error);
+
+    // On the worker: it must survive, keep cycling, and stay restartable.
+    client.startAutoValidation();
+    REQUIRE(spin_until(std::chrono::seconds(5),
+                       [&]{ return transport.calls.load() >= 3; }));
+
+    client.stopAutoValidation();
+    client.startAutoValidation();
+    const int before = transport.calls.load();
+    REQUIRE(spin_until(std::chrono::seconds(5),
+                       [&]{ return transport.calls.load() > before; }));
+
+    client.stopAutoValidation();
+}
+
 TEST_CASE("Client: retired workers are actually reaped, not just queued") {
     // Review neutered take_exited_() to reap nothing and the entire suite
     // still passed — the one function whose whole job is bounding thread
@@ -2084,6 +2141,10 @@ TEST_CASE("Client: retired workers are actually reaped, not just queued") {
     REQUIRE(spin_until(std::chrono::seconds(10), [&]{
         client.startAutoValidation();     // drives a reap
         client.stopAutoValidation();
+        // spin_until only yields, and this predicate spawns a thread per
+        // iteration — on a genuine failure that is a 10-second pthread_create
+        // storm that could hit EAGAIN itself and obscure the real result.
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
         return client.retiredWorkerCount_ForTest() <= 4;
     }));
 
@@ -2094,256 +2155,6 @@ TEST_CASE("Client: retired workers are actually reaped, not just queued") {
     client.stopAutoValidation();
 
     CHECK(client.retiredWorkerCount_ForTest() <= 6);
-}
-
-TEST_CASE("Client: a start racing a stop leaves exactly one worker") {
-    // Under the previous design both start and stop released av_mutex_ to
-    // join, with the thread moved out. A start walking into that window saw
-    // "no worker", skipped the reap and spawned a SECOND one while the first
-    // had not observed the stop: two pollers for the session, plus a hang in
-    // the stopper's join(). The epoch model has no such window — neither call
-    // releases the lock mid-body — and this is the regression guard.
-    //
-    // Asserted by counting the DISTINCT threads that call the clock, not by
-    // watching a tick counter go quiet. Under the new contract stop() retires
-    // rather than joins, so "quiet" is inherently timing-dependent and made
-    // this test flaky; "how many workers are alive" is not.
-    auto  cfg = make_config();
-    cfg.autoValidationIntervalMs = 10;
-
-    // Heap-allocated and leaked on timeout: a hung run has threads parked
-    // inside these objects.
-    auto* nowv    = new std::atomic<int64_t>(VALID_ACTIVE_NOW);
-    auto* offline = new FailingTransport();
-    auto* store   = new MemoryStore();
-
-    auto* callers_mutex = new std::mutex();
-    auto* callers       = new std::set<std::thread::id>();
-    auto* ticks         = new std::atomic<int>(0);
-
-    seed_store_with_valid_lease(*store, VALID_ACTIVE_NOW);
-
-    auto* client = new Client(cfg, *offline, *store,
-        [nowv, callers_mutex, callers, ticks] {
-            ticks->fetch_add(1);
-            {
-                std::lock_guard<std::mutex> lock(*callers_mutex);
-                callers->insert(std::this_thread::get_id());
-            }
-            return nowv->load();
-        });
-
-    auto* in_callback = new std::atomic<bool>(false);
-    auto* sub = new Subscription(client->subscribe([in_callback](State) {
-        in_callback->store(true);
-        // Still inside the callback when the starts race below (they wait 30 ms).
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
-    }));
-
-    client->startAutoValidation();
-
-    // Force a transition so the worker is parked inside the slow listener.
-    nowv->store(VALID_ACTIVE_NOW - 2 * 3600);
-    REQUIRE(spin_until(std::chrono::seconds(5), [in_callback]{ return in_callback->load(); }));
-
-    const bool ok = completes_within(std::chrono::seconds(10), [=] {
-        std::thread s([=]{ client->stopAutoValidation(); });
-        std::this_thread::sleep_for(std::chrono::milliseconds(30));
-        std::thread t1([=]{ client->startAutoValidation(); });
-        std::thread t2([=]{ client->startAutoValidation(); });
-        s.join(); t1.join(); t2.join();
-    });
-
-    REQUIRE(ok);
-
-    // Let any retired worker finish its in-flight cycle and exit, then look at
-    // who is still polling. Two live workers both tick every 10 ms, so a
-    // 300 ms window sees both; one worker contributes exactly one id.
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    {
-        std::lock_guard<std::mutex> lock(*callers_mutex);
-        callers->clear();
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
-
-    size_t distinct = 0;
-    {
-        std::lock_guard<std::mutex> lock(*callers_mutex);
-        distinct = callers->size();
-    }
-    CHECK(distinct <= 1);   // never two pollers
-
-    // ~Client() joins, so nothing can still be ticking once it returns. That
-    // is the safety property the epoch model must not give up, and unlike
-    // "quiet after stop" it is deterministic.
-    client->stopAutoValidation();
-    delete sub;
-    delete client;
-
-    const int after_destruction = ticks->load();
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    CHECK(ticks->load() == after_destruction);
-
-    delete store; delete offline; delete nowv;
-    delete in_callback; delete ticks; delete callers; delete callers_mutex;
-}
-
-TEST_CASE("Client: a listener may stop or restart auto-validation from the worker thread") {
-    // A listener is delivered on the worker thread and the contract permits it
-    // to call back in. Under the epoch model neither start nor stop joins or
-    // waits, so this cannot deadlock by construction — but it is exactly the
-    // shape that hung under the two previous designs (first by self-joining,
-    // then by blocking on a transition flag while an external stop was parked
-    // in join() waiting for this very thread). Kept as the regression guard
-    // for both.
-    //
-    // Still driven with a concurrent external stop, because that is what made
-    // the window reachable before.
-    auto  cfg = make_config();
-    cfg.autoValidationIntervalMs = 10;
-
-    // Heap-allocated and leaked on timeout: a hung run has threads parked
-    // inside these objects.
-    auto* nowv    = new std::atomic<int64_t>(VALID_ACTIVE_NOW);
-    auto* offline = new FailingTransport();
-    auto* store   = new MemoryStore();
-
-    seed_store_with_valid_lease(*store, VALID_ACTIVE_NOW);
-
-    auto* client = new Client(cfg, *offline, *store, [nowv]{ return nowv->load(); });
-
-    auto* in_callback = new std::atomic<bool>(false);
-    auto* released    = new std::atomic<bool>(false);
-    auto* did_call    = new std::atomic<bool>(false);
-
-    SUBCASE("the listener stops") {
-        auto* sub = new Subscription(client->subscribe(
-            [client, in_callback, released, did_call](State) {
-                in_callback->store(true);
-                // Stay inside the callback long enough for an external stop to
-                // reach join(), then call back in from the worker thread.
-                spin_until(std::chrono::seconds(5), [released]{ return released->load(); });
-                client->stopAutoValidation();
-                did_call->store(true);
-            }));
-
-        client->startAutoValidation();
-        nowv->store(VALID_ACTIVE_NOW - 2 * 3600);
-        REQUIRE(spin_until(std::chrono::seconds(5), [in_callback]{ return in_callback->load(); }));
-
-        const bool ok = completes_within(std::chrono::seconds(10), [=] {
-            std::thread ext([=]{ client->stopAutoValidation(); });
-            std::this_thread::sleep_for(std::chrono::milliseconds(30));
-            released->store(true);   // let the listener call back in
-            ext.join();
-        });
-
-        REQUIRE(ok);
-        // stop() no longer joins, so the external stop returns without waiting
-        // for the listener — the test has to wait for it explicitly rather
-        // than lean on a join that the epoch model deliberately removed.
-        CHECK(spin_until(std::chrono::seconds(5), [did_call]{ return did_call->load(); }));
-        if (ok) delete sub;
-    }
-
-    SUBCASE("the listener restarts") {
-        auto* sub = new Subscription(client->subscribe(
-            [client, in_callback, released, did_call](State) {
-                in_callback->store(true);
-                spin_until(std::chrono::seconds(5), [released]{ return released->load(); });
-                client->startAutoValidation();
-                did_call->store(true);
-            }));
-
-        client->startAutoValidation();
-        nowv->store(VALID_ACTIVE_NOW - 2 * 3600);
-        REQUIRE(spin_until(std::chrono::seconds(5), [in_callback]{ return in_callback->load(); }));
-
-        const bool ok = completes_within(std::chrono::seconds(10), [=] {
-            std::thread ext([=]{ client->stopAutoValidation(); });
-            std::this_thread::sleep_for(std::chrono::milliseconds(30));
-            released->store(true);
-            ext.join();
-        });
-
-        REQUIRE(ok);
-        // stop() no longer joins, so the external stop returns without waiting
-        // for the listener — the test has to wait for it explicitly rather
-        // than lean on a join that the epoch model deliberately removed.
-        CHECK(spin_until(std::chrono::seconds(5), [did_call]{ return did_call->load(); }));
-        if (ok) delete sub;
-    }
-
-    client->stopAutoValidation();
-    delete client; delete store; delete offline;
-    delete nowv; delete in_callback; delete released; delete did_call;
-}
-
-TEST_CASE("Client: stop returns without waiting on an in-flight cycle") {
-    // The epoch model's headline trade: stop() retires the worker instead of
-    // joining it, so it returns promptly even while the worker is stuck inside
-    // a slow listener. Under the previous designs this call blocked for the
-    // whole callback — measured at 703 ms with a 700 ms listener — which is
-    // what put an SDK lock in the caller's path and produced two rounds of
-    // deadlocks.
-    auto  cfg = make_config();
-    cfg.autoValidationIntervalMs = 10;
-
-    std::atomic<int64_t> now{VALID_ACTIVE_NOW};
-    FailingTransport     offline;
-    MemoryStore          store;
-
-    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW);
-
-    Client client(cfg, offline, store, [&]{ return now.load(); });
-
-    std::atomic<bool> in_callback{false};
-    auto sub = client.subscribe([&](State) {
-        in_callback.store(true);
-        std::this_thread::sleep_for(std::chrono::milliseconds(600));
-    });
-
-    client.startAutoValidation();
-    now.store(VALID_ACTIVE_NOW - 2 * 3600);
-    REQUIRE(spin_until(std::chrono::seconds(5), [&]{ return in_callback.load(); }));
-
-    const auto before = std::chrono::steady_clock::now();
-    client.stopAutoValidation();
-    const auto elapsed = std::chrono::steady_clock::now() - before;
-
-    CHECK(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() < 200);
-
-    // ~Client() is what joins, so the worker still cannot outlive the Client.
-}
-
-TEST_CASE("Client: repeated stop/start does not accumulate worker threads") {
-    // Retired workers are held until a reaper can join them without blocking.
-    // If nothing ever reaps, an unjoined pthread keeps its stack — hundreds of
-    // MB across a few hundred cycles — so start/stop must drain finished ones.
-    // Observable proxy: the cycle stays fast and the process stays healthy.
-    auto  cfg = make_config();
-    cfg.autoValidationIntervalMs = 1000;   // long, so workers park immediately
-
-    std::atomic<int64_t> now{VALID_ACTIVE_NOW};
-    FailingTransport     offline;
-    MemoryStore          store;
-
-    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW);
-
-    Client client(cfg, offline, store, [&]{ return now.load(); });
-
-    for (int i = 0; i < 200; ++i) {
-        client.startAutoValidation();
-        client.stopAutoValidation();
-    }
-
-    // Idempotence still holds at the end of all that.
-    client.startAutoValidation();
-    client.startAutoValidation();
-    client.stopAutoValidation();
-    client.stopAutoValidation();
-
-    CHECK(true);   // reaching here without exhausting threads is the assertion
 }
 
 TEST_CASE("Client: an anchor ahead of the clock does not pass the maxOfflineDays bound") {

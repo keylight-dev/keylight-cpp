@@ -2857,17 +2857,6 @@ public:
         // wait on the network and it cannot wait on a listener.
     }
 
-    /// TEST SEAM — internal, unstable, not part of the supported API.
-    ///
-    /// Number of retired workers awaiting a reap. Exposed because without it
-    /// take_exited_() has no coverage at all: a reaper that silently stops
-    /// working leaks a thread stack per stop/start cycle and every
-    /// black-box symptom of that is far too slow to assert in a test.
-    std::size_t retiredWorkerCount_ForTest() const {
-        std::lock_guard<std::mutex> lock(av_mutex_);
-        return av_retired_.size();
-    }
-
     /// Retire the auto-validation worker. Safe from any thread, including
     /// from a state-change listener delivered on the worker thread itself.
     /// Idempotent: safe when nothing is running.
@@ -2884,6 +2873,13 @@ public:
             reap.workers = take_exited_();
 
             if (av_current_.thread.joinable()) {
+                // Reserve BEFORE the epoch bump. push_back reallocates
+                // whenever take_exited_() reaped nothing, and a bad_alloc
+                // there would leave the epoch retired with the worker still
+                // in av_current_ and joinable — so startAutoValidation()
+                // would no-op forever and auto-validation would be silently
+                // dead for the life of the process.
+                av_retired_.reserve(av_retired_.size() + 1);
                 ++av_epoch_;              // retires the current worker
                 av_cv_.notify_all();      // wake it out of its interval wait
                 av_retired_.push_back(std::move(av_current_));
@@ -4008,6 +4004,23 @@ private:
         return Result<State>::ok(current);
     }
 
+#ifdef KEYLIGHT_ENABLE_TEST_SEAMS
+public:
+    /// TEST SEAM — compiled only for this repo's own test target, never in a
+    /// shipped build. Number of retired workers awaiting a reap.
+    ///
+    /// It exists because without it take_exited_() has no coverage at all: a
+    /// reaper that silently stops working leaks a thread stack per stop/start
+    /// cycle, and every black-box symptom of that needs hundreds of cycles and
+    /// hundreds of megabytes to observe. A review found the previous
+    /// black-box attempt asserted literally nothing.
+    std::size_t retiredWorkerCount_ForTest() const {
+        std::lock_guard<std::mutex> lock(av_mutex_);
+        return av_retired_.size();
+    }
+private:
+#endif
+
     /// The auto-validation worker. Runs until the epoch it was spawned with
     /// is no longer current — which is how both stopAutoValidation() and
     /// ~Client() retire it, without either of them joining.
@@ -4023,7 +4036,23 @@ private:
             // acquire cache_mutex_ / notify_mutex_ / listeners_mutex_ without
             // deadlock, and so start/stop stay responsive during a round trip.
             lk.unlock();
-            refreshIfNeeded();
+            // Contain it, for the same reason a listener is contained: an
+            // exception escaping a thread's entry point is std::terminate, and
+            // aborting a DAW from a licensing SDK's background thread is not a
+            // failure mode we get to have. Nothing documents Transport or
+            // LicenseStore as non-throwing — only now_fn is — and the SDK's own
+            // JuceUrlTransport builds juce::String and std::string with no
+            // guard, so bad_alloc alone reaches here through our code.
+            //
+            // The catch belongs HERE and not around av_loop_: catching outside
+            // would leave av_current_.thread joinable with a dead thread behind
+            // it, and startAutoValidation() would then no-op forever.
+            try {
+                refreshIfNeeded();
+            } catch (...) {
+                // Swallowed. There is nowhere to report it from a background
+                // thread, and the next cycle retries.
+            }
             lk.lock();
         }
     }
