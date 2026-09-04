@@ -330,8 +330,11 @@ public:
         //   our state-change callback (and enqueueing new callAsync lambdas).
         subscription_ = keylight::Subscription{};
 
-        // ③ Stop SDK auto-validation thread (may fire a final callback; the
-        //   alive_ flag above makes any resulting callAsync a safe no-op).
+        // ③ Retire the SDK auto-validation worker.  NOTE: since 0.2.0 this
+        //   does NOT wait for that worker to exit — it retires it and
+        //   returns, so a final state-change callback can still be in flight
+        //   when this line completes.  The alive_ flag above is what makes
+        //   that safe, not this call.
         client_->stopAutoValidation();
 
         // ④ Join any pending activate/validate/deactivate worker thread.
@@ -339,6 +342,19 @@ public:
         //   are safe even without the flag — but joining here keeps ordering
         //   well-defined.
         join_worker_();
+
+        // ⑤ Destroy the Client HERE, in the destructor body, not in member
+        //   destruction order.  ~Client() is the only thing that joins the
+        //   auto-validation worker, and client_ is declared BEFORE
+        //   state_snapshot_ and pro_enabled_ — so leaving it to member
+        //   destruction would join after those atomics are already gone, and
+        //   an in-flight callback that got past the alive_ check would write
+        //   to destroyed members.  Formally UB, and free to avoid.
+        //
+        //   This can block for one listener callback plus a network round
+        //   trip, on the message thread.  That is the cost of a clean
+        //   shutdown; it was previously paid inside stopAutoValidation().
+        client_.reset();
     }
 
     // Move-only (owns a thread).
@@ -486,6 +502,9 @@ public:
     // (interval configured via Config::autoValidationIntervalMs, default 30 min).
     // Call startAutoValidation() from the message thread after construction.
     // -----------------------------------------------------------------------
+    // stopAutoValidation() retires the SDK worker and returns; it does NOT
+    // wait for it to exit, so one more validation cycle (and one more
+    // onStateChanged) can land after this returns. ~Licensing() is what joins.
     void startAutoValidation() { client_->startAutoValidation(); }
     void stopAutoValidation()  { client_->stopAutoValidation();  }
 
