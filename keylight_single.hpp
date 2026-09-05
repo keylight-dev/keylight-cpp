@@ -3322,6 +3322,61 @@ public:
     /// calling this again (or by deactivating a paid license and re-calling).
     /// No-op when trials are disabled (Config::trialDurationDays <= 0).
     /// Performs store I/O — never call this from an audio thread.
+    /// Fetch the product's server-owned settings (trial length, free tier).
+    ///
+    /// Trial length used to be a per-SDK Config default — Rust shipped 14 days,
+    /// this SDK shipped 0 — with no server record at all, so a tenant could
+    /// neither see nor change it without an app release. The server owns it now
+    /// and Config is only the pre-first-contact seed.
+    ///
+    /// A failure is non-fatal: the last cached values (or the seed) stay in
+    /// force. A network blip must never silently switch trials off.
+    ///
+    /// NOT called automatically. checkOnLaunch() is I/O-free for an unlicensed
+    /// device by design — the settings normally arrive on the validate and
+    /// keyless responses instead. Call this only if you want an explicit
+    /// refresh and accept the network round-trip.
+    Result<void> fetchConfig() {
+        auto hr = request_with_retry_("GET", api_url_("config"), json_headers_(), "");
+        if (!hr.is_ok()) return Result<void>::err(hr.error());
+        if (hr.value().status != 200) {
+            return Result<void>::err({ErrorCode::Http,
+                http_error_message_(hr.value().body, "config", hr.value().status)});
+        }
+
+        auto jr = Json::parse(hr.value().body);
+        if (!jr.is_ok()) {
+            return Result<void>::err({ErrorCode::BadResponse, "config: undecodable body"});
+        }
+        const Json& j = jr.value();
+
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            cached_server_trial_days_ = static_cast<int>(j["trial_duration_days"].as_int());
+            cached_server_free_tier_  = j["free_tier_enabled"].as_bool();
+        }
+        (void)save_cache_();
+
+        State s = resolve_current_state_();
+        set_state_(s);
+        return Result<void>::ok();
+    }
+
+    /// Trial length actually in force: cached server value, else the Config
+    /// seed, else 0 (trials off).
+    int effectiveTrialDurationDays() const {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        if (cached_server_trial_days_.has_value()) return *cached_server_trial_days_;
+        return cfg_.trialDurationDays;
+    }
+
+    /// Free tier as the server sees it, falling back to the Config seed.
+    bool effectiveFreeTierEnabled() const {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        if (cached_server_free_tier_.has_value()) return *cached_server_free_tier_;
+        return cfg_.freeTierEnabled;
+    }
+
     /// Anonymous, per-install identifier for keyless/free-tier reporting.
     /// Minted on first use and persisted; never derived from a licence or from
     /// hardware.  Returns an empty string only when the store write fails.
@@ -3860,6 +3915,10 @@ private:
     std::optional<std::string>       cached_hardware_id_;
     std::optional<std::string>       cached_keyless_last_state_;
     int64_t                          cached_last_keyless_ping_at_ = 0;
+    // Server-owned product settings. nullopt until the first config lands;
+    // Config's own fields are only the pre-first-contact seed.
+    std::optional<int>               cached_server_trial_days_;
+    std::optional<bool>              cached_server_free_tier_;
 
     // ── Event listeners ───────────────────────────────────────────────────
     struct Listener {
@@ -4279,6 +4338,23 @@ private:
                 if (!kls.empty()) cached_keyless_last_state_ = kls;
                 cached_last_keyless_ping_at_ = j["lastKeylessPingAt"].as_int();
             }
+            {
+                // Server-owned config. Unlike the timestamps above, PRESENCE
+                // is what matters here: 0 is a legitimate server value meaning
+                // "trials off", so treating absent and zero alike would turn a
+                // never-fetched config into a deliberate no-trial setting.
+                const auto ks = j.keys();
+                const auto present = [&ks](const char* k) {
+                    return std::find(ks.begin(), ks.end(), k) != ks.end();
+                };
+                if (present("serverTrialDurationDays")) {
+                    cached_server_trial_days_ =
+                        static_cast<int>(j["serverTrialDurationDays"].as_int());
+                }
+                if (present("serverFreeTierEnabled")) {
+                    cached_server_free_tier_ = j["serverFreeTierEnabled"].as_bool();
+                }
+            }
         }
 
         State paid = State::Invalid;
@@ -4543,6 +4619,14 @@ private:
         if (cached_last_keyless_ping_at_ != 0) {
             append("\"lastKeylessPingAt\":" +
                    std::to_string(cached_last_keyless_ping_at_));
+        }
+        if (cached_server_trial_days_.has_value()) {
+            append("\"serverTrialDurationDays\":" +
+                   std::to_string(*cached_server_trial_days_));
+        }
+        if (cached_server_free_tier_.has_value()) {
+            append(std::string("\"serverFreeTierEnabled\":") +
+                   (*cached_server_free_tier_ ? "true" : "false"));
         }
 
         blob += "}";

@@ -2298,3 +2298,118 @@ TEST_CASE("Client: retries stop at the attempt ceiling") {
     CHECK(transport.calls == RETRY_MAX_ATTEMPTS);
     CHECK(slept.size() == RETRY_MAX_ATTEMPTS - 1);
 }
+
+
+// ---------------------------------------------------------------------------
+// Server-owned product config (trial length, free tier).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("Client: fetchConfig caches the server's trial duration") {
+    auto cfg = make_config();
+    cfg.trialDurationDays = 0;
+
+    FakeTransport transport;
+    MemoryStore   store;
+    transport.next_status = 200;
+    transport.next_body   =
+        R"({"trial_duration_days":14,"free_tier_enabled":true})";
+
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+    REQUIRE(client.fetchConfig().is_ok());
+
+    // The server value wins over the local seed: a tenant changes trial length
+    // in the dashboard without shipping an app release.
+    CHECK(client.effectiveTrialDurationDays() == 14);
+}
+
+TEST_CASE("Client: the cached server config survives a relaunch") {
+    auto cfg = make_config();
+    cfg.trialDurationDays = 0;
+
+    MemoryStore store;
+    {
+        FakeTransport transport;
+        transport.next_status = 200;
+        transport.next_body   =
+            R"({"trial_duration_days":14,"free_tier_enabled":true})";
+        Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+        REQUIRE(client.fetchConfig().is_ok());
+    }
+
+    // An offline launch must use the last known values, not fall back to 0.
+    FailingTransport offline;
+    Client relaunched(cfg, offline, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+    CHECK(relaunched.effectiveTrialDurationDays() == 14);
+}
+
+TEST_CASE("Client: a failed config fetch leaves the cached value alone") {
+    auto cfg = make_config();
+    cfg.trialDurationDays = 7;
+
+    FailingTransport offline;
+    MemoryStore      store;
+    Client client(cfg, offline, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+
+    CHECK(!client.fetchConfig().is_ok());
+    // Falls back to the local seed rather than to zero — a network blip must
+    // not silently switch trials off.
+    CHECK(client.effectiveTrialDurationDays() == 7);
+}
+
+TEST_CASE("Client: a server trial duration of 0 survives a relaunch as 0") {
+    // 0 is a legitimate server value meaning "trials off", and it has to be
+    // distinguishable from "no config has ever been fetched". The store's
+    // other numeric fields use 0-means-absent, so this is the case that would
+    // silently re-enable a 7-day trial the tenant deliberately turned off.
+    auto cfg = make_config();
+    cfg.trialDurationDays = 7;          // seed says 7; server says no trials
+
+    MemoryStore store;
+    {
+        FakeTransport transport;
+        transport.next_status = 200;
+        transport.next_body   =
+            R"({"trial_duration_days":0,"free_tier_enabled":false})";
+        Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+        REQUIRE(client.fetchConfig().is_ok());
+        CHECK(client.effectiveTrialDurationDays() == 0);
+    }
+
+    FailingTransport offline;
+    Client relaunched(cfg, offline, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+    CHECK(relaunched.effectiveTrialDurationDays() == 0);   // not 7
+}
+
+TEST_CASE("Client: with no config fetched, the seed governs") {
+    // The other half of the same distinction: absent must fall through to the
+    // seed rather than reading as a server-set 0.
+    auto cfg = make_config();
+    cfg.trialDurationDays = 7;
+    cfg.freeTierEnabled   = true;
+
+    FakeTransport transport;
+    MemoryStore   store;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+
+    CHECK(client.effectiveTrialDurationDays() == 7);
+    CHECK(client.effectiveFreeTierEnabled()   == true);
+}
+
+TEST_CASE("Client: a server free-tier flag of false survives a relaunch") {
+    auto cfg = make_config();
+    cfg.freeTierEnabled = true;         // seed on; server turns it off
+
+    MemoryStore store;
+    {
+        FakeTransport transport;
+        transport.next_status = 200;
+        transport.next_body   =
+            R"({"trial_duration_days":14,"free_tier_enabled":false})";
+        Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+        REQUIRE(client.fetchConfig().is_ok());
+    }
+
+    FailingTransport offline;
+    Client relaunched(cfg, offline, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+    CHECK(relaunched.effectiveFreeTierEnabled() == false);   // not the seed's true
+}
