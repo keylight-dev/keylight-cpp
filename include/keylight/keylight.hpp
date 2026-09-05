@@ -2,6 +2,7 @@
 #include "version.hpp"
 #include "result.hpp"
 #include "clock.hpp"
+#include "retry.hpp"
 #include "config.hpp"
 #include "device_info.hpp"
 #include "lease.hpp"
