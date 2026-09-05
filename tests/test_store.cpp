@@ -127,9 +127,13 @@ TEST_CASE("EncryptedFileStore: the blob is not readable on disk") {
     keylight::EncryptedFileStore store(path, "machine-a");
     REQUIRE(store.save(R"({"trialStart":1781076246})").is_ok());
 
-    std::ifstream f(path, std::ios::binary);
-    const std::string raw((std::istreambuf_iterator<char>(f)),
-                          std::istreambuf_iterator<char>());
+    // Scoped: the stream must be CLOSED before the remove() below. Windows
+    // refuses to unlink an open file where POSIX allows it, so leaving this
+    // dangling passes locally and fails only on Windows CI.
+    std::string raw;
+    { std::ifstream f(path, std::ios::binary);
+      raw.assign((std::istreambuf_iterator<char>(f)),
+                 std::istreambuf_iterator<char>()); }
     // Resetting trialStart with a text editor is the attack this closes.
     CHECK(raw.find("trialStart") == std::string::npos);
     CHECK(raw.size() >= 28);   // 12-byte nonce + 16-byte tag minimum
@@ -227,9 +231,10 @@ TEST_CASE("EncryptedFileStore: an absent machine id still encrypts, and binds to
 
     // And the tamper protection is unaffected — this is the property that
     // matters most, and it holds on every machine.
-    std::ifstream f(path, std::ios::binary);
-    const std::string raw((std::istreambuf_iterator<char>(f)),
-                          std::istreambuf_iterator<char>());
+    std::string raw;
+    { std::ifstream f(path, std::ios::binary);   // closed before remove(); see above
+      raw.assign((std::istreambuf_iterator<char>(f)),
+                 std::istreambuf_iterator<char>()); }
     CHECK(raw.find("trialStart") == std::string::npos);
 
     // The accepted trade, asserted rather than left implicit: two id-less
