@@ -62,7 +62,7 @@ include(FetchContent)
 FetchContent_Declare(
   keylight
   GIT_REPOSITORY https://github.com/keylight-dev/keylight-cpp.git
-  GIT_TAG        v0.2.0
+  GIT_TAG        v0.2.1
 )
 FetchContent_MakeAvailable(keylight)
 
@@ -111,7 +111,7 @@ vcpkg install "keylight[httplib-transport]"
 ### Conan
 
 ```bash
-conan install keylight/0.2.0@
+conan install keylight/0.2.1@
 ```
 
 > Conan Center submission is planned for a future release.

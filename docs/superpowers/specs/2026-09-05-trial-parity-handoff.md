@@ -1,6 +1,7 @@
 # Server-owned trial length — porting handoff for Rust, Swift, JS and C#
 
-**Status:** implemented in `keylight-cpp` 0.2.0. Not yet in any other SDK.
+**Status:** implemented in `keylight-cpp` 0.2.0 (0.2.1 for the config-field
+ordering fix in 3.3). Not yet in any other SDK.
 
 **Who this is for:** a session working in `keylight-rust`, `keylight-swift`,
 `keylight-js` or `keylight-dotnet`. Ownership is split by repo, so each of those
@@ -79,7 +80,7 @@ than falling back to the seed.
 
 ---
 
-## 3. Three traps that cost real time in the C++ port
+## 3. Four traps that cost real time in the C++ port
 
 ### 3.1 Absent is not zero
 
@@ -114,7 +115,20 @@ Two consequences to carry over deliberately:
   loses that — an install starting offline would stamp without an id, and
   nothing calls `startTrial()` again once the duration lands.
 
-### 3.3 An old stamp is honoured, never restarted
+### 3.3 Append new config fields, never insert them
+
+C++ 0.2.0 added two config fields in the middle of the struct and had to ship
+0.2.1 to move them. The mechanism differs per language but the rule does not:
+
+- **Swift** — the memberwise initialiser takes arguments in declaration order,
+  so inserting a field breaks existing `Config(...)` call sites.
+- **Rust** — order is irrelevant, but *adding* a public field at all breaks
+  anyone constructing without `..Default::default()`. Mark the struct
+  `#[non_exhaustive]` if it is not already.
+- **JS / C#** — object literals and object initialisers are name-based; no
+  issue.
+
+### 3.4 An old stamp is honoured, never restarted
 
 A tenant enabling a 14-day trial 60 days after an install already stamped must
 not hand that install a fresh window. One field, one rule — otherwise it can be
