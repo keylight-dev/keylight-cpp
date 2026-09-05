@@ -1,3 +1,24 @@
+## [0.2.1] - 2026-09-05
+
+### Fixed
+
+- **`Config`'s two new fields moved to the end of the struct.** `0.2.0` added
+  `requireSignedConfig` and `keylessHeartbeatIntervalMs` in the MIDDLE, ahead of
+  `autoValidationIntervalMs`. Positional aggregate initialisation binds by
+  position, so `Config cfg{"tenant", "product", ..., 60000}` written against
+  `0.1.6` silently shifted every value after the insertion point, or failed to
+  compile. Nothing else changes — the fields, their names, their defaults and
+  their behaviour are identical.
+
+  Only affects code that aggregate-initialises `Config` positionally; the
+  documented style is field assignment, and that was never affected. If you
+  have not adopted `0.2.0` yet, upgrade straight to this and the question does
+  not arise.
+
+  The struct now carries a comment saying to append rather than insert, which
+  is the rule `State::FreeTier` and `State::Limited` already document for the
+  same reason.
+
 ## [0.2.0] - 2026-09-05
 
 ### Fixed

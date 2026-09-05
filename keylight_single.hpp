@@ -42,7 +42,7 @@
 // include/keylight/version.hpp
 // ──────────────────────────────────────────────────────────────────────────
 
-#define KEYLIGHT_SDK_VERSION "0.2.0"
+#define KEYLIGHT_SDK_VERSION "0.2.1"
 
 // Identifies this SDK to the backend, sent as `sdk` alongside `platform`.
 // Server cap is 16 characters (zod `z.string().max(16)`).
@@ -430,6 +430,24 @@ struct Config {
     std::string apiBaseUrl         = "https://api.keylight.dev";
     std::string appVersion;        // optional; sent as telemetry in activate/validate
 
+    // Interval between background auto-validation ticks (milliseconds).
+    // Default is 30 minutes (1 800 000 ms).  Set a smaller value in tests
+    // as a deterministic seam — the background thread uses this as its
+    // interruptible wait timeout.
+    //
+    // A non-positive value is clamped to 1 ms. Left unclamped it would make
+    // the wait return immediately and turn the worker into a busy-spin over
+    // refreshIfNeeded(); 1 ms is still a bad interval, but it is a rate.
+    int autoValidationIntervalMs = 1'800'000; // 30 min
+
+    // ── Fields below were added after 1.0 of this struct's shape ──────────
+    //
+    // APPENDED, never inserted. Positional aggregate initialisation —
+    // `Config cfg{"tenant", "product", ...}` — binds by position, so slotting
+    // a new field into the middle silently shifts every value after it or
+    // fails to compile. Same rule the State enum documents twice for the same
+    // reason. Add new fields HERE, at the end.
+
     // Reject a GET /config response that carries no signature at all.
     //
     // A signature that is PRESENT is always verified, and a bad one is always
@@ -454,16 +472,6 @@ struct Config {
     // +interval, never immediate — an AU/VST3 host instantiating and
     // discarding plugin instances during a scan must not pay for either.
     int         keylessHeartbeatIntervalMs = 6 * 60 * 60 * 1000;  // 6h
-
-    // Interval between background auto-validation ticks (milliseconds).
-    // Default is 30 minutes (1 800 000 ms).  Set a smaller value in tests
-    // as a deterministic seam — the background thread uses this as its
-    // interruptible wait timeout.
-    //
-    // A non-positive value is clamped to 1 ms. Left unclamped it would make
-    // the wait return immediately and turn the worker into a busy-spin over
-    // refreshIfNeeded(); 1 ms is still a bad interval, but it is a rate.
-    int autoValidationIntervalMs = 1'800'000; // 30 min
 };
 
 } // namespace keylight
