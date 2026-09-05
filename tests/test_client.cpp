@@ -178,6 +178,26 @@ static const std::string VALIDATE_RESPONSE = R"({
 // "expired-status" vector from tests/fixtures/vectors.json. resolve_from_lease_
 // maps any trusted, non-"active" status to State::Expired, which is the
 // "deny" outcome the revocation-parity design calls for.
+// VALIDATE_RESPONSE plus the server's product settings at the top level. The
+// lease and its signature are untouched — the config fields sit OUTSIDE the
+// signed lease payload, which is why they need their own authentication.
+static const std::string VALIDATE_RESPONSE_WITH_CONFIG = R"({
+  "valid": true,
+  "trial_duration_days": 14,
+  "free_tier_enabled": false,
+  "license_expires_at": 1781681046,
+  "lease": {
+    "kid": "k1",
+    "licenseKeyHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "instanceId": "00000000-0000-4000-8000-000000000001",
+    "issuedAt": 1781076246,
+    "expiresAt": 1781681046,
+    "status": "active",
+    "signature": "SUrg6IHJBkO4PB80hiwXhkCFgHTxp5Ao6i9fRnajIH3ws3E+F444xYUQL9UyJYMz4cC+6f8YDMfwrxIv1mQeBw==",
+    "entitlements": ["pro"]
+  }
+})";
+
 static const std::string REVOKED_VALIDATE_RESPONSE = R"({
   "valid": false,
   "lease": {
@@ -2948,4 +2968,66 @@ TEST_CASE("Client: a throwing lifecycle listener costs no other listener its eve
     REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
 
     CHECK(delivered == 1);
+}
+
+
+TEST_CASE("Client: a validate response carries the server config") {
+    auto cfg = make_config();
+    cfg.trialDurationDays = 0;
+
+    FakeTransport transport;
+    MemoryStore   store;
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    transport.next_body = VALIDATE_RESPONSE_WITH_CONFIG;
+    REQUIRE(client.validate().is_ok());
+
+    CHECK(client.effectiveTrialDurationDays() == 14);
+}
+
+TEST_CASE("Client: a response without config fields leaves the cache alone") {
+    auto cfg = make_config();
+    cfg.trialDurationDays = 0;
+
+    FakeTransport transport;
+    MemoryStore   store;
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    transport.next_body = VALIDATE_RESPONSE_WITH_CONFIG;
+    REQUIRE(client.validate().is_ok());
+    REQUIRE(client.effectiveTrialDurationDays() == 14);
+
+    // An older worker that does not send the fields must not wipe what we know.
+    transport.next_body = VALIDATE_RESPONSE;
+    REQUIRE(client.validate().is_ok());
+    CHECK(client.effectiveTrialDurationDays() == 14);
+}
+
+TEST_CASE("Client: requireSignedConfig also covers a validate body") {
+    // The bypass this closes: the /config route verifies a signature, so a
+    // fake server would otherwise just deliver the long trial on a validate
+    // body instead. Authentication has to be a property of the FIELDS, not of
+    // the route they arrived on.
+    auto cfg = make_config();
+    cfg.trialDurationDays     = 7;
+    cfg.requireSignedConfig   = true;
+
+    FakeTransport transport;
+    MemoryStore   store;
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    transport.next_body = VALIDATE_RESPONSE_WITH_CONFIG;   // unsigned fields
+    REQUIRE(client.validate().is_ok());
+
+    // The validate itself still succeeds — only the unsigned config is ignored.
+    CHECK(client.effectiveTrialDurationDays() == 7);
 }

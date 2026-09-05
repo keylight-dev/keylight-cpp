@@ -471,6 +471,11 @@ public:
         }
         const Json& j = jr.value();
 
+        // The server's product settings ride on responses to calls that are
+        // already being made, so a licensed install learns them without an
+        // extra round trip.
+        apply_config_fields_(j);
+
         // Parse optional lease
         std::optional<Lease> lease;
         auto lease_node = j["lease"];
@@ -616,16 +621,13 @@ public:
         // Authenticate before caching. Nothing below writes to the cache until
         // this returns ok, so a rejected config leaves the last good value —
         // or the Config seed — in force rather than adopting what a fake
-        // server claimed.
+        // server claimed. Reported as an error too, because the caller asked
+        // for a refresh and a forged config is worth surfacing.
         auto vr = verify_config_(j, trial_days, free_tier);
         if (!vr.is_ok()) return vr;
 
-        {
-            std::lock_guard<std::mutex> lock(cache_mutex_);
-            cached_server_trial_days_ = trial_days;
-            cached_server_free_tier_  = free_tier;
-        }
-        (void)save_cache_();
+        // One parser for all three carriers.
+        apply_config_fields_(j);
 
         State s = resolve_current_state_();
         set_state_(s);
@@ -715,6 +717,14 @@ public:
         if (!hr.is_ok() || hr.value().status != 200) {
             return;
         }
+
+        // The beacon reply is how an UNLICENSED install learns the server's
+        // settings — validate covers the licensed ones. The body used to be
+        // discarded entirely.
+        if (auto jr = Json::parse(hr.value().body); jr.is_ok()) {
+            apply_config_fields_(jr.value());
+        }
+
         {
             std::lock_guard<std::mutex> lock(cache_mutex_);
             cached_keyless_last_state_   = wire;
@@ -1493,6 +1503,58 @@ private:
         }
         headers["X-Keylight-Request-Id"] = detail::random_request_id();
         return headers;
+    }
+
+    /// Whether a JSON object actually carries a key. Presence matters for the
+    /// config fields because 0 and false are legitimate values, so the
+    /// "0 means absent" shortcut used for timestamps would misread them.
+    static bool json_has_(const Json& j, const char* key) {
+        const auto ks = j.keys();
+        return std::find(ks.begin(), ks.end(), key) != ks.end();
+    }
+
+    /// Read the server-owned product settings out of any response that carries
+    /// them — the dedicated /config route, a validate body, or a beacon reply.
+    ///
+    /// ABSENT FIELDS ARE LEFT ALONE, never treated as zero: an older worker,
+    /// or a route that does not include them, must not wipe a value we already
+    /// learned.
+    ///
+    /// AUTHENTICATION IS THE SAME WHEREVER THEY RIDE. A signed envelope is
+    /// verified; an unsigned one is accepted only when requireSignedConfig is
+    /// false. Applying these fields unsigned here while /config verified them
+    /// would defeat that check completely — a fake server would simply deliver
+    /// the long trial on a validate body instead of on /config.
+    void apply_config_fields_(const Json& j) {
+        const bool has_trial = json_has_(j, "trial_duration_days");
+        const bool has_ft    = json_has_(j, "free_tier_enabled");
+        if (!has_trial && !has_ft) return;
+
+        const bool signed_envelope =
+            !j["kid"].as_string().empty() && !j["signature"].as_string().empty();
+
+        if (signed_envelope) {
+            // A signed envelope covers BOTH fields, so a partial one is
+            // malformed rather than something to verify against a guess.
+            if (!has_trial || !has_ft) return;
+            const int  trial = static_cast<int>(j["trial_duration_days"].as_int());
+            const bool ft    = j["free_tier_enabled"].as_bool();
+            if (!verify_config_(j, trial, ft).is_ok()) return;
+        } else if (cfg_.requireSignedConfig) {
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            if (has_trial) {
+                cached_server_trial_days_ =
+                    static_cast<int>(j["trial_duration_days"].as_int());
+            }
+            if (has_ft) {
+                cached_server_free_tier_ = j["free_tier_enabled"].as_bool();
+            }
+        }
+        (void)save_cache_();
     }
 
     /// Authenticate a GET /config body. See config_payload.hpp for why this
@@ -2308,6 +2370,12 @@ private:
             return apply_offline_grace_(now, last_lvo);
         }
         const Json& j = jr.value();
+
+        // The server's product settings ride on responses to calls that are
+        // already being made, so a licensed install learns them without an
+        // extra round trip. checkOnLaunch() stays I/O-free for an unlicensed
+        // device, which a DAW plugin scan depends on.
+        apply_config_fields_(j);
 
         std::optional<Lease> lease;
         auto lease_node = j["lease"];

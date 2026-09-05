@@ -823,3 +823,22 @@ TEST_CASE("Heartbeat: a licensed device never beacons") {
     // free-tier table would corrupt the dashboard's conversion numbers.
     CHECK(transport.keyless_count() == before);
 }
+
+
+TEST_CASE("Client: checkOnLaunch still makes no network call on a free-tier device") {
+    // Regression guard: a DAW scanning plugins must not generate one request
+    // per plugin instantiation. Delivering the config on existing calls is
+    // what lets this stay true — adding a launch-time fetchConfig() would
+    // break it.
+    auto cfg = canonical_config();
+    RecordingTransport transport;
+    MemStore           store;
+    transport.fail = true;
+    int64_t now = T0;
+
+    Client client(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
+    auto r = client.checkOnLaunch();
+    REQUIRE(r.is_ok());
+    CHECK(r.value() == State::FreeTier);
+    CHECK(transport.call_count() == 0);
+}
