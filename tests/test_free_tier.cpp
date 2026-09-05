@@ -12,9 +12,13 @@
 #include "keylight/store.hpp"
 #include "keylight/transport.hpp"
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <mutex>
+#include <thread>
 #include <optional>
 #include <string>
 #include <vector>
@@ -49,12 +53,18 @@ public:
 
     std::vector<Call> calls;
 
+    // Guards `calls` against the heartbeat thread. Without this, every test
+    // in this file that reads `calls` while a heartbeat is running is a data
+    // race — one that shows up as a flaky CI job, not a clean failure.
+    mutable std::mutex mu_;
+
     Result<HttpResponse> request(
         const std::string&                        method,
         const std::string&                        url,
         const std::map<std::string, std::string>& headers,
         const std::string&                        body) override
     {
+        std::lock_guard<std::mutex> lock(mu_);
         calls.push_back({method, url, headers, body});
         if (fail) {
             return Result<HttpResponse>::err({ErrorCode::Network, "offline"});
@@ -65,17 +75,41 @@ public:
         return Result<HttpResponse>::ok(r);
     }
 
-    // Convenience: the last call whose URL ends with /<action>.
-    const Call* last_call_for(const std::string& action) const {
+    // Beacons sent, counted under the lock.
+    size_t keyless_count() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        size_t n = 0;
+        for (const auto& c : calls) {
+            const std::string suffix = "/keyless";
+            if (c.url.size() >= suffix.size() &&
+                c.url.compare(c.url.size() - suffix.size(),
+                              suffix.size(), suffix) == 0) {
+                ++n;
+            }
+        }
+        return n;
+    }
+
+    size_t call_count() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return calls.size();
+    }
+
+    // Convenience: a COPY of the last call whose URL ends with /<action>.
+    // Returns by value, not by pointer: a pointer into `calls` outlives the
+    // lock and the heartbeat thread can reallocate the vector under the
+    // caller's feet.
+    std::optional<Call> last_call_for(const std::string& action) const {
+        std::lock_guard<std::mutex> lock(mu_);
         for (auto it = calls.rbegin(); it != calls.rend(); ++it) {
             const std::string suffix = "/" + action;
             if (it->url.size() >= suffix.size() &&
                 it->url.compare(it->url.size() - suffix.size(),
                                 suffix.size(), suffix) == 0) {
-                return &*it;
+                return *it;
             }
         }
-        return nullptr;
+        return std::nullopt;
     }
 
     static std::string header(const Call& c, const std::string& name) {
@@ -408,8 +442,8 @@ TEST_CASE("Hardware id: cached after the first successful read") {
     // A later beacon must still carry the hash, from the cached id.
     transport.calls.clear();
     client.reportKeylessState(KeylessState::Expired);
-    const auto* call = transport.last_call_for("keyless");
-    REQUIRE(call != nullptr);
+    const auto call = transport.last_call_for("keyless");
+    REQUIRE(call.has_value());
     CHECK(call->body.find(CANONICAL_HASH) != std::string::npos);
 }
 
@@ -423,8 +457,8 @@ TEST_CASE("Hardware id: machine_hash omitted entirely when none is available") {
     Client client(cfg, transport, store, [&]{ return now; }, none, NO_SLEEP);
     client.reportKeylessState(KeylessState::FreeTier);
 
-    const auto* call = transport.last_call_for("keyless");
-    REQUIRE(call != nullptr);
+    const auto call = transport.last_call_for("keyless");
+    REQUIRE(call.has_value());
     CHECK(call->body.find("machine_hash") == std::string::npos);
 }
 
@@ -438,8 +472,8 @@ TEST_CASE("Hardware id: an empty id is treated as absent") {
     Client client(cfg, transport, store, [&]{ return now; }, empty);
     client.reportKeylessState(KeylessState::FreeTier);
 
-    const auto* call = transport.last_call_for("keyless");
-    REQUIRE(call != nullptr);
+    const auto call = transport.last_call_for("keyless");
+    REQUIRE(call.has_value());
     CHECK(call->body.find("machine_hash") == std::string::npos);
 }
 
@@ -454,8 +488,8 @@ TEST_CASE("Beacon: posts instance_id, state and the SDK key to /keyless") {
     const std::string id = client.freeTierInstanceId();
     client.reportKeylessState(KeylessState::FreeTier);
 
-    const auto* call = transport.last_call_for("keyless");
-    REQUIRE(call != nullptr);
+    const auto call = transport.last_call_for("keyless");
+    REQUIRE(call.has_value());
     CHECK(call->method == "POST");
     CHECK(call->url    == "https://api.keylight.dev/testco/testapp/keyless");
     CHECK(RecordingTransport::header(*call, "X-Keylight-SDK-Key") == SDK_KEY);
@@ -602,8 +636,8 @@ TEST_CASE("Attribution: activate carries free_tier_instance_id and machine_hash"
     const std::string id = client.freeTierInstanceId();
     REQUIRE(client.activate("KL-TEST-KEY").is_ok());
 
-    const auto* call = transport.last_call_for("activate");
-    REQUIRE(call != nullptr);
+    const auto call = transport.last_call_for("activate");
+    REQUIRE(call.has_value());
     CHECK(call->body.find("\"free_tier_instance_id\":\"" + id + "\"") != std::string::npos);
     CHECK(call->body.find(CANONICAL_HASH) != std::string::npos);
 }
@@ -619,8 +653,8 @@ TEST_CASE("Attribution: activate omits free_tier_instance_id when none was minte
     Client client(cfg, transport, store, [&]{ return now; }, none, NO_SLEEP);
     REQUIRE(client.activate("KL-TEST-KEY").is_ok());
 
-    const auto* call = transport.last_call_for("activate");
-    REQUIRE(call != nullptr);
+    const auto call = transport.last_call_for("activate");
+    REQUIRE(call.has_value());
     CHECK(call->body.find("free_tier_instance_id") == std::string::npos);
 }
 
@@ -636,8 +670,8 @@ TEST_CASE("Attribution: validate carries machine_hash but not the instance id") 
     REQUIRE(client.activate("KL-TEST-KEY").is_ok());
     REQUIRE(client.validate().is_ok());
 
-    const auto* call = transport.last_call_for("validate");
-    REQUIRE(call != nullptr);
+    const auto call = transport.last_call_for("validate");
+    REQUIRE(call.has_value());
     CHECK(call->body.find(CANONICAL_HASH)            != std::string::npos);
     CHECK(call->body.find("free_tier_instance_id")   == std::string::npos);
 }
@@ -653,8 +687,8 @@ TEST_CASE("Attribution: activate still sends its original fields") {
     Client client(cfg, transport, store, [&]{ return now; }, hw);
     REQUIRE(client.activate("KL-TEST-KEY").is_ok());
 
-    const auto* call = transport.last_call_for("activate");
-    REQUIRE(call != nullptr);
+    const auto call = transport.last_call_for("activate");
+    REQUIRE(call.has_value());
     CHECK(call->body.find("\"license_key\":\"KL-TEST-KEY\"") != std::string::npos);
     CHECK(call->body.find("\"instance_name\"") != std::string::npos);
 
@@ -665,4 +699,127 @@ TEST_CASE("Attribution: activate still sends its original fields") {
     std::string host = keylight::detail::detect_machine_name();
     std::string expected_name = host.empty() ? "device" : host;
     CHECK(call->body.find("\"instance_name\":\"" + expected_name + "\"") != std::string::npos);
+}
+
+
+// ===========================================================================
+// Keyless heartbeat (Plan 3 Task 8).
+// ===========================================================================
+
+TEST_CASE("Config: the keyless heartbeat defaults to six hours") {
+    keylight::Config cfg;
+    CHECK(cfg.keylessHeartbeatIntervalMs == 6 * 60 * 60 * 1000);
+}
+
+TEST_CASE("Heartbeat: the thread is not spawned by the constructor") {
+    auto cfg = make_config();
+    cfg.keylessHeartbeatIntervalMs = 50;
+
+    RecordingTransport transport;
+    MemStore           store;
+
+    // AU/VST3 hosts instantiate and discard plugin instances repeatedly during
+    // a scan. A constructor that spawns a thread makes scanning expensive, so
+    // the thread starts on first state resolution instead.
+    {
+        Client client(cfg, transport, store, []{ return T0; }, NO_SLEEP);
+        CHECK(client.heartbeatRunningForTest() == false);
+    }
+}
+
+TEST_CASE("Heartbeat: starts on first state resolution and stops on destruction") {
+    auto cfg = make_config();
+    cfg.keylessHeartbeatIntervalMs = 50;
+
+    RecordingTransport   transport;
+    MemStore             store;
+    std::atomic<int64_t> now{T0};
+
+    {
+        Client client(cfg, transport, store, [&]{ return now.load(); }, NO_SLEEP);
+        (void)client.startTrial();          // first state resolution
+        CHECK(client.heartbeatRunningForTest() == true);
+    }   // destructor must join; a leaked thread here would crash the host
+}
+
+TEST_CASE("Heartbeat: a zero interval disables it") {
+    auto cfg = make_config();
+    cfg.keylessHeartbeatIntervalMs = 0;
+
+    RecordingTransport transport;
+    MemStore           store;
+    Client client(cfg, transport, store, []{ return T0; }, NO_SLEEP);
+    (void)client.startTrial();
+
+    CHECK(client.heartbeatRunningForTest() == false);
+}
+
+TEST_CASE("Heartbeat: the first tick is at +interval, never immediate") {
+    // This is what keeps "on by default" compatible with checkOnLaunch() doing
+    // no I/O during a plugin scan: the thread is born and joined without ever
+    // emitting.
+    auto cfg = canonical_config();
+    cfg.keylessHeartbeatIntervalMs = 60 * 1000;   // far longer than this test
+
+    RecordingTransport transport;
+    MemStore           store;
+    Client client(cfg, transport, store, []{ return T0; }, NO_SLEEP);
+    (void)client.startTrial();
+    REQUIRE(client.heartbeatRunningForTest() == true);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    CHECK(transport.keyless_count() == 0);
+}
+
+TEST_CASE("Heartbeat: respects the 24h beacon debounce") {
+    // This is the property that matters — not the number of ticks. A 10ms
+    // interval fires constantly; only the debounce keeps the beacon honest.
+    auto cfg = canonical_config();
+    cfg.keylessHeartbeatIntervalMs = 10;
+
+    RecordingTransport   transport;
+    MemStore             store;
+    std::atomic<int64_t> now{T0};
+
+    Client client(cfg, transport, store, [&]{ return now.load(); }, NO_SLEEP);
+    (void)client.startTrial();
+
+    // First beacon.
+    for (int i = 0; i < 200 && transport.keyless_count() < 1; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    REQUIRE(transport.keyless_count() == 1);
+
+    // Many more ticks inside the 24h window must add nothing.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK(transport.keyless_count() == 1);
+
+    // Past the window, exactly one more.
+    now.store(T0 + 25 * 3600);
+    for (int i = 0; i < 200 && transport.keyless_count() < 2; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    CHECK(transport.keyless_count() == 2);
+}
+
+TEST_CASE("Heartbeat: a licensed device never beacons") {
+    auto cfg = canonical_config();
+    cfg.keylessHeartbeatIntervalMs = 10;
+
+    RecordingTransport   transport;
+    MemStore             store;
+    std::atomic<int64_t> now{T0};
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_OK;
+    Client client(cfg, transport, store, [&]{ return now.load(); }, NO_SLEEP);
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+    REQUIRE(client.state() == State::Licensed);
+
+    const size_t before = transport.keyless_count();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // The beacon counts KEYLESS devices. Reporting a paying customer into the
+    // free-tier table would corrupt the dashboard's conversion numbers.
+    CHECK(transport.keyless_count() == before);
 }

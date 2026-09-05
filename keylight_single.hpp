@@ -442,6 +442,19 @@ struct Config {
     // expect the default to flip in a later release.
     bool        requireSignedConfig = false;
 
+    // Interval between anonymous keyless-beacon heartbeats (milliseconds).
+    // 0 disables the heartbeat entirely.
+    //
+    // The beacon itself is debounced to one report per 24h per state, so this
+    // interval only decides how promptly a state CHANGE is noticed, not how
+    // much traffic is sent. Six hours means a device that converts or lapses
+    // is reflected within a quarter day without the app being relaunched.
+    //
+    // The thread is not spawned by the constructor and its first tick is at
+    // +interval, never immediate — an AU/VST3 host instantiating and
+    // discarding plugin instances during a scan must not pay for either.
+    int         keylessHeartbeatIntervalMs = 6 * 60 * 60 * 1000;  // 6h
+
     // Interval between background auto-validation ticks (milliseconds).
     // Default is 30 minutes (1 800 000 ms).  Set a smaller value in tests
     // as a deterministic seam — the background thread uses this as its
@@ -3156,6 +3169,10 @@ public:
     // can still call into it; the LISTENER CONTRACT's "do not destroy from a
     // callback" is the special case, not the whole rule.
     ~Client() {
+        // Both threads, not just the auto-validation worker. A leaked
+        // heartbeat outliving the Client is a use-after-free in a host.
+        stop_heartbeat_();
+
         Reaper to_join;
         {
             std::lock_guard<std::mutex> lock(av_mutex_);
@@ -4316,6 +4333,16 @@ private:
         }
     };
 
+    // ── Keyless heartbeat ─────────────────────────────────────────────────
+    // Deliberately mirrors the av_* machinery above: same interruptible
+    // wait_for, same idempotent start, same move-the-thread-out-of-the-lock
+    // before joining. A second threading discipline in one file is how the
+    // first one's hard-won rules get quietly violated.
+    mutable std::mutex      kh_mutex_;
+    std::condition_variable kh_cv_;
+    bool                    kh_stop_ = false;
+    std::thread             kh_thread_;
+
     // The worker running the CURRENT epoch. A joinable thread here is the
     // definition of "auto-validation is running".
     AvWorker                av_current_;
@@ -5274,6 +5301,14 @@ public:
         std::lock_guard<std::mutex> lock(av_mutex_);
         return av_retired_.size();
     }
+
+    /// TEST SEAM — whether the keyless heartbeat thread is running. The
+    /// alternative is asserting on beacon traffic, which cannot distinguish
+    /// "never started" from "started and correctly debounced".
+    bool heartbeatRunningForTest() const {
+        std::lock_guard<std::mutex> lock(kh_mutex_);
+        return kh_thread_.joinable();
+    }
 private:
 #endif
 
@@ -5362,6 +5397,82 @@ private:
 
         if (auto ev = lifecycle_event(prev, new_state, moved_later)) {
             notify_lifecycle_(*ev);
+        }
+
+        // First state resolution is where the heartbeat begins. Spawning it in
+        // the constructor would make a plugin scan — which builds and discards
+        // a Client per plugin — pay for a thread it never uses.
+        start_heartbeat_();
+    }
+
+    /// Which keyless state, if any, this license state should beacon as.
+    ///
+    /// An EXHAUSTIVE switch on purpose. With -Werror=switch a new State forces
+    /// this decision at compile time; an if-chain would drop it into a default
+    /// branch instead, and if that branch beacons then a LICENSED device gets
+    /// reported into the free-tier table and the dashboard's conversion
+    /// numbers are wrong with no error anywhere.
+    ///
+    /// Licensed and Limited both report nothing: the beacon counts KEYLESS
+    /// devices, and liveness for a paying customer already goes through
+    /// /validate.
+    static std::optional<KeylessState> beacon_state_for_(State s) {
+        switch (s) {
+            case State::Trial:    return KeylessState::Trial;
+            case State::FreeTier: return KeylessState::FreeTier;
+            case State::Expired:  return KeylessState::Expired;
+            case State::Invalid:  return std::nullopt;
+            case State::Licensed: return std::nullopt;
+            case State::Limited:  return std::nullopt;
+        }
+        return std::nullopt;
+    }
+
+    /// Start the heartbeat if it is enabled and not already running.
+    /// Idempotent. Called on state resolution, never from the constructor.
+    void start_heartbeat_() {
+        if (cfg_.keylessHeartbeatIntervalMs <= 0) return;   // disabled
+        std::lock_guard<std::mutex> lock(kh_mutex_);
+        if (kh_thread_.joinable()) return;                  // already running
+        kh_stop_ = false;
+        kh_thread_ = std::thread([this] { kh_loop_(); });
+    }
+
+    /// Join the heartbeat. Moves the thread out from under the lock before
+    /// joining, because the worker re-acquires kh_mutex_ on its way out.
+    void stop_heartbeat_() {
+        std::thread victim;
+        {
+            std::lock_guard<std::mutex> lock(kh_mutex_);
+            kh_stop_ = true;
+            kh_cv_.notify_all();
+            victim = std::move(kh_thread_);
+        }
+        if (victim.joinable()) victim.join();
+    }
+
+    void kh_loop_() {
+        const auto interval = std::chrono::milliseconds(
+            cfg_.keylessHeartbeatIntervalMs > 0 ? cfg_.keylessHeartbeatIntervalMs : 1);
+        for (;;) {
+            {
+                // The first tick is at +interval, NEVER immediate. That is
+                // what keeps "on by default" compatible with checkOnLaunch()
+                // doing no I/O: a plugin scan lasts seconds, so the thread is
+                // born and joined without ever emitting. Do not add an
+                // immediate beacon "so the first launch is not missed" — it
+                // breaks the free-tier invariant and the no-I/O-during-scan
+                // guarantee in one move.
+                std::unique_lock<std::mutex> lock(kh_mutex_);
+                if (kh_cv_.wait_for(lock, interval, [this]{ return kh_stop_; })) {
+                    return;
+                }
+            }
+            // Outside the lock: reportKeylessState does network I/O and is
+            // itself debounced to one report per 24h per state.
+            if (auto ks = beacon_state_for_(state())) {
+                try { reportKeylessState(*ks); } catch (...) {}
+            }
         }
     }
 
