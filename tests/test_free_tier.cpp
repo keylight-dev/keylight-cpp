@@ -842,3 +842,43 @@ TEST_CASE("Client: checkOnLaunch still makes no network call on a free-tier devi
     CHECK(r.value() == State::FreeTier);
     CHECK(transport.call_count() == 0);
 }
+
+
+TEST_CASE("Telemetry: activate reports the build's configured trial length") {
+    // Diagnostic only. It exists so a dashboard can say "this install reports
+    // a 30-day build against your 14-day setting" instead of that mismatch
+    // surfacing as a week of support tickets.
+    auto cfg = make_config(30);
+    RecordingTransport transport;
+    MemStore           store;
+    transport.next_body = ACTIVATE_OK;
+
+    Client client(cfg, transport, store, []{ return T0; }, NO_SLEEP);
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    auto call = transport.last_call_for("activate");
+    REQUIRE(call.has_value());
+    CHECK(call->body.find("\"sdk_trial_duration_days\":30") != std::string::npos);
+}
+
+TEST_CASE("Telemetry: the reported trial length is the SEED, not the effective one") {
+    // The distinction is the whole point: reporting the effective value would
+    // just echo the server's own number back at it, which diagnoses nothing.
+    auto cfg = make_config(30);
+    RecordingTransport transport;
+    MemStore           store;
+    transport.next_status = 200;
+    transport.next_body   = R"({"trial_duration_days":14,"free_tier_enabled":false})";
+
+    Client client(cfg, transport, store, []{ return T0; }, NO_SLEEP);
+    REQUIRE(client.fetchConfig().is_ok());
+    REQUIRE(client.effectiveTrialDurationDays() == 14);
+
+    transport.next_body = ACTIVATE_OK;
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    auto call = transport.last_call_for("activate");
+    REQUIRE(call.has_value());
+    CHECK(call->body.find("\"sdk_trial_duration_days\":30") != std::string::npos);
+    CHECK(call->body.find("\"sdk_trial_duration_days\":14") == std::string::npos);
+}

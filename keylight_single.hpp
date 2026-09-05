@@ -4612,6 +4612,20 @@ private:
             // the same canonical macos/windows/linux tokens, so the server used
             // to label every C++ device "Rust". Identify ourselves explicitly.
             fields.push_back({"sdk",         json_str(KEYLIGHT_SDK_ID)});
+            // The trial length this BUILD was compiled with — not the
+            // effective one. Purely diagnostic, and the server must never gate
+            // on it: a patched client sends whatever its author wants, so
+            // comparing it against the server's value proves nothing about the
+            // client. That is what the signed config and the server-side trial
+            // ledger are for.
+            //
+            // It earns its place on ordinary mistakes instead, which are far
+            // more common than attacks: a tenant sets 14 in the dashboard,
+            // ships a build compiled with 30, and the dashboard can say so
+            // instead of the difference surfacing as a week of support
+            // tickets.
+            fields.push_back({"sdk_trial_duration_days",
+                              std::to_string(cfg_.trialDurationDays)});
             if (!cfg_.appVersion.empty()) {
                 fields.push_back({"app_version", json_str(cfg_.appVersion)});
             }
