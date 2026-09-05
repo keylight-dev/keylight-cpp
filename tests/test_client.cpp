@@ -40,6 +40,9 @@ public:
     // After each request(), the request headers are stored here.
     std::map<std::string, std::string> last_request_headers;
 
+    // Total requests issued, for asserting debounces and retry counts.
+    size_t calls_made = 0;
+
     Result<HttpResponse> request(
         const std::string&,
         const std::string&,
@@ -48,6 +51,7 @@ public:
     {
         last_request_body    = body;
         last_request_headers = headers;
+        ++calls_made;
         HttpResponse r;
         r.status = next_status;
         r.body   = next_body;
@@ -2702,4 +2706,68 @@ TEST_CASE("Client: a key of only separators is not a valid format") {
 
     CHECK(client.isValidKeyFormat("---")   == false);
     CHECK(client.isValidKeyFormat("   ")   == false);
+}
+
+
+TEST_CASE("Client: activeRevalidate is debounced to 60 seconds") {
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    int64_t now = VALID_ACTIVE_NOW;
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    Client client(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    transport.next_body = VALIDATE_RESPONSE;
+    const size_t after_activate = transport.calls_made;
+
+    CHECK(client.activeRevalidate() == true);
+    CHECK(transport.calls_made == after_activate + 1);
+
+    // Foregrounding an app repeatedly must not hammer the API.
+    now += 30;
+    CHECK(client.activeRevalidate() == false);
+    CHECK(transport.calls_made == after_activate + 1);
+
+    now += 31;   // past the 60s window
+    CHECK(client.activeRevalidate() == true);
+    CHECK(transport.calls_made == after_activate + 2);
+}
+
+TEST_CASE("Client: activeRevalidate does nothing without a stored license") {
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+
+    CHECK(client.activeRevalidate() == false);
+    CHECK(transport.calls_made == 0);
+}
+
+TEST_CASE("Client: the activeRevalidate debounce is per-session, not persisted") {
+    // A relaunch must always revalidate. Persisting the debounce would let a
+    // user dodge a revoke by restarting inside the window.
+    auto cfg = make_config();
+    MemoryStore store;
+    int64_t now = VALID_ACTIVE_NOW;
+
+    {
+        FakeTransport transport;
+        transport.next_status = 200;
+        transport.next_body   = ACTIVATE_RESPONSE;
+        Client client(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
+        REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+        transport.next_body = VALIDATE_RESPONSE;
+        REQUIRE(client.activeRevalidate() == true);
+    }
+
+    // Same instant, brand new Client: the debounce does not survive.
+    FakeTransport transport;
+    transport.next_status = 200;
+    transport.next_body   = VALIDATE_RESPONSE;
+    Client relaunched(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
+    CHECK(relaunched.activeRevalidate() == true);
+    CHECK(transport.calls_made == 1);
 }

@@ -1140,6 +1140,33 @@ public:
         return cached_license_key_;
     }
 
+    /// Force a re-validation on active use (app foregrounded, popover opened),
+    /// debounced to 60s. Call this whenever the user brings the app forward so
+    /// a dashboard revoke takes effect within minutes instead of waiting for a
+    /// relaunch.
+    ///
+    /// A definitive server rejection downgrades immediately; a transient
+    /// failure never downgrades a live session — validate() already draws that
+    /// line, so this only owns the debounce. Returns true when a validate ran.
+    ///
+    /// Blocking: this performs a network round trip when it does not debounce.
+    /// Never call it from an audio thread.
+    bool activeRevalidate() {
+        if (!hasStoredLicense()) return false;
+
+        const int64_t now = now_fn_();
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            if (last_active_revalidate_at_ != 0 &&
+                now - last_active_revalidate_at_ < 60) {
+                return false;
+            }
+            last_active_revalidate_at_ = now;
+        }
+        (void)validate();
+        return true;
+    }
+
     /// Normalize a license key the way the API does: strip whitespace and
     /// hyphens, uppercase. Mirrors the worker's normalizeKey, so a key typed
     /// with the wrong spacing still resolves to the same license.
@@ -1282,6 +1309,10 @@ private:
     // Config's own fields are only the pre-first-contact seed.
     std::optional<int>               cached_server_trial_days_;
     std::optional<bool>              cached_server_free_tier_;
+    // Debounce for activeRevalidate(). Deliberately NOT persisted: the window
+    // is per-session, so a relaunch always revalidates. Persisting it would
+    // let a user dodge a revoke by restarting inside the window.
+    int64_t                          last_active_revalidate_at_ = 0;
 
     // ── Event listeners ───────────────────────────────────────────────────
     struct Listener {
