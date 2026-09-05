@@ -22,6 +22,18 @@ struct Config {
     std::string apiBaseUrl         = "https://api.keylight.dev";
     std::string appVersion;        // optional; sent as telemetry in activate/validate
 
+    // Reject a GET /config response that carries no signature at all.
+    //
+    // A signature that is PRESENT is always verified, and a bad one is always
+    // rejected, regardless of this flag. This only decides what to do with a
+    // response that has none.
+    //
+    // Defaults to false for 0.2.0 because the worker does not sign /config
+    // yet; defaulting to true would silently break every tenant's dashboard
+    // trial setting on upgrade. Set it to true once your server signs — and
+    // expect the default to flip in a later release.
+    bool        requireSignedConfig = false;
+
     // Interval between background auto-validation ticks (milliseconds).
     // Default is 30 minutes (1 800 000 ms).  Set a smaller value in tests
     // as a deterministic seam — the background thread uses this as its

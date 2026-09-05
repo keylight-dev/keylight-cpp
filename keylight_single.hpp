@@ -356,6 +356,18 @@ struct Config {
     std::string apiBaseUrl         = "https://api.keylight.dev";
     std::string appVersion;        // optional; sent as telemetry in activate/validate
 
+    // Reject a GET /config response that carries no signature at all.
+    //
+    // A signature that is PRESENT is always verified, and a bad one is always
+    // rejected, regardless of this flag. This only decides what to do with a
+    // response that has none.
+    //
+    // Defaults to false for 0.2.0 because the worker does not sign /config
+    // yet; defaulting to true would silently break every tenant's dashboard
+    // trial setting on upgrade. Set it to true once your server signs — and
+    // expect the default to flip in a later release.
+    bool        requireSignedConfig = false;
+
     // Interval between background auto-validation ticks (milliseconds).
     // Default is 30 minutes (1 800 000 ms).  Set a smaller value in tests
     // as a deterministic seam — the background thread uses this as its
@@ -2755,6 +2767,62 @@ private:
 } // namespace keylight
 
 // ──────────────────────────────────────────────────────────────────────────
+// include/keylight/config_payload.hpp
+// ──────────────────────────────────────────────────────────────────────────
+
+// keylight/config_payload.hpp — canonical signing payload for GET /config.
+//
+// WHY THIS EXISTS
+//
+// The v3 lease is Ed25519-signed, so pointing an app at a fake server mints no
+// licence. `GET /config` carried no signature, which left the same trick able
+// to mint an unlimited TRIAL: redirect the API host with a hosts entry or a
+// local proxy and answer with {"trial_duration_days": 3650}. No binary
+// patching, no reverse engineering. Signing the config closes that.
+//
+// It does NOT defeat a patched binary — that binary can drop the check like
+// any other. It raises the cheapest attack from editing a hosts file to
+// patching and re-signing an app. Stopping the patched case needs the server
+// to refuse (a server-side trial ledger keyed to machine_hash), not this.
+//
+// FORMAT — this is a cross-SDK protocol contract
+//
+//   cfg1|{kid}|{tenantId}|{productId}|{issuedAt}|{expiresAt}|{trialDays}|{freeTier}
+//
+// Pipe-delimited and fixed-order, exactly like lease.hpp's v3 payload, so
+// there is no JSON canonicalisation for five SDKs to disagree about.
+// `freeTier` renders as the literal `true` or `false`.
+//
+// tenantId and productId are inside the signature deliberately. Without them a
+// config legitimately signed for one product replays against another under the
+// same tenant keyset — including a product whose trial is meant to be zero.
+//
+// Changing these bytes is a protocol break: the worker and the Rust, Swift, JS
+// and C# SDKs must all produce and accept the same string, or they will
+// disagree about the same tenant. The literal expectations in
+// tests/test_client.cpp are the guard.
+
+
+namespace keylight {
+
+inline std::string config_canonical_payload(const std::string& kid,
+                                            const std::string& tenantId,
+                                            const std::string& productId,
+                                            int64_t            issuedAt,
+                                            int64_t            expiresAt,
+                                            int                trialDurationDays,
+                                            bool               freeTierEnabled)
+{
+    return "cfg1|" + kid + "|" + tenantId + "|" + productId
+         + "|" + std::to_string(issuedAt)
+         + "|" + std::to_string(expiresAt)
+         + "|" + std::to_string(trialDurationDays)
+         + "|" + (freeTierEnabled ? "true" : "false");
+}
+
+} // namespace keylight
+
+// ──────────────────────────────────────────────────────────────────────────
 // include/keylight/client.hpp
 // ──────────────────────────────────────────────────────────────────────────
 
@@ -3350,10 +3418,20 @@ public:
         }
         const Json& j = jr.value();
 
+        const int   trial_days = static_cast<int>(j["trial_duration_days"].as_int());
+        const bool  free_tier  = j["free_tier_enabled"].as_bool();
+
+        // Authenticate before caching. Nothing below writes to the cache until
+        // this returns ok, so a rejected config leaves the last good value —
+        // or the Config seed — in force rather than adopting what a fake
+        // server claimed.
+        auto vr = verify_config_(j, trial_days, free_tier);
+        if (!vr.is_ok()) return vr;
+
         {
             std::lock_guard<std::mutex> lock(cache_mutex_);
-            cached_server_trial_days_ = static_cast<int>(j["trial_duration_days"].as_int());
-            cached_server_free_tier_  = j["free_tier_enabled"].as_bool();
+            cached_server_trial_days_ = trial_days;
+            cached_server_free_tier_  = free_tier;
         }
         (void)save_cache_();
 
@@ -4005,6 +4083,85 @@ private:
         }
         headers["X-Keylight-Request-Id"] = detail::random_request_id();
         return headers;
+    }
+
+    /// Authenticate a GET /config body. See config_payload.hpp for why this
+    /// exists and, just as importantly, what it does not buy.
+    ///
+    /// Returns an error rather than silently ignoring a bad config: the caller
+    /// asked for a refresh and deserves to know it was refused, and a forged
+    /// config is worth surfacing. The failure is non-fatal either way, because
+    /// fetchConfig() never touches the cache unless this returns ok.
+    Result<void> verify_config_(const Json&  j,
+                                int          trial_days,
+                                bool         free_tier) const
+    {
+        const std::string kid = j["kid"].as_string();
+        const std::string sig = j["signature"].as_string();
+
+        if (kid.empty() || sig.empty()) {
+            // No signature at all. A signature that is PRESENT is always
+            // checked below; this branch only decides the rollout question.
+            if (cfg_.requireSignedConfig) {
+                return Result<void>::err({ErrorCode::BadResponse,
+                    "config: unsigned response rejected (requireSignedConfig)"});
+            }
+            return Result<void>::ok();
+        }
+
+        auto key_it = cfg_.trustedKeys.find(kid);
+        if (key_it == cfg_.trustedKeys.end()) {
+            return Result<void>::err({ErrorCode::BadResponse,
+                "config: unknown signing key '" + kid + "'"});
+        }
+
+        const int64_t issued_at  = j["issued_at"].as_int();
+        const int64_t expires_at = j["expires_at"].as_int();
+
+        // Freshness bounds the WIRE, not the cache. This is what stops an old,
+        // genuinely-signed config that granted a longer trial from being
+        // replayed forever. A cached config deliberately outlives its window —
+        // see effectiveTrialDurationDays(); it was verified once and sits in
+        // the machine-bound store, and expiring it would cut an offline user's
+        // trial short to punish an attack they are not committing.
+        const int64_t now  = now_fn_();
+        const int64_t skew = 300;
+        if (expires_at != 0 && now > expires_at + skew) {
+            return Result<void>::err({ErrorCode::BadResponse,
+                "config: signed response has expired"});
+        }
+        if (issued_at != 0 && now + skew < issued_at) {
+            return Result<void>::err({ErrorCode::BadResponse,
+                "config: signed response is not yet valid"});
+        }
+
+        // tenantId/productId come from OUR config, not the body — that is what
+        // makes a config signed for another product fail here instead of
+        // validating against its own claim.
+        const std::string payload = config_canonical_payload(
+            kid, cfg_.tenantId, cfg_.productId, issued_at, expires_at,
+            trial_days, free_tier);
+
+        const std::string pk_bytes  = b64_decode_flexible(key_it->second);
+        const std::string sig_bytes = b64_decode_flexible(sig);
+        if (pk_bytes.size() != 32 || sig_bytes.size() != 64) {
+            return Result<void>::err({ErrorCode::BadResponse,
+                "config: malformed key or signature"});
+        }
+
+        std::array<uint8_t, 32> pubkey;
+        for (size_t i = 0; i < 32; ++i) pubkey[i] = static_cast<uint8_t>(pk_bytes[i]);
+        std::array<uint8_t, 64> sigbuf;
+        for (size_t i = 0; i < 64; ++i) sigbuf[i] = static_cast<uint8_t>(sig_bytes[i]);
+
+        const bool ok = ed25519_verify(
+            reinterpret_cast<const uint8_t*>(payload.data()), payload.size(),
+            sigbuf, pubkey);
+        if (!ok) {
+            return Result<void>::err({ErrorCode::BadResponse,
+                "config: signature does not verify"});
+        }
+        return Result<void>::ok();
     }
 
     // Every outbound request goes through here. A transient failure (408, 429,

@@ -2413,3 +2413,186 @@ TEST_CASE("Client: a server free-tier flag of false survives a relaunch") {
     Client relaunched(cfg, offline, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
     CHECK(relaunched.effectiveFreeTierEnabled() == false);   // not the seed's true
 }
+
+
+// ---------------------------------------------------------------------------
+// Signed server config (Task 1b).
+//
+// An unsigned /config is the soft spot in an otherwise signed protocol: a lease
+// cannot be forged, so a fake server mints no licence — but without this it
+// mints an unlimited TRIAL, via nothing more than a hosts entry.
+//
+// The signing key below is TEST-ONLY, generated from the fixed seed 0x00..07.
+// It signs nothing real and must never appear in a tenant keyset.
+//
+// The SDK verifies but never signs — signing is the server's job — so these
+// fixtures cannot be produced by the suite itself. Regenerate them with
+// `python3 tools/gen_config_fixtures.py` after any change to
+// config_canonical_payload()'s format, and paste the output over the CFG_*
+// constants below.
+// ---------------------------------------------------------------------------
+
+static const char* CFG_PUBKEY =
+    "PuKopyg8sv1yiUPaoSfvCeSDBxqLS8aZukUi8JsUz94=";
+
+// cfg1|kcfg|testco|testapp|1781076246|1781680000|14|true
+static const char* CFG_SIG_VALID =
+    "OAhXFip/oKm06gPtCEKccWJ4hmnxMEU4NDLf47xzQ+Ip05L1ftgXIiowz2Np3h10nABov2M6WqrXshHRxsTICQ==";
+// cfg1|kcfg|testco|otherapp|... — a real signature, for the WRONG product
+static const char* CFG_SIG_OTHER_PRODUCT =
+    "+1LD7d2bAj2nTaZEDO2o42p/zEGxodPUabTVkTrQz2TBR33/F4oUnmMcuO6eIbdiewyGh07utbjg69zc80ZCDA==";
+// cfg1|kcfg|testco|testapp|1700000000|1700600000|30|true — genuinely signed, long expired
+static const char* CFG_SIG_EXPIRED =
+    "pncOoAY6bfzkIrfkhAW/uz3thV2C6ASo+d8zl8KwtIo3K3Of8aXELCYVDlumt0btbp9jqTd3N2BkcCmDad5FDw==";
+
+static const int64_t CFG_NOW = 1781076256LL;   // inside the valid window
+
+static Config config_signing_cfg() {
+    auto cfg = make_config();
+    // Set explicitly rather than inherited: these two strings are INSIDE the
+    // signed payload, so the fixtures above are only valid for these values.
+    cfg.tenantId  = "testco";
+    cfg.productId = "testapp";
+    cfg.trialDurationDays   = 7;       // the seed a rejected config falls back to
+    cfg.trustedKeys["kcfg"] = CFG_PUBKEY;
+    return cfg;
+}
+
+static std::string signed_config_body(const char* sig,
+                                      int trial_days   = 14,
+                                      int64_t issued   = 1781076246LL,
+                                      int64_t expires  = 1781680000LL) {
+    return std::string(R"({"trial_duration_days":)") + std::to_string(trial_days) +
+           R"(,"free_tier_enabled":true,"issued_at":)" + std::to_string(issued) +
+           R"(,"expires_at":)" + std::to_string(expires) +
+           R"(,"kid":"kcfg","signature":")" + sig + R"("})";
+}
+
+TEST_CASE("Config signature: a valid signature is trusted") {
+    auto cfg = config_signing_cfg();
+    FakeTransport transport;
+    MemoryStore   store;
+    transport.next_status = 200;
+    transport.next_body   = signed_config_body(CFG_SIG_VALID);
+
+    Client client(cfg, transport, store, []{ return CFG_NOW; }, NO_SLEEP);
+    REQUIRE(client.fetchConfig().is_ok());
+    CHECK(client.effectiveTrialDurationDays() == 14);
+}
+
+TEST_CASE("Config signature: a tampered trial duration is ignored") {
+    // The exact attack: a fake server answers with a longer trial. The
+    // signature no longer covers the body, so the seed governs instead.
+    auto cfg = config_signing_cfg();
+    FakeTransport transport;
+    MemoryStore   store;
+    transport.next_status = 200;
+    transport.next_body   = signed_config_body(CFG_SIG_VALID, 3650);
+
+    Client client(cfg, transport, store, []{ return CFG_NOW; }, NO_SLEEP);
+    CHECK(!client.fetchConfig().is_ok());
+    CHECK(client.effectiveTrialDurationDays() == 7);   // the seed, not 3650
+}
+
+TEST_CASE("Config signature: a signature for another product is rejected") {
+    // Without tenant/product inside the payload, a config legitimately signed
+    // for one product replays against another under the same tenant keyset.
+    auto cfg = config_signing_cfg();
+    FakeTransport transport;
+    MemoryStore   store;
+    transport.next_status = 200;
+    transport.next_body   = signed_config_body(CFG_SIG_OTHER_PRODUCT);
+
+    Client client(cfg, transport, store, []{ return CFG_NOW; }, NO_SLEEP);
+    CHECK(!client.fetchConfig().is_ok());
+    CHECK(client.effectiveTrialDurationDays() == 7);
+}
+
+TEST_CASE("Config signature: an expired config from the network is rejected") {
+    // Replay of an old, genuinely-signed config that granted a longer trial.
+    auto cfg = config_signing_cfg();
+    FakeTransport transport;
+    MemoryStore   store;
+    transport.next_status = 200;
+    transport.next_body   =
+        signed_config_body(CFG_SIG_EXPIRED, 30, 1700000000LL, 1700600000LL);
+
+    Client client(cfg, transport, store, []{ return CFG_NOW; }, NO_SLEEP);
+    CHECK(!client.fetchConfig().is_ok());
+    CHECK(client.effectiveTrialDurationDays() == 7);
+}
+
+TEST_CASE("Config signature: an expired config from the CACHE is still used") {
+    // Freshness bounds the wire, not the cache. The cached value was verified
+    // once and lives in the machine-bound store; expiring it would cut an
+    // offline user's trial short to punish an attack they are not committing.
+    auto cfg = config_signing_cfg();
+    MemoryStore store;
+    {
+        FakeTransport transport;
+        transport.next_status = 200;
+        transport.next_body   = signed_config_body(CFG_SIG_VALID);
+        Client client(cfg, transport, store, []{ return CFG_NOW; }, NO_SLEEP);
+        REQUIRE(client.fetchConfig().is_ok());
+    }
+
+    // Relaunch long after the config's own expires_at.
+    FailingTransport offline;
+    Client relaunched(cfg, offline, store, []{ return 1900000000LL; }, NO_SLEEP);
+    CHECK(relaunched.effectiveTrialDurationDays() == 14);
+}
+
+TEST_CASE("Config signature: unsigned is tolerated by default, rejected when required") {
+    auto cfg = config_signing_cfg();
+    const std::string unsigned_body =
+        R"({"trial_duration_days":14,"free_tier_enabled":true})";
+
+    SUBCASE("default accepts unsigned during the signing rollout") {
+        REQUIRE(cfg.requireSignedConfig == false);
+        FakeTransport transport;
+        MemoryStore   store;
+        transport.next_status = 200;
+        transport.next_body   = unsigned_body;
+
+        Client client(cfg, transport, store, []{ return CFG_NOW; }, NO_SLEEP);
+        REQUIRE(client.fetchConfig().is_ok());
+        CHECK(client.effectiveTrialDurationDays() == 14);
+    }
+
+    SUBCASE("requireSignedConfig rejects it") {
+        cfg.requireSignedConfig = true;
+        FakeTransport transport;
+        MemoryStore   store;
+        transport.next_status = 200;
+        transport.next_body   = unsigned_body;
+
+        Client client(cfg, transport, store, []{ return CFG_NOW; }, NO_SLEEP);
+        CHECK(!client.fetchConfig().is_ok());
+        CHECK(client.effectiveTrialDurationDays() == 7);
+    }
+}
+
+TEST_CASE("Config signature: an unknown kid is rejected") {
+    auto cfg = config_signing_cfg();
+    cfg.trustedKeys.erase("kcfg");     // key rotated out from under us
+
+    FakeTransport transport;
+    MemoryStore   store;
+    transport.next_status = 200;
+    transport.next_body   = signed_config_body(CFG_SIG_VALID);
+
+    Client client(cfg, transport, store, []{ return CFG_NOW; }, NO_SLEEP);
+    CHECK(!client.fetchConfig().is_ok());
+    CHECK(client.effectiveTrialDurationDays() == 7);
+}
+
+TEST_CASE("config_canonical_payload matches the documented format") {
+    // The bytes the other four SDKs must reproduce. Pinned literally, because
+    // a silent change here makes this SDK disagree with them about one tenant.
+    CHECK(config_canonical_payload("kcfg", "testco", "testapp",
+                                   1781076246LL, 1781680000LL, 14, true)
+          == "cfg1|kcfg|testco|testapp|1781076246|1781680000|14|true");
+    CHECK(config_canonical_payload("kcfg", "testco", "testapp",
+                                   1781076246LL, 1781680000LL, 0, false)
+          == "cfg1|kcfg|testco|testapp|1781076246|1781680000|0|false");
+}
