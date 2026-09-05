@@ -74,11 +74,11 @@ public:
 
             // Build the typed arrays required by ed25519_verify
             std::array<uint8_t, 32> pubkey;
-            for (int i = 0; i < 32; ++i)
+            for (size_t i = 0; i < 32; ++i)
                 pubkey[i] = static_cast<uint8_t>(pk_bytes[i]);
 
             std::array<uint8_t, 64> sig;
-            for (int i = 0; i < 64; ++i)
+            for (size_t i = 0; i < 64; ++i)
                 sig[i] = static_cast<uint8_t>(sig_bytes[i]);
 
             // Build canonical payload

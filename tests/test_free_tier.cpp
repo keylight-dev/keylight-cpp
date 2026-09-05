@@ -12,7 +12,13 @@
 #include "keylight/store.hpp"
 #include "keylight/transport.hpp"
 
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <functional>
 #include <map>
+#include <mutex>
+#include <thread>
 #include <optional>
 #include <string>
 #include <vector>
@@ -20,6 +26,12 @@
 using namespace keylight;
 
 namespace {
+
+// Retry backoff is real wall-clock time. A test driving a transport that
+// returns a retryable failure injects this instead of the default sleep, so
+// the suite exercises the retry policy without spending ~1.5s per request.
+static const std::function<void(uint64_t)> NO_SLEEP = [](uint64_t){};
+
 
 // ---------------------------------------------------------------------------
 // RecordingTransport — captures every request (headers included) and replays a
@@ -41,12 +53,18 @@ public:
 
     std::vector<Call> calls;
 
+    // Guards `calls` against the heartbeat thread. Without this, every test
+    // in this file that reads `calls` while a heartbeat is running is a data
+    // race — one that shows up as a flaky CI job, not a clean failure.
+    mutable std::mutex mu_;
+
     Result<HttpResponse> request(
         const std::string&                        method,
         const std::string&                        url,
         const std::map<std::string, std::string>& headers,
         const std::string&                        body) override
     {
+        std::lock_guard<std::mutex> lock(mu_);
         calls.push_back({method, url, headers, body});
         if (fail) {
             return Result<HttpResponse>::err({ErrorCode::Network, "offline"});
@@ -57,17 +75,41 @@ public:
         return Result<HttpResponse>::ok(r);
     }
 
-    // Convenience: the last call whose URL ends with /<action>.
-    const Call* last_call_for(const std::string& action) const {
+    // Beacons sent, counted under the lock.
+    size_t keyless_count() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        size_t n = 0;
+        for (const auto& c : calls) {
+            const std::string suffix = "/keyless";
+            if (c.url.size() >= suffix.size() &&
+                c.url.compare(c.url.size() - suffix.size(),
+                              suffix.size(), suffix) == 0) {
+                ++n;
+            }
+        }
+        return n;
+    }
+
+    size_t call_count() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return calls.size();
+    }
+
+    // Convenience: a COPY of the last call whose URL ends with /<action>.
+    // Returns by value, not by pointer: a pointer into `calls` outlives the
+    // lock and the heartbeat thread can reallocate the vector under the
+    // caller's feet.
+    std::optional<Call> last_call_for(const std::string& action) const {
+        std::lock_guard<std::mutex> lock(mu_);
         for (auto it = calls.rbegin(); it != calls.rend(); ++it) {
             const std::string suffix = "/" + action;
             if (it->url.size() >= suffix.size() &&
                 it->url.compare(it->url.size() - suffix.size(),
                                 suffix.size(), suffix) == 0) {
-                return &*it;
+                return *it;
             }
         }
-        return nullptr;
+        return std::nullopt;
     }
 
     static std::string header(const Call& c, const std::string& name) {
@@ -204,7 +246,7 @@ TEST_CASE("FreeTier: disabled by default — no license resolves Invalid") {
     MemStore           store;
     int64_t now = T0;
 
-    Client client(cfg, transport, store, [&]{ return now; });
+    Client client(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
     CHECK(client.checkOnLaunch().value() == State::Invalid);
 }
 
@@ -215,7 +257,7 @@ TEST_CASE("FreeTier: enabled and no trial resolves FreeTier offline") {
     transport.fail = true;             // any request would fail — there must be none
     int64_t now = T0;
 
-    Client client(cfg, transport, store, [&]{ return now; });
+    Client client(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
     auto r = client.checkOnLaunch();
     REQUIRE(r.is_ok());
     CHECK(r.value()      == State::FreeTier);
@@ -230,7 +272,7 @@ TEST_CASE("FreeTier: an active trial still outranks the free tier") {
     MemStore           store;
     int64_t now = T0;
 
-    Client client(cfg, transport, store, [&]{ return now; });
+    Client client(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
     REQUIRE(client.startTrial().is_ok());
     CHECK(client.state() == State::Trial);
 }
@@ -246,7 +288,7 @@ TEST_CASE("FreeTier: an ELAPSED trial drops to FreeTier, not Expired") {
     int64_t now = T0;
 
     {
-        Client client(cfg, transport, store, [&]{ return now; });
+        Client client(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
         REQUIRE(client.startTrial().is_ok());
     }
 
@@ -266,7 +308,7 @@ TEST_CASE("FreeTier: a paid license still wins") {
     transport.next_body = ACTIVATE_OK;
     int64_t now = T0;
 
-    Client client(cfg, transport, store, [&]{ return now; });
+    Client client(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
     REQUIRE(client.activate("KL-TEST-KEY").is_ok());
     CHECK(client.state() == State::Licensed);
 }
@@ -278,7 +320,7 @@ TEST_CASE("FreeTier: deactivate lands on FreeTier rather than the paywall") {
     transport.next_body = ACTIVATE_OK;
     int64_t now = T0;
 
-    Client client(cfg, transport, store, [&]{ return now; });
+    Client client(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
     REQUIRE(client.activate("KL-TEST-KEY").is_ok());
     REQUIRE(client.state() == State::Licensed);
 
@@ -297,7 +339,7 @@ TEST_CASE("Instance id: minted once and stable across calls") {
     MemStore           store;
     int64_t now = T0;
 
-    Client client(cfg, transport, store, [&]{ return now; });
+    Client client(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
     const std::string a = client.freeTierInstanceId();
     const std::string b = client.freeTierInstanceId();
 
@@ -314,7 +356,7 @@ TEST_CASE("Instance id: restored by a new Client on the same store") {
 
     std::string first;
     {
-        Client client(cfg, transport, store, [&]{ return now; });
+        Client client(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
         first = client.freeTierInstanceId();
     }
     Client relaunched(cfg, transport, store, [&]{ return now; });
@@ -329,22 +371,34 @@ TEST_CASE("Instance id: startTrial mints one for conversion attribution") {
     MemStore           store;
     int64_t now = T0;
 
-    Client client(cfg, transport, store, [&]{ return now; });
+    Client client(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
     REQUIRE(client.startTrial().is_ok());
 
     CHECK(store.has_field("trialStart"));
     CHECK(store.str_field("freeTierInstanceId").size() == 36);
 }
 
-TEST_CASE("Instance id: trials disabled means startTrial mints nothing") {
+TEST_CASE("Instance id: startTrial mints one even at a zero duration") {
+    // Inverted from the old contract, deliberately. A zero effective duration
+    // no longer means "trials are disabled" — it is indistinguishable from
+    // "the server config has not arrived yet", so startTrial() now stamps and
+    // mints unconditionally.
+    //
+    // Minting only when the duration is already non-zero was the alternative,
+    // and it loses attribution: an install that starts offline would stamp
+    // without an id, and nothing calls startTrial() a second time once the
+    // duration lands, so a trial that later converts would carry no id to
+    // attribute it by. The id is anonymous, per-install, and never derived
+    // from a licence or from hardware, so minting it early costs nothing that
+    // the trial→convert funnel does not pay for.
     auto cfg = make_config(0);
     RecordingTransport transport;
     MemStore           store;
     int64_t now = T0;
 
-    Client client(cfg, transport, store, [&]{ return now; });
+    Client client(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
     REQUIRE(client.startTrial().is_ok());
-    CHECK_FALSE(store.has_field("freeTierInstanceId"));
+    CHECK(store.has_field("freeTierInstanceId"));
 }
 
 TEST_CASE("Instance id: survives activate and validate") {
@@ -354,7 +408,7 @@ TEST_CASE("Instance id: survives activate and validate") {
     transport.next_body = ACTIVATE_OK;
     int64_t now = T0;
 
-    Client client(cfg, transport, store, [&]{ return now; });
+    Client client(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
     const std::string id = client.freeTierInstanceId();
 
     REQUIRE(client.activate("KL-TEST-KEY").is_ok());
@@ -388,8 +442,8 @@ TEST_CASE("Hardware id: cached after the first successful read") {
     // A later beacon must still carry the hash, from the cached id.
     transport.calls.clear();
     client.reportKeylessState(KeylessState::Expired);
-    const auto* call = transport.last_call_for("keyless");
-    REQUIRE(call != nullptr);
+    const auto call = transport.last_call_for("keyless");
+    REQUIRE(call.has_value());
     CHECK(call->body.find(CANONICAL_HASH) != std::string::npos);
 }
 
@@ -400,11 +454,11 @@ TEST_CASE("Hardware id: machine_hash omitted entirely when none is available") {
     int64_t now = T0;
     auto none = []() -> std::optional<std::string> { return std::nullopt; };
 
-    Client client(cfg, transport, store, [&]{ return now; }, none);
+    Client client(cfg, transport, store, [&]{ return now; }, none, NO_SLEEP);
     client.reportKeylessState(KeylessState::FreeTier);
 
-    const auto* call = transport.last_call_for("keyless");
-    REQUIRE(call != nullptr);
+    const auto call = transport.last_call_for("keyless");
+    REQUIRE(call.has_value());
     CHECK(call->body.find("machine_hash") == std::string::npos);
 }
 
@@ -418,8 +472,8 @@ TEST_CASE("Hardware id: an empty id is treated as absent") {
     Client client(cfg, transport, store, [&]{ return now; }, empty);
     client.reportKeylessState(KeylessState::FreeTier);
 
-    const auto* call = transport.last_call_for("keyless");
-    REQUIRE(call != nullptr);
+    const auto call = transport.last_call_for("keyless");
+    REQUIRE(call.has_value());
     CHECK(call->body.find("machine_hash") == std::string::npos);
 }
 
@@ -434,8 +488,8 @@ TEST_CASE("Beacon: posts instance_id, state and the SDK key to /keyless") {
     const std::string id = client.freeTierInstanceId();
     client.reportKeylessState(KeylessState::FreeTier);
 
-    const auto* call = transport.last_call_for("keyless");
-    REQUIRE(call != nullptr);
+    const auto call = transport.last_call_for("keyless");
+    REQUIRE(call.has_value());
     CHECK(call->method == "POST");
     CHECK(call->url    == "https://api.keylight.dev/testco/testapp/keyless");
     CHECK(RecordingTransport::header(*call, "X-Keylight-SDK-Key") == SDK_KEY);
@@ -452,7 +506,7 @@ TEST_CASE("Beacon: debounced — same state inside 24h sends nothing") {
     int64_t now = T0;
     auto none = []() -> std::optional<std::string> { return std::nullopt; };
 
-    Client client(cfg, transport, store, [&]{ return now; }, none);
+    Client client(cfg, transport, store, [&]{ return now; }, none, NO_SLEEP);
     client.reportKeylessState(KeylessState::FreeTier);
     REQUIRE(transport.calls.size() == 1);
 
@@ -468,7 +522,7 @@ TEST_CASE("Beacon: a changed state defeats the debounce immediately") {
     int64_t now = T0;
     auto none = []() -> std::optional<std::string> { return std::nullopt; };
 
-    Client client(cfg, transport, store, [&]{ return now; }, none);
+    Client client(cfg, transport, store, [&]{ return now; }, none, NO_SLEEP);
     client.reportKeylessState(KeylessState::Trial);
     REQUIRE(transport.calls.size() == 1);
 
@@ -484,7 +538,7 @@ TEST_CASE("Beacon: the same state sends again once 24h have passed") {
     int64_t now = T0;
     auto none = []() -> std::optional<std::string> { return std::nullopt; };
 
-    Client client(cfg, transport, store, [&]{ return now; }, none);
+    Client client(cfg, transport, store, [&]{ return now; }, none, NO_SLEEP);
     client.reportKeylessState(KeylessState::FreeTier);
     REQUIRE(transport.calls.size() == 1);
 
@@ -503,15 +557,20 @@ TEST_CASE("Beacon: a non-200 response does NOT arm the debounce") {
     int64_t now = T0;
     auto none = []() -> std::optional<std::string> { return std::nullopt; };
 
-    Client client(cfg, transport, store, [&]{ return now; }, none);
+    // A 500 is transient, so the beacon is retried to the ceiling before it
+    // gives up. The no-op sleep keeps that from costing real time. What this
+    // case is about is the debounce, not the attempt count: a beacon that
+    // never got a 200 must not suppress reporting for a day.
+    Client client(cfg, transport, store, [&]{ return now; }, none,
+                  NO_SLEEP);
     client.reportKeylessState(KeylessState::FreeTier);
-    REQUIRE(transport.calls.size() == 1);
+    REQUIRE(transport.calls.size() == RETRY_MAX_ATTEMPTS);
     CHECK_FALSE(store.has_field("keylessLastState"));
 
     now = T0 + 60;
     transport.next_status = 200;
     client.reportKeylessState(KeylessState::FreeTier);
-    CHECK(transport.calls.size() == 2);
+    CHECK(transport.calls.size() == RETRY_MAX_ATTEMPTS + 1);
     CHECK(store.str_field("keylessLastState") == "free_tier");
     CHECK(store.int_field("lastKeylessPingAt") == now);
 }
@@ -524,7 +583,7 @@ TEST_CASE("Beacon: a network error is swallowed and leaves the debounce unarmed"
     int64_t now = T0;
     auto none = []() -> std::optional<std::string> { return std::nullopt; };
 
-    Client client(cfg, transport, store, [&]{ return now; }, none);
+    Client client(cfg, transport, store, [&]{ return now; }, none, NO_SLEEP);
     client.reportKeylessState(KeylessState::FreeTier);   // must not throw
     CHECK_FALSE(store.has_field("keylessLastState"));
 }
@@ -537,7 +596,7 @@ TEST_CASE("Beacon: the debounce survives a relaunch") {
     auto none = []() -> std::optional<std::string> { return std::nullopt; };
 
     {
-        Client client(cfg, transport, store, [&]{ return now; }, none);
+        Client client(cfg, transport, store, [&]{ return now; }, none, NO_SLEEP);
         client.reportKeylessState(KeylessState::FreeTier);
     }
     REQUIRE(transport.calls.size() == 1);
@@ -555,7 +614,7 @@ TEST_CASE("Beacon: reporting never changes the resolved state") {
     int64_t now = T0;
     auto none = []() -> std::optional<std::string> { return std::nullopt; };
 
-    Client client(cfg, transport, store, [&]{ return now; }, none);
+    Client client(cfg, transport, store, [&]{ return now; }, none, NO_SLEEP);
     REQUIRE(client.checkOnLaunch().value() == State::FreeTier);
     client.reportKeylessState(KeylessState::FreeTier);
     CHECK(client.state() == State::FreeTier);
@@ -577,8 +636,8 @@ TEST_CASE("Attribution: activate carries free_tier_instance_id and machine_hash"
     const std::string id = client.freeTierInstanceId();
     REQUIRE(client.activate("KL-TEST-KEY").is_ok());
 
-    const auto* call = transport.last_call_for("activate");
-    REQUIRE(call != nullptr);
+    const auto call = transport.last_call_for("activate");
+    REQUIRE(call.has_value());
     CHECK(call->body.find("\"free_tier_instance_id\":\"" + id + "\"") != std::string::npos);
     CHECK(call->body.find(CANONICAL_HASH) != std::string::npos);
 }
@@ -591,11 +650,11 @@ TEST_CASE("Attribution: activate omits free_tier_instance_id when none was minte
     int64_t now = T0;
     auto none = []() -> std::optional<std::string> { return std::nullopt; };
 
-    Client client(cfg, transport, store, [&]{ return now; }, none);
+    Client client(cfg, transport, store, [&]{ return now; }, none, NO_SLEEP);
     REQUIRE(client.activate("KL-TEST-KEY").is_ok());
 
-    const auto* call = transport.last_call_for("activate");
-    REQUIRE(call != nullptr);
+    const auto call = transport.last_call_for("activate");
+    REQUIRE(call.has_value());
     CHECK(call->body.find("free_tier_instance_id") == std::string::npos);
 }
 
@@ -611,8 +670,8 @@ TEST_CASE("Attribution: validate carries machine_hash but not the instance id") 
     REQUIRE(client.activate("KL-TEST-KEY").is_ok());
     REQUIRE(client.validate().is_ok());
 
-    const auto* call = transport.last_call_for("validate");
-    REQUIRE(call != nullptr);
+    const auto call = transport.last_call_for("validate");
+    REQUIRE(call.has_value());
     CHECK(call->body.find(CANONICAL_HASH)            != std::string::npos);
     CHECK(call->body.find("free_tier_instance_id")   == std::string::npos);
 }
@@ -628,8 +687,198 @@ TEST_CASE("Attribution: activate still sends its original fields") {
     Client client(cfg, transport, store, [&]{ return now; }, hw);
     REQUIRE(client.activate("KL-TEST-KEY").is_ok());
 
-    const auto* call = transport.last_call_for("activate");
-    REQUIRE(call != nullptr);
+    const auto call = transport.last_call_for("activate");
+    REQUIRE(call.has_value());
     CHECK(call->body.find("\"license_key\":\"KL-TEST-KEY\"") != std::string::npos);
-    CHECK(call->body.find("\"instance_name\":\"device\"")    != std::string::npos);
+    CHECK(call->body.find("\"instance_name\"") != std::string::npos);
+
+    // instance_name now carries the real machine name; "device" survives
+    // only as the fallback when the platform read fails. Assert against the
+    // detected value at runtime rather than a fixed string (see
+    // keylight::detail::detect_machine_name).
+    std::string host = keylight::detail::detect_machine_name();
+    std::string expected_name = host.empty() ? "device" : host;
+    CHECK(call->body.find("\"instance_name\":\"" + expected_name + "\"") != std::string::npos);
+}
+
+
+// ===========================================================================
+// Keyless heartbeat (Plan 3 Task 8).
+// ===========================================================================
+
+TEST_CASE("Config: the keyless heartbeat defaults to six hours") {
+    keylight::Config cfg;
+    CHECK(cfg.keylessHeartbeatIntervalMs == 6 * 60 * 60 * 1000);
+}
+
+TEST_CASE("Heartbeat: the thread is not spawned by the constructor") {
+    auto cfg = make_config();
+    cfg.keylessHeartbeatIntervalMs = 50;
+
+    RecordingTransport transport;
+    MemStore           store;
+
+    // AU/VST3 hosts instantiate and discard plugin instances repeatedly during
+    // a scan. A constructor that spawns a thread makes scanning expensive, so
+    // the thread starts on first state resolution instead.
+    {
+        Client client(cfg, transport, store, []{ return T0; }, NO_SLEEP);
+        CHECK(client.heartbeatRunningForTest() == false);
+    }
+}
+
+TEST_CASE("Heartbeat: starts on first state resolution and stops on destruction") {
+    auto cfg = make_config();
+    cfg.keylessHeartbeatIntervalMs = 50;
+
+    RecordingTransport   transport;
+    MemStore             store;
+    std::atomic<int64_t> now{T0};
+
+    {
+        Client client(cfg, transport, store, [&]{ return now.load(); }, NO_SLEEP);
+        (void)client.startTrial();          // first state resolution
+        CHECK(client.heartbeatRunningForTest() == true);
+    }   // destructor must join; a leaked thread here would crash the host
+}
+
+TEST_CASE("Heartbeat: a zero interval disables it") {
+    auto cfg = make_config();
+    cfg.keylessHeartbeatIntervalMs = 0;
+
+    RecordingTransport transport;
+    MemStore           store;
+    Client client(cfg, transport, store, []{ return T0; }, NO_SLEEP);
+    (void)client.startTrial();
+
+    CHECK(client.heartbeatRunningForTest() == false);
+}
+
+TEST_CASE("Heartbeat: the first tick is at +interval, never immediate") {
+    // This is what keeps "on by default" compatible with checkOnLaunch() doing
+    // no I/O during a plugin scan: the thread is born and joined without ever
+    // emitting.
+    auto cfg = canonical_config();
+    cfg.keylessHeartbeatIntervalMs = 60 * 1000;   // far longer than this test
+
+    RecordingTransport transport;
+    MemStore           store;
+    Client client(cfg, transport, store, []{ return T0; }, NO_SLEEP);
+    (void)client.startTrial();
+    REQUIRE(client.heartbeatRunningForTest() == true);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    CHECK(transport.keyless_count() == 0);
+}
+
+TEST_CASE("Heartbeat: respects the 24h beacon debounce") {
+    // This is the property that matters — not the number of ticks. A 10ms
+    // interval fires constantly; only the debounce keeps the beacon honest.
+    auto cfg = canonical_config();
+    cfg.keylessHeartbeatIntervalMs = 10;
+
+    RecordingTransport   transport;
+    MemStore             store;
+    std::atomic<int64_t> now{T0};
+
+    Client client(cfg, transport, store, [&]{ return now.load(); }, NO_SLEEP);
+    (void)client.startTrial();
+
+    // First beacon.
+    for (int i = 0; i < 200 && transport.keyless_count() < 1; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    REQUIRE(transport.keyless_count() == 1);
+
+    // Many more ticks inside the 24h window must add nothing.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK(transport.keyless_count() == 1);
+
+    // Past the window, exactly one more.
+    now.store(T0 + 25 * 3600);
+    for (int i = 0; i < 200 && transport.keyless_count() < 2; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    CHECK(transport.keyless_count() == 2);
+}
+
+TEST_CASE("Heartbeat: a licensed device never beacons") {
+    auto cfg = canonical_config();
+    cfg.keylessHeartbeatIntervalMs = 10;
+
+    RecordingTransport   transport;
+    MemStore             store;
+    std::atomic<int64_t> now{T0};
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_OK;
+    Client client(cfg, transport, store, [&]{ return now.load(); }, NO_SLEEP);
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+    REQUIRE(client.state() == State::Licensed);
+
+    const size_t before = transport.keyless_count();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // The beacon counts KEYLESS devices. Reporting a paying customer into the
+    // free-tier table would corrupt the dashboard's conversion numbers.
+    CHECK(transport.keyless_count() == before);
+}
+
+
+TEST_CASE("Client: checkOnLaunch still makes no network call on a free-tier device") {
+    // Regression guard: a DAW scanning plugins must not generate one request
+    // per plugin instantiation. Delivering the config on existing calls is
+    // what lets this stay true — adding a launch-time fetchConfig() would
+    // break it.
+    auto cfg = canonical_config();
+    RecordingTransport transport;
+    MemStore           store;
+    transport.fail = true;
+    int64_t now = T0;
+
+    Client client(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
+    auto r = client.checkOnLaunch();
+    REQUIRE(r.is_ok());
+    CHECK(r.value() == State::FreeTier);
+    CHECK(transport.call_count() == 0);
+}
+
+
+TEST_CASE("Telemetry: activate reports the build's configured trial length") {
+    // Diagnostic only. It exists so a dashboard can say "this install reports
+    // a 30-day build against your 14-day setting" instead of that mismatch
+    // surfacing as a week of support tickets.
+    auto cfg = make_config(30);
+    RecordingTransport transport;
+    MemStore           store;
+    transport.next_body = ACTIVATE_OK;
+
+    Client client(cfg, transport, store, []{ return T0; }, NO_SLEEP);
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    auto call = transport.last_call_for("activate");
+    REQUIRE(call.has_value());
+    CHECK(call->body.find("\"sdk_trial_duration_days\":30") != std::string::npos);
+}
+
+TEST_CASE("Telemetry: the reported trial length is the SEED, not the effective one") {
+    // The distinction is the whole point: reporting the effective value would
+    // just echo the server's own number back at it, which diagnoses nothing.
+    auto cfg = make_config(30);
+    RecordingTransport transport;
+    MemStore           store;
+    transport.next_status = 200;
+    transport.next_body   = R"({"trial_duration_days":14,"free_tier_enabled":false})";
+
+    Client client(cfg, transport, store, []{ return T0; }, NO_SLEEP);
+    REQUIRE(client.fetchConfig().is_ok());
+    REQUIRE(client.effectiveTrialDurationDays() == 14);
+
+    transport.next_body = ACTIVATE_OK;
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    auto call = transport.last_call_for("activate");
+    REQUIRE(call.has_value());
+    CHECK(call->body.find("\"sdk_trial_duration_days\":30") != std::string::npos);
+    CHECK(call->body.find("\"sdk_trial_duration_days\":14") == std::string::npos);
 }

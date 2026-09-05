@@ -141,3 +141,16 @@ TEST_CASE("HttplibTransport — live smoke (KEYLIGHT_LIVE env required)") {
             res.value().body.substr(0, 200));
 }
 #endif
+
+TEST_CASE("HttpResponse: headers default to empty and are aggregate-init compatible") {
+    // A trailing member keeps existing `{status, body}` aggregate
+    // initialization compiling — that form is used across the test suite and
+    // in integrator code.
+    keylight::HttpResponse r{200, "{}"};
+    CHECK(r.status == 200);
+    CHECK(r.body == "{}");
+    CHECK(r.headers.empty());
+
+    r.headers["retry-after"] = "30";
+    CHECK(r.headers.at("retry-after") == "30");
+}

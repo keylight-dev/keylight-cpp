@@ -10,19 +10,47 @@
  * The audio render thread (processBlock) MUST NOT block, allocate, or lock.
  * All licensing network I/O runs on a background std::thread and delivers
  * results to the message thread via juce::MessageManager::callAsync.
- * The only data the audio thread ever touches are two std::atomic fields:
+ * The only data the audio thread ever touches are three std::atomic fields:
  *
- *   std::atomic<keylight::State>  state_snapshot_   — mirrors Client::state()
- *   std::atomic<bool>             pro_enabled_       — mirrors hasEntitlement("pro")
+ *   std::atomic<keylight::State>  state_snapshot_             — Client::state()
+ *   std::atomic<bool>             pro_enabled_                — hasEntitlement("pro")
+ *   std::atomic<bool>             generic_entitlement_enabled_ — always false
  *
- * These are updated from the message thread (in the subscription callback)
- * after every SDK state transition.  No mutex, no allocation, no juce::String
- * construction happens on the audio thread — just two relaxed atomic loads.
+ * The first two are updated in the subscription callback, on whichever thread
+ * is draining the SDK's event queue, after every SDK state transition. The
+ * third is a placeholder nothing writes — see hasFeature().
+ *
+ * No mutex, no allocation and no juce::String construction happens on the
+ * audio thread: state() is one relaxed load, and hasFeature() takes a
+ * juce::StringRef so a "pro" literal never materialises a temporary
+ * juce::String. That last part is why the signature is StringRef and not
+ * const juce::String&.
+ *
+ * state_snapshot_ mirrors Client::state(), which fails closed when the system
+ * clock has been rolled back.  The SDK's subscription callback delivers that
+ * same guarded value — the SDK reports every event through the guard and
+ * dedupes on the reported value — so storing the callback's parameter is both
+ * correct and the only way the audio thread, the message thread and
+ * client_->state() cannot disagree.
+ * Do not "optimise" any of the three to a different source.
+ *
+ * The guard also emits its own events: a rolled-back clock changes no raw
+ * state, so the SDK fires the transition off refreshIfNeeded(), which
+ * startAutoValidation() ticks.  Call startAutoValidation(): without it the
+ * snapshot only moves on real state changes and a mid-session rollback would
+ * never reach the audio thread.
+ *
+ * For what every public member costs on the thread you call it from, see the
+ * threading-contract table in integrations/juce/README.md. It covers all of
+ * them, including the two that block unboundedly: the dispatched SDK calls
+ * and the destructor.
  *
  * JUCE version compatibility: JUCE 7 and JUCE 8.
  *
- * Manual verification pending: compile in a real JUCE plugin project.
- * (No JUCE toolchain is available in keylight-cpp CI.)
+ * Compiled in CI: .github/workflows/juce.yml builds integrations/juce/citest
+ * against JUCE 8.0.6 on Linux, macOS and Windows, and JUCE 7.0.12 on Linux and
+ * Windows, then runs a CTest smoke test that constructs Licensing and asserts
+ * the audio-thread-safe accessors.
  */
 
 #pragma once
@@ -200,14 +228,52 @@ public:
         refresh_entitlement_cache_();
 
         // Subscribe to SDK state-change events.
-        // The callback fires on whatever thread changes the state (i.e. the
-        // background network thread managed by this class). We update the
-        // atomics there, then post a UI notification via callAsync so the
-        // editor can repaint.
-        subscription_ = client_->subscribe([this](keylight::State newState)
+        // The callback fires on whatever thread is draining the SDK's event
+        // queue. We update the atomics there, then post a UI notification via
+        // callAsync so the editor can repaint.
+        //
+        // alive_ is captured BY VALUE (a shared_ptr copy) and checked before
+        // anything touches `this`. Dropping subscription_ in ~Licensing does
+        // not fence a delivery already in flight on another thread, so the
+        // unsubscribe alone does not make this safe.
+        //
+        // KNOWN LIMITATION, be honest about it: the flag NARROWS the window,
+        // it does not close it. This is a check-then-use — the callback can
+        // pass the check, ~Licensing can then run to completion, and the
+        // callback proceeds into state_snapshot_/refresh_entitlement_cache_()
+        // on a destroyed object.
+        //
+        // ~Licensing closes the AUTO-VALIDATION half: step ⑤ destroys the
+        // Client last, and ~Client() joins the worker, so a delivery on that
+        // thread finishes while every member it can touch is still alive.
+        //
+        // What remains is delivery on an APP thread — the SDK hands the baton
+        // to whichever thread is draining, so an app thread calling
+        // refreshIfNeeded() on focus/resume can be the one in your callback,
+        // and nothing here joins that thread. Closing it needs a fence in the
+        // SDK, and a naive one reintroduces a deadlock (an unsubscribe() that
+        // waits blocks the caller on user callback code), so it is a
+        // deliberate follow-up rather than an oversight.
+        //
+        // NOTE: stopping auto-validation first does NOT help — since 0.2.0
+        // stopAutoValidation() does not wait for anything. Destroy Licensing
+        // from the message thread, and do not call into the SDK off
+        // underlying() from another thread while doing so.
+        subscription_ = client_->subscribe(
+            [this, aliveCopy = alive_](keylight::State newState)
         {
-            // Update atomics (may be called from any thread, but always from
-            // our own background thread — never from the audio thread).
+            if (!aliveCopy->load())   // Licensing destroyed mid-delivery
+                return;
+
+            // Update atomics. Called from whichever thread is draining the
+            // SDK's queue — never the audio thread.
+            //
+            // `newState` IS the guarded state: the SDK reports subscription
+            // events through the same clock guard as Client::state(). Use it
+            // rather than re-reading client_->state(), so the value latched
+            // for the audio thread is byte-for-byte the one handed to the
+            // message thread below — re-reading could straddle a clock change
+            // and leave the two disagreeing. Still a single atomic store.
             state_snapshot_.store(newState, std::memory_order_relaxed);
             refresh_entitlement_cache_();
 
@@ -215,12 +281,38 @@ public:
             // automatically; keylight::Client deliberately never does, so the
             // adapter does it here.
             //
-            // Called INLINE on purpose. This callback already runs on our
-            // background thread (never the audio or message thread), and
-            // dispatch_() joins that same thread — routing through it here
+            // Called INLINE on purpose. dispatch_() joins the background
+            // thread this callback normally runs on, so routing through it
             // would make the thread join itself. The SDK debounces to one
-            // request per 24h per state, so the usual cost is a lock and a
-            // comparison. Licensed/Invalid are not keyless states.
+            // request per 24h per state. Do not reason from notify_()'s dedupe
+            // to "so this is always a POST": the two dedupe on DIFFERENT
+            // values. notify_() dedupes on State (six values); the beacon
+            // dedupes on the keyless wire string (three), and that cache
+            // persists across the states that send nothing. So
+            // Trial -> Licensed -> Trial is a genuine state change each time,
+            // yet the second beacon repeats the wire "trial" and the 24h arm
+            // does suppress it.
+            //
+            // Cost is therefore either a lock and a comparison or a full
+            // blocking POST, depending on what came before. Assume the POST
+            // when reasoning about teardown latency, since that is the
+            // expensive branch. Licensed/Invalid are not keyless states.
+            //
+            // The callback runs on whichever thread is DRAINING the SDK's
+            // event queue — usually the thread that caused the transition
+            // (our background thread for a dispatched call, the SDK's
+            // auto-validation thread for a tick), but under concurrency a
+            // thread already delivering picks up the event instead. Never the
+            // audio thread. It CAN reach the message thread if you call the
+            // SDK directly off underlying() from there — the root README
+            // recommends refreshIfNeeded() on focus/resume — in which case
+            // this POST blocks the UI for one round trip, once per 24h. Wrap
+            // that call in your own thread if that matters to you.
+            //
+            // Calling back into the SDK from here is allowed — it holds no
+            // lock during delivery, and a re-entrant call queues its event
+            // rather than recursing. The one thing not to do is destroy the
+            // Client (or this Licensing) from inside the callback.
             switch (newState)
             {
                 case keylight::State::Trial:
@@ -234,6 +326,11 @@ public:
                     break;
                 case keylight::State::Licensed:
                 case keylight::State::Invalid:
+                // Limited means a trusted, licensed lease that the server
+                // could only issue in degraded form (signing-key incident) —
+                // it is licensing material, not a keyless funnel state, so it
+                // is not reported here either.
+                case keylight::State::Limited:
                     break;
             }
 
@@ -241,7 +338,6 @@ public:
             // Capture alive_ by value (copies the shared_ptr, keeping the
             // flag alive even after ~Licensing runs) so the lambda can
             // safely check whether this is still valid before touching members.
-            auto aliveCopy = alive_;
             juce::MessageManager::callAsync([this, aliveCopy, newState]()
             {
                 if (!aliveCopy->load())  // Licensing destroyed; drop safely
@@ -253,9 +349,28 @@ public:
     }
 
     // -----------------------------------------------------------------------
-    // Destructor — joins any running background thread; stops auto-validation.
-    // Safe to call from the message thread (join is quick; background threads
-    // do only one SDK round-trip then exit).
+    // Destructor — retires auto-validation, joins our own worker thread, then
+    // destroys the SDK client (which joins the SDK's worker).
+    //
+    // Call from the MESSAGE THREAD, and know that it can block there. TWO
+    // separate waits, and the likelier one is not the SDK's:
+    //
+    //   step ④ — joins OUR OWN worker thread, the one dispatch_() starts for
+    //            activate, validate, deactivate, checkOnLaunch, startTrial and
+    //            reportKeylessState. If the session closes while one is in
+    //            flight, this is a full HTTP round trip on the message thread
+    //            — plus the inline keyless POST and any of your listeners, if
+    //            that thread is delivering. A button press away, not a timer
+    //            coincidence, and note dispatch_() does the same join on every
+    //            ordinary call, not just here.
+    //
+    //   step ⑤ — destroys the Client, which joins the SDK's auto-validation
+    //            worker. Usually free: ~Client() wakes that worker before it
+    //            joins, so one parked on the (default 30-minute) interval
+    //            exits without another cycle. It costs only when that worker
+    //            is mid-cycle — up to one round trip, plus every queued
+    //            listener callback if it holds the delivery baton. Your
+    //            listeners set that ceiling, so it has no fixed upper bound.
     // -----------------------------------------------------------------------
     ~Licensing()
     {
@@ -268,15 +383,55 @@ public:
         //   our state-change callback (and enqueueing new callAsync lambdas).
         subscription_ = keylight::Subscription{};
 
-        // ③ Stop SDK auto-validation thread (may fire a final callback; the
-        //   alive_ flag above makes any resulting callAsync a safe no-op).
+        // ③ Retire the SDK auto-validation worker.  NOTE: since 0.2.0 this
+        //   does NOT wait for that worker to exit — it retires it and
+        //   returns, so a final state-change callback can still be in flight
+        //   when this line completes.  The alive_ flag above is what makes
+        //   that safe, not this call.
         client_->stopAutoValidation();
 
-        // ④ Join any pending activate/validate/deactivate worker thread.
+        // ④ Join any pending dispatched worker thread — activate, validate,
+        //   deactivate, checkOnLaunch, startTrial or reportKeylessState.
         //   These callAsync lambdas only capture result+cb, not this, so they
         //   are safe even without the flag — but joining here keeps ordering
         //   well-defined.
+        //
+        //   COST: this is the teardown block you are most likely to actually
+        //   hit, and it is more than one round trip. That thread is inside
+        //   JuceUrlTransport::request(), so if the session closed mid-request
+        //   this waits out the whole HTTP round trip on the MESSAGE THREAD —
+        //   nothing cancels it, the transport has no interrupt.
+        //
+        //   AND THEN some. That thread is also the one that moved the state,
+        //   so it holds the SDK's delivery baton and runs the subscription
+        //   callback below inline: possibly a second blocking POST via
+        //   reportKeylessState (see the note there — it may or may not be
+        //   debounced away), plus any listener the integrator registered
+        //   directly through underlying().subscribe(). Your listeners set that
+        //   ceiling, so like step ⑤ it has no fixed upper bound.
+        //
+        //   checkOnLaunch() is the likeliest one to be in flight, since a DAW
+        //   instantiates and destroys plugins while scanning.
         join_worker_();
+
+        // ⑤ Destroy the Client HERE, in the destructor body, not in member
+        //   destruction order.  ~Client() is the only thing that joins the
+        //   auto-validation worker, and client_ is declared BEFORE
+        //   state_snapshot_ and pro_enabled_ — so leaving it to member
+        //   destruction would join after those atomics are already gone, and
+        //   an in-flight callback that got past the alive_ check would write
+        //   to destroyed members.  Formally UB, and free to avoid.
+        //
+        //   COST: usually zero. ~Client() wakes the SDK worker before it
+        //   joins, so one parked in its interval wait exits without another
+        //   cycle — on the default 30-minute interval that is almost always
+        //   the case. It blocks the MESSAGE THREAD only when the worker is
+        //   mid-cycle: up to one round trip, plus every queued listener
+        //   callback if that worker is delivering events. Your listeners set
+        //   that ceiling, so keep them short if teardown latency matters.
+        //   It is the price of a clean shutdown, and it was previously paid
+        //   inside stopAutoValidation().
+        client_.reset();
     }
 
     // Move-only (owns a thread).
@@ -424,6 +579,9 @@ public:
     // (interval configured via Config::autoValidationIntervalMs, default 30 min).
     // Call startAutoValidation() from the message thread after construction.
     // -----------------------------------------------------------------------
+    // stopAutoValidation() retires the SDK worker and returns; it does NOT
+    // wait for it to exit, so one more validation cycle (and one more
+    // onStateChanged) can land after this returns. ~Licensing() is what joins.
     void startAutoValidation() { client_->startAutoValidation(); }
     void stopAutoValidation()  { client_->stopAutoValidation();  }
 
@@ -442,31 +600,50 @@ public:
 
     /// Returns true iff the named entitlement/feature is currently enabled.
     ///
-    /// IMPORTANT: to remain audio-thread safe, this method uses a pre-cached
-    /// std::atomic<bool> per-entitlement.  The per-feature atomics are
-    /// refreshed from the message/background thread on every state change via
-    /// the SDK subscription.
+    /// IMPORTANT: to remain audio-thread safe this reads a pre-cached
+    /// std::atomic<bool>. There is exactly ONE such cache, for "pro", and it
+    /// is refreshed from the message/background thread on every state change
+    /// via the SDK subscription. There is no per-entitlement cache and no
+    /// per-feature refresh.
     ///
-    /// For the common "pro" entitlement: call hasFeature("pro") — reads
-    /// pro_enabled_ atomically.  For other entitlements, reads the generic
-    /// snapshot (which caches the last hasEntitlement result for exactly the
-    /// feature key last subscribed).
+    /// So: call hasFeature("pro") — reads pro_enabled_ atomically.
     ///
-    /// If you gate on multiple entitlements, pre-cache each one in a separate
-    /// std::atomic<bool> member via the subscription callback (see README).
-    // NOTE: noexcept / lock-free guarantee is for RELEASE builds.  In JUCE
-    // debug builds, juce::String comparison may invoke debug instrumentation
-    // that allocates; only the atomics themselves are unconditionally lock-free.
-    bool hasFeature(const juce::String& feature) const noexcept
+    /// ANY OTHER KEY ALWAYS RETURNS FALSE. generic_entitlement_enabled_ is a
+    /// placeholder that nothing ever writes; it is not a cache of "the feature
+    /// key last subscribed". If you gate on a second entitlement, pre-cache it
+    /// yourself in your own std::atomic<bool>, refreshed from the subscription
+    /// callback (see README). Fails closed, but silently — do not discover
+    /// this from behaviour.
+    ///
+    /// Takes juce::StringRef, NOT const juce::String&. That is load-bearing:
+    /// binding a "pro" literal to a const String& materialises a temporary
+    /// juce::String, which HEAP-ALLOCATES — in every build, release included —
+    /// and the documented call site for this method is inside processBlock.
+    /// StringRef wraps the pointer without copying, so the audio thread does
+    /// no allocation. Do not "simplify" this signature back.
+    ///
+    /// PRECONDITION: that holds only at JUCE_STRING_UTF_TYPE == 8, the
+    /// default. At 16 or 32, StringRef carries a juce::String member and its
+    /// const char* constructor allocates — silently restoring exactly the
+    /// audio-thread allocation this signature exists to remove. If you change
+    /// that setting, cache the result yourself outside processBlock.
+    bool hasFeature(juce::StringRef feature) const noexcept
     {
         // Fast path for the canonical "pro" entitlement — atomic bool.
         // This covers the vast majority of plugins that have a single pro tier.
-        if (feature == "pro")
+        //
+        // The juce::StringRef() is REQUIRED, not stylistic. `feature == "pro"`
+        // does not compile: StringRef declares operator==(const String&) AND
+        // operator==(StringRef), and both String(const char*) and
+        // StringRef(const char*) are non-explicit — so a char array has two
+        // equally-ranked user-defined conversions and the call is ambiguous.
+        // Naming StringRef makes it an exact match, which outranks every
+        // conversion candidate.
+        if (feature == juce::StringRef("pro"))
             return pro_enabled_.load(std::memory_order_relaxed);
 
-        // Fallback: read generic cached entitlement flag.
-        // Updated by refresh_entitlement_cache_ on state transitions.
-        // Still lock-free (atomic bool).
+        // Any other key: always false. See the note above — nothing writes
+        // generic_entitlement_enabled_.
         return generic_entitlement_enabled_.load(std::memory_order_relaxed);
     }
 
@@ -525,9 +702,12 @@ private:
     {
         bool pro = client_->hasEntitlement("pro");
         pro_enabled_.store(pro, std::memory_order_relaxed);
-        // generic_entitlement_enabled_ is not meaningful without a target feature;
-        // it defaults to false until callers explicitly populate it.
-        // (Advanced users: extend this pattern with their own atomics.)
+        // generic_entitlement_enabled_ is not meaningful without a target
+        // feature, and NOTHING writes it — not here, not anywhere. It is
+        // private, so no caller or subclass can populate it either. Every
+        // hasFeature() key other than "pro" is therefore permanently false.
+        // Integrators who need a second entitlement add their own atomic and
+        // refresh it from their own onStateChanged (see README).
     }
 
     // Join any running worker thread before launching a new one.
@@ -538,7 +718,22 @@ private:
     }
 
     // Dispatch a callable to a background std::thread.
-    // Joins the previous thread first (our operations are short, sequential).
+    //
+    // BLOCKS THE CALLER. join_worker_() waits for the previous dispatched
+    // operation to finish, and every caller of this — activate, validate,
+    // deactivate, checkOnLaunch, startTrial, reportKeylessState — is
+    // documented "call from the message thread". So a second call made while
+    // the first request is still in flight stalls the message thread for the
+    // remainder of that HTTP round trip, bounded only by JuceUrlTransport's
+    // 15 s connection timeout.
+    //
+    // That is reachable in ordinary use, not just at teardown: the documented
+    // integration calls checkOnLaunch() at construction, and a user tapping
+    // Activate a second later joins it. Measured ~280 ms with a 300 ms request
+    // in flight.
+    //
+    // One at a time is deliberate — it keeps the SDK calls sequential — but do
+    // not read "our operations are short" into it. They are network calls.
     template <typename Fn>
     void dispatch_(Fn&& fn)
     {

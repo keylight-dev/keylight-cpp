@@ -9,12 +9,22 @@
 #include "keylight/json.hpp"
 #include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <functional>
 #include <string>
 #include <map>
 #include <thread>
+#include <set>
 #include <vector>
+#include <stdexcept>
 
 using namespace keylight;
+
+// Retry backoff is real wall-clock time. A test driving a transport that
+// returns a retryable failure injects this instead of the default sleep, so
+// the suite exercises the retry policy without spending ~1.5s per request.
+static const std::function<void(uint64_t)> NO_SLEEP = [](uint64_t){};
+
 
 // ---------------------------------------------------------------------------
 // FakeTransport — returns a canned HTTP response; optionally captures the body
@@ -27,17 +37,53 @@ public:
     // After each request(), the request body is stored here.
     std::string last_request_body;
 
+    // After each request(), the request headers are stored here.
+    std::map<std::string, std::string> last_request_headers;
+
+    // Total requests issued, for asserting debounces and retry counts.
+    size_t calls_made = 0;
+
     Result<HttpResponse> request(
         const std::string&,
         const std::string&,
-        const std::map<std::string, std::string>&,
+        const std::map<std::string, std::string>& headers,
         const std::string& body) override
     {
-        last_request_body = body;
+        last_request_body    = body;
+        last_request_headers = headers;
+        ++calls_made;
         HttpResponse r;
         r.status = next_status;
         r.body   = next_body;
         return Result<HttpResponse>::ok(r);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// ScriptedTransport — replays a scripted sequence of responses, so retry
+// behavior can be asserted without sleeping or networking. The last reply
+// repeats once the script runs out, so an "always 503" case needs one entry.
+// ---------------------------------------------------------------------------
+class ScriptedTransport : public Transport {
+public:
+    struct Reply { int status; std::string body; std::map<std::string, std::string> headers; };
+
+    std::vector<Reply> replies;
+    size_t             calls = 0;
+
+    Result<HttpResponse> request(
+        const std::string&,
+        const std::string&,
+        const std::map<std::string, std::string>&,
+        const std::string&) override
+    {
+        const Reply& r = replies[calls < replies.size() ? calls : replies.size() - 1];
+        ++calls;
+        HttpResponse out;
+        out.status  = r.status;
+        out.body    = r.body;
+        out.headers = r.headers;
+        return Result<HttpResponse>::ok(out);
     }
 };
 
@@ -132,6 +178,26 @@ static const std::string VALIDATE_RESPONSE = R"({
 // "expired-status" vector from tests/fixtures/vectors.json. resolve_from_lease_
 // maps any trusted, non-"active" status to State::Expired, which is the
 // "deny" outcome the revocation-parity design calls for.
+// VALIDATE_RESPONSE plus the server's product settings at the top level. The
+// lease and its signature are untouched — the config fields sit OUTSIDE the
+// signed lease payload, which is why they need their own authentication.
+static const std::string VALIDATE_RESPONSE_WITH_CONFIG = R"({
+  "valid": true,
+  "trial_duration_days": 14,
+  "free_tier_enabled": false,
+  "license_expires_at": 1781681046,
+  "lease": {
+    "kid": "k1",
+    "licenseKeyHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "instanceId": "00000000-0000-4000-8000-000000000001",
+    "issuedAt": 1781076246,
+    "expiresAt": 1781681046,
+    "status": "active",
+    "signature": "SUrg6IHJBkO4PB80hiwXhkCFgHTxp5Ao6i9fRnajIH3ws3E+F444xYUQL9UyJYMz4cC+6f8YDMfwrxIv1mQeBw==",
+    "entitlements": ["pro"]
+  }
+})";
+
 static const std::string REVOKED_VALIDATE_RESPONSE = R"({
   "valid": false,
   "lease": {
@@ -385,7 +451,7 @@ TEST_CASE("Client: activate() sends cpu_cores and memory buckets") {
     transport.next_status = 200;
     transport.next_body   = ACTIVATE_RESPONSE;
 
-    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; });
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
     REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
 
     const std::string& body = transport.last_request_body;
@@ -408,7 +474,7 @@ TEST_CASE("Client: validate() sends cpu_cores and memory buckets") {
 
     transport.next_status = 200;
     transport.next_body   = ACTIVATE_RESPONSE;
-    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; });
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
     REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
 
     transport.next_body = VALIDATE_RESPONSE;
@@ -431,7 +497,7 @@ TEST_CASE("Client: raw core count and raw byte count never reach the wire") {
 
     transport.next_status = 200;
     transport.next_body   = ACTIVATE_RESPONSE;
-    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; });
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
     REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
 
     const std::string& body = transport.last_request_body;
@@ -489,6 +555,35 @@ public:
     }
 };
 
+// A transport that behaves like FakeTransport (configurable status/body)
+// until told to go offline, at which point every subsequent request() fails
+// with a network error. This lets a single Client instance activate online
+// and then "lose the network" mid-session, without constructing a second
+// Client (which would re-run refresh_state_from_store_ and defeat tests that
+// need to isolate apply_offline_grace_'s own deny branch from the launch
+// path's construction-time bound).
+class GoesOfflineTransport : public Transport {
+public:
+    int         next_status = 200;
+    std::string next_body;
+    bool        offline     = false;
+
+    Result<HttpResponse> request(
+        const std::string&,
+        const std::string&,
+        const std::map<std::string, std::string>&,
+        const std::string&) override
+    {
+        if (offline) {
+            return Result<HttpResponse>::err({ErrorCode::Network, "simulated network failure"});
+        }
+        HttpResponse r;
+        r.status = next_status;
+        r.body   = next_body;
+        return Result<HttpResponse>::ok(r);
+    }
+};
+
 // Persist a valid-active lease blob directly into the store, mimicking what
 // activate() would have written (format: {"lease":{...},"expiresAt":N,...}).
 // Also stores lastValidatedOnline (for offline-grace tests).
@@ -514,6 +609,31 @@ static void seed_store_with_valid_lease(MemoryStore& store,
     int64_t lvo = (last_validated_online == 0) ? now : last_validated_online;
     blob += ",\"lastValidatedOnline\":" + std::to_string(lvo);
     blob += "}";
+
+    store.save(blob);
+}
+
+// Persist a trusted, "fallback"-status lease blob directly into the store —
+// the same lease as FALLBACK_VALIDATE_RESPONSE, in the shape validate()
+// would have written after receiving it. Used to exercise the offline
+// relaunch path (refresh_state_from_store_ -> derive_state_from_verify_)
+// independently of the online path (resolve_from_lease_), which
+// FALLBACK_VALIDATE_RESPONSE + a live transport already covers elsewhere.
+static void seed_store_with_fallback_lease(MemoryStore& store, int64_t now) {
+    std::string blob = R"({"lease":{)"
+        R"("kid":"k1",)"
+        R"("licenseKeyHash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",)"
+        R"("instanceId":"00000000-0000-4000-8000-000000000001",)"
+        R"("issuedAt":1781076246,)"
+        R"("expiresAt":1781681046,)"
+        R"("status":"fallback",)"
+        R"("signature":"H/L/1y6x6Cg11Hle+6RNFioM9N6gFWGeR9tOORsNZlcL+kinqJdtb3T5dD2Irh5Q9bH1avSUQZGQXtkqaeEVDw==",)"
+        R"("entitlements":[]})"
+        R"(,"expiresAt":1781681046)"
+        R"(,"instanceId":"inst-abc")"
+        R"(,"licenseKey":"XXXX-YYYY-ZZZZ-0001")"
+        ",\"lastValidatedOnline\":" + std::to_string(now) +
+        "}";
 
     store.save(blob);
 }
@@ -654,7 +774,7 @@ TEST_CASE("E2: checkOnLaunch with a transient failure keeps access within the of
     int64_t last_lvo = now - 10LL * 86400;
     seed_store_with_valid_lease(store, VALID_ACTIVE_NOW, 1781681046LL, last_lvo);
 
-    Client client(cfg, transport, store, [now]{ return now; });
+    Client client(cfg, transport, store, [now]{ return now; }, NO_SLEEP);
     REQUIRE(client.state() == State::Licensed);
 
     auto r = client.checkOnLaunch();
@@ -663,8 +783,11 @@ TEST_CASE("E2: checkOnLaunch with a transient failure keeps access within the of
     CHECK(client.state() == State::Licensed);
 
     // The network WAS attempted (checkOnLaunch always validates); it just
-    // failed transiently and must not deny access within the cap.
-    CHECK(transport.call_count == 1);
+    // failed transiently and must not deny access within the cap. A transport
+    // error is retried like a 503, so the attempt count is the retry ceiling
+    // rather than 1 — what this case asserts is that the failure did not deny
+    // access, not how many times it was tried.
+    CHECK(transport.call_count == static_cast<int>(RETRY_MAX_ATTEMPTS));
 }
 
 TEST_CASE("E2: checkOnLaunch denies once offline past maxOfflineDays (15)") {
@@ -679,8 +802,12 @@ TEST_CASE("E2: checkOnLaunch denies once offline past maxOfflineDays (15)") {
 
     seed_store_with_valid_lease(store, VALID_ACTIVE_NOW, 1781681046LL, last_lvo);
 
-    Client client(cfg, transport, store, [now]{ return now; });
-    REQUIRE(client.state() == State::Licensed);
+    // refresh_state_from_store_ now applies the offline bound directly on
+    // construction (this is the behavior this task adds), so the cached
+    // lease already resolves to Expired before any network call — not just
+    // after checkOnLaunch's own grace check below.
+    Client client(cfg, transport, store, [now]{ return now; }, NO_SLEEP);
+    REQUIRE(client.state() == State::Expired);
 
     auto r = client.checkOnLaunch();
     REQUIRE(r.is_ok());
@@ -701,7 +828,7 @@ TEST_CASE("E2: checkOnLaunch with maxOfflineDays disabled never denies for age")
 
     seed_store_with_valid_lease(store, VALID_ACTIVE_NOW, 1781681046LL, last_lvo);
 
-    Client client(cfg, transport, store, [now]{ return now; });
+    Client client(cfg, transport, store, [now]{ return now; }, NO_SLEEP);
     REQUIRE(client.state() == State::Licensed);
 
     auto r = client.checkOnLaunch();
@@ -728,7 +855,7 @@ TEST_CASE("E2: checkOnLaunch with expired-beyond-grace lease → Expired") {
     // lastValidatedOnline = VALID_ACTIVE_NOW (≈ 7 days before now)
     seed_store_with_valid_lease(store, VALID_ACTIVE_NOW, lease_expires_at, VALID_ACTIVE_NOW);
 
-    Client client(cfg, transport, store, [now]{ return now; });
+    Client client(cfg, transport, store, [now]{ return now; }, NO_SLEEP);
 
     auto r = client.checkOnLaunch();
     REQUIRE(r.is_ok());
@@ -749,7 +876,7 @@ TEST_CASE("E2: refreshIfNeeded within offline grace keeps Licensed on network fa
     // Lease expires at 1781681046 which is still in the future at 'now'
     seed_store_with_valid_lease(store, VALID_ACTIVE_NOW, 1781681046LL, last_lvo);
 
-    Client client(cfg, transport, store, [now]{ return now; });
+    Client client(cfg, transport, store, [now]{ return now; }, NO_SLEEP);
 
     // State from store (loaded on construction) should be Licensed
     REQUIRE(client.state() == State::Licensed);
@@ -851,7 +978,7 @@ TEST_CASE("E2: no spurious events on same-state transitions") {
 // ---------------------------------------------------------------------------
 // CountingTransport is defined in the E2 helpers section above.
 
-TEST_CASE("E3: startAutoValidation + stopAutoValidation cleanly joins") {
+TEST_CASE("E3: startAutoValidation + stopAutoValidation shut down cleanly") {
     // No background thread without a stored license, so seed one first.
     // We seed so that refreshIfNeeded fires (last_validated > stale threshold
     // triggers a validate call on the thread). The transport responds with a
@@ -869,11 +996,11 @@ TEST_CASE("E3: startAutoValidation + stopAutoValidation cleanly joins") {
     transport.next_status = 200;
     transport.next_body   = VALIDATE_RESPONSE;
 
-    Client client(cfg, transport, store, [now]{ return now; });
+    Client client(cfg, transport, store, [now]{ return now; }, NO_SLEEP);
 
     // start → stop must return without hanging
     client.startAutoValidation();
-    client.stopAutoValidation(); // must join cleanly (no hang)
+    client.stopAutoValidation(); // retires the worker; must not hang
 
     // Idempotent: stopping again is a no-op
     client.stopAutoValidation();
@@ -888,7 +1015,7 @@ TEST_CASE("E3: no background thread without startAutoValidation") {
     MemoryStore   store;
 
     {
-        Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; });
+        Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
         // Do NOT call startAutoValidation.
         // Scope exit: destructor must not hang or std::terminate.
     }
@@ -905,7 +1032,7 @@ TEST_CASE("E3: destructor stops running auto-validation cleanly") {
     transport.next_body   = VALIDATE_RESPONSE;
 
     {
-        Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; });
+        Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
         client.startAutoValidation();
         // Go out of scope without calling stopAutoValidation.
         // Destructor must join the thread cleanly.
@@ -922,7 +1049,7 @@ TEST_CASE("E3: startAutoValidation is idempotent (double-start safe)") {
     transport.next_status = 200;
     transport.next_body   = VALIDATE_RESPONSE;
 
-    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; });
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
 
     client.startAutoValidation();
     client.startAutoValidation(); // second call must be a no-op, not spawn a second thread
@@ -944,7 +1071,7 @@ TEST_CASE("E3: worker invokes refreshIfNeeded at least once when stale") {
     transport.next_status = 200;
     transport.next_body   = VALIDATE_RESPONSE;
 
-    Client client(cfg, transport, store, [now]{ return now; });
+    Client client(cfg, transport, store, [now]{ return now; }, NO_SLEEP);
 
     client.startAutoValidation();
 
@@ -955,4 +1082,1952 @@ TEST_CASE("E3: worker invokes refreshIfNeeded at least once when stale") {
 
     // The worker must have called refreshIfNeeded at least once → transport hit
     CHECK(transport.call_count >= 1);
+}
+
+TEST_CASE("Client: deactivate sends license_key alongside instance_id") {
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    transport.next_body = R"({"deactivated":true})";
+    REQUIRE(client.deactivate().is_ok());
+
+    // DeactivateBodySchema requires BOTH fields. A body missing license_key is
+    // rejected by zod before any mutation runs, so the seat is never released.
+    CHECK(transport.last_request_body.find("\"license_key\"")        != std::string::npos);
+    CHECK(transport.last_request_body.find("XXXX-YYYY-ZZZZ-0001")    != std::string::npos);
+    CHECK(transport.last_request_body.find("\"instance_id\"")        != std::string::npos);
+}
+
+TEST_CASE("Client: deactivate surfaces a server rejection but still clears the store") {
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    transport.next_status = 422;
+    transport.next_body   = R"({"error":"Instance not found or deactivated"})";
+
+    auto dr = client.deactivate();
+    CHECK(!dr.is_ok());
+    CHECK(dr.error().message.find("Instance not found") != std::string::npos);
+
+    // The local half is cleared regardless — the app must not stay "licensed"
+    // on a machine the user asked to release.
+    auto loaded = store.load();
+    REQUIRE(loaded.is_ok());
+    CHECK(loaded.value().empty());
+    CHECK(client.state() == State::Invalid);
+}
+
+TEST_CASE("Client: activate sends os_version and arch when detectable") {
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    const std::string& body = transport.last_request_body;
+
+    // Both fields are omitted entirely when the platform cannot report them —
+    // the SDK never guesses — so assert presence only when detection worked.
+    if (!keylight::detail::detect_os_version().empty()) {
+        CHECK(body.find("\"os_version\"") != std::string::npos);
+        CHECK(body.find(keylight::detail::detect_os_version()) != std::string::npos);
+    }
+    if (std::string(keylight::detail::current_arch()).empty() == false) {
+        CHECK(body.find("\"arch\"") != std::string::npos);
+        CHECK(body.find(keylight::detail::current_arch()) != std::string::npos);
+    }
+    // device_class is NEVER sent from this SDK: the server derives it.
+    CHECK(body.find("\"device_class\"") == std::string::npos);
+}
+
+TEST_CASE("Client: activate sends a real instance_name, not the literal 'device'") {
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    CHECK(transport.last_request_body.find("\"instance_name\"") != std::string::npos);
+
+    // On any machine that can report a hostname the field must carry it.
+    // "device" survives only as the fallback when the read fails, so this
+    // asserts against the machine's actual name rather than a fixed string.
+    std::string host = keylight::detail::detect_machine_name();
+    if (!host.empty()) {
+        CHECK(transport.last_request_body.find(host) != std::string::npos);
+    }
+}
+
+TEST_CASE("Client: every request carries a unique X-Keylight-Request-Id") {
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+    auto it = transport.last_request_headers.find("X-Keylight-Request-Id");
+    REQUIRE(it != transport.last_request_headers.end());
+
+    const std::string first = it->second;
+    CHECK(first.size() == 32);
+    CHECK(first.find_first_not_of("0123456789abcdef") == std::string::npos);
+
+    // A correlation id that repeats correlates nothing.
+    transport.next_body = VALIDATE_RESPONSE;
+    REQUIRE(client.validate().is_ok());
+    CHECK(transport.last_request_headers["X-Keylight-Request-Id"] != first);
+}
+
+TEST_CASE("Client: activate surfaces the worker's error message") {
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+
+    transport.next_status = 404;
+    transport.next_body   = R"({"error":"License key not found"})";
+
+    auto r = client.activate("XXXX-YYYY-ZZZZ-0001");
+    REQUIRE(!r.is_ok());
+    // This string goes straight into the integrator's UI. "activate HTTP 404"
+    // tells the customer nothing they can act on.
+    CHECK(r.error().message == "License key not found");
+}
+
+TEST_CASE("Client: activate falls back to the status line on an unparseable body") {
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+
+    transport.next_status = 502;
+    transport.next_body   = "<html>gateway</html>";
+
+    auto r = client.activate("XXXX-YYYY-ZZZZ-0001");
+    REQUIRE(!r.is_ok());
+    CHECK(r.error().message == "activate HTTP 502");
+}
+
+// A signature-valid lease whose server-assigned status is "fallback": the
+// server could not mint a full lease (signing-key incident, key rotation).
+// Copied verbatim from the `fallback-status` conformance vector
+// (tests/fixtures/vectors.json, vectors[3]) so it stays byte-identical to the
+// Rust and worker suites.
+static const std::string FALLBACK_VALIDATE_RESPONSE = R"({
+  "valid": true,
+  "lease": {
+    "kid": "k1",
+    "licenseKeyHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "instanceId": "00000000-0000-4000-8000-000000000001",
+    "issuedAt": 1781076246,
+    "expiresAt": 1781681046,
+    "status": "fallback",
+    "signature": "H/L/1y6x6Cg11Hle+6RNFioM9N6gFWGeR9tOORsNZlcL+kinqJdtb3T5dD2Irh5Q9bH1avSUQZGQXtkqaeEVDw==",
+    "entitlements": []
+  }
+})";
+
+TEST_CASE("Client: enum values are stable for anyone who persisted a State") {
+    // Renumbering would silently reinterpret a stored integer as a different
+    // state. New values are appended only.
+    CHECK(static_cast<int>(State::Licensed) == 0);
+    CHECK(static_cast<int>(State::Trial)    == 1);
+    CHECK(static_cast<int>(State::Expired)  == 2);
+    CHECK(static_cast<int>(State::Invalid)  == 3);
+    CHECK(static_cast<int>(State::FreeTier) == 4);
+    CHECK(static_cast<int>(State::Limited)  == 5);
+}
+
+TEST_CASE("Client: a fallback lease degrades to Limited, it does not lock the app") {
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    transport.next_status = 200;
+    transport.next_body   = FALLBACK_VALIDATE_RESPONSE;
+
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+    REQUIRE(client.validate().is_ok());
+
+    // "fallback" means the server could not sign a full lease — a key-rotation
+    // or signing incident. Degrading is correct; locking a paying customer out
+    // over a server-side incident is not.
+    CHECK(client.state() == State::Limited);
+}
+
+TEST_CASE("Client: a fallback lease cached from a previous launch is still Limited offline") {
+    // resolve_from_lease_ (the online validate() path, covered above) is not
+    // the only place that decides State from a lease's "fallback" status.
+    // derive_state_from_verify_ recomputes state from whatever is persisted
+    // in the store on construction — the relaunch path — and must reach the
+    // same answer with NO server round-trip, or a client that degraded to
+    // Limited during validate() would silently re-lock to Expired the next
+    // time the app starts.
+    auto cfg = make_config();
+    FailingTransport transport; // must not be called: state must come from cache
+    MemoryStore      store;
+
+    seed_store_with_fallback_lease(store, VALID_ACTIVE_NOW);
+
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+
+    CHECK(client.state() == State::Limited);
+    CHECK(transport.call_count == 0);
+}
+
+TEST_CASE("Client: a lease older than maxOfflineDays does not survive a relaunch") {
+    auto cfg = make_config();
+    cfg.maxOfflineDays = 2;
+
+    FakeTransport transport;
+    MemoryStore   store;
+
+    // First run: activate and go offline.
+    {
+        transport.next_status = 200;
+        transport.next_body   = ACTIVATE_RESPONSE;
+        Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+        REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+        REQUIRE(client.state() == State::Licensed);
+    }
+
+    // Relaunch three days later with no network. The lease itself is still
+    // within its 7-day TTL, so only the offline bound can catch this.
+    const int64_t three_days_later = VALID_ACTIVE_NOW + 3 * 86400;
+    FailingTransport offline;
+    Client relaunched(cfg, offline, store, [&]{ return three_days_later; }, NO_SLEEP);
+
+    // Exactly Expired: `!= Licensed` would also pass for Invalid, Trial or
+    // FreeTier, and a lease aged out of the offline bound is not the same
+    // outcome as a lease that never verified.
+    CHECK(relaunched.state() == State::Expired);
+}
+
+TEST_CASE("Client: a lease within maxOfflineDays survives a relaunch") {
+    auto cfg = make_config();
+    cfg.maxOfflineDays = 7;
+
+    FakeTransport transport;
+    MemoryStore   store;
+    {
+        transport.next_status = 200;
+        transport.next_body   = ACTIVATE_RESPONSE;
+        Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+        REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+    }
+
+    const int64_t one_day_later = VALID_ACTIVE_NOW + 86400;
+    FailingTransport offline;
+    Client relaunched(cfg, offline, store, [&]{ return one_day_later; }, NO_SLEEP);
+
+    CHECK(relaunched.state() == State::Licensed);
+}
+
+// The two relaunch tests above only exercise refresh_state_from_store_'s
+// construction-time offline bound. apply_offline_grace_ (used by both
+// checkOnLaunch() and refreshIfNeeded() when a network call fails mid-
+// session) has its own, separate Licensed->Expired deny branch that only
+// fires when state_ is Licensed on entry — and every relaunch test starts
+// a NEW Client whose construction has already resolved to Expired before
+// that branch could ever run. These two tests keep a single Client alive
+// across a clock advance so the deny branch gets its own coverage.
+TEST_CASE("Client: checkOnLaunch's offline grace denies Licensed after maxOfflineDays elapses mid-session") {
+    auto cfg = make_config();
+    cfg.maxOfflineDays = 2;
+
+    int64_t now = VALID_ACTIVE_NOW;
+    GoesOfflineTransport transport;
+    MemoryStore          store;
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    Client client(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+    // Proves the entry condition apply_offline_grace_'s deny branch requires:
+    // state_ is Licensed before the clock moves or the network goes away.
+    REQUIRE(client.state() == State::Licensed);
+
+    // Advance past maxOfflineDays (2 days) but stay within the lease's own
+    // ~7-day TTL, so it is the offline bound doing the work, not raw lease
+    // expiry (apply_offline_grace_'s lease_raw_expired short-circuit is
+    // deliberately not what this test exercises).
+    now += 3 * 86400;
+    transport.offline = true;
+
+    auto r = client.checkOnLaunch();
+    REQUIRE(r.is_ok());
+    CHECK(r.value() == State::Expired);
+    CHECK(client.state() == State::Expired);
+}
+
+TEST_CASE("Client: refreshIfNeeded's offline grace denies Licensed after maxOfflineDays elapses mid-session") {
+    auto cfg = make_config();
+    cfg.maxOfflineDays = 2;
+
+    int64_t now = VALID_ACTIVE_NOW;
+    GoesOfflineTransport transport;
+    MemoryStore          store;
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    Client client(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+    REQUIRE(client.state() == State::Licensed);
+
+    // Advance past both maxOfflineDays (2 days) and refreshIfNeeded's own
+    // 6h staleness timer, so it actually attempts a network call, while
+    // staying within the lease's own ~7-day TTL.
+    now += 3 * 86400;
+    transport.offline = true;
+
+    auto r = client.refreshIfNeeded();
+    REQUIRE(r.is_ok());
+    CHECK(r.value() == State::Expired);
+    CHECK(client.state() == State::Expired);
+}
+
+// ---------------------------------------------------------------------------
+// Clock-rollback guard — every read point, not just state()
+// ---------------------------------------------------------------------------
+
+TEST_CASE("Client: a rolled-back clock denies state, entitlements and checkOnLaunch alike") {
+    // The guard has to answer the same way at every read point. If state()
+    // fails closed while hasEntitlement() keeps returning true, the paywall
+    // and the feature gate disagree and the feature gate fails OPEN — the app
+    // shows "not licensed" and hands out the paid features anyway.
+    auto cfg = make_config();
+
+    int64_t          now = VALID_ACTIVE_NOW;
+    FailingTransport offline;  // this whole scenario is offline
+    MemoryStore      store;
+
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW);
+
+    Client client(cfg, offline, store, [&]{ return now; }, NO_SLEEP);
+
+    // Honest clock: a trusted, unexpired, entitled lease.
+    REQUIRE(client.state() == State::Licensed);
+    REQUIRE(client.hasEntitlement("pro") == true);
+
+    // The machine booted with a wrong clock and NTP has just corrected it
+    // backward past the tolerance. Nothing about the lease changed; what
+    // changed is that nothing can be aged against this clock any more.
+    now = VALID_ACTIVE_NOW - 2 * 3600;
+
+    CHECK(client.state() == State::Invalid);
+    CHECK(client.hasEntitlement("pro") == false);
+
+    // checkOnLaunch() must report what state() reports. Offline, its grace
+    // window would otherwise hand back Licensed against the moved clock.
+    auto r = client.checkOnLaunch();
+    REQUIRE(r.is_ok());
+    CHECK(r.value() == State::Invalid);
+}
+
+TEST_CASE("Client: a rolled-back clock denies refreshIfNeeded and validate too") {
+    // checkOnLaunch() is not the only path that reports a State. A JUCE or
+    // Unreal host polls refreshIfNeeded() on focus/resume for the whole
+    // session, and its debounce and staleness short-circuits return the
+    // cached state without any server contact. Guarding only the launch path
+    // leaves the long-running case -- the one that lasts hours -- reporting
+    // Licensed against a clock state() calls Invalid.
+    auto cfg = make_config();
+
+    int64_t          now = VALID_ACTIVE_NOW;
+    FailingTransport offline;
+    MemoryStore      store;
+
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW);
+
+    Client client(cfg, offline, store, [&]{ return now; }, NO_SLEEP);
+    REQUIRE(client.state() == State::Licensed);
+
+    // Honest clock, inside the 5-minute debounce: the short-circuit hands
+    // back the cached Licensed, and that is correct here.
+    auto honest = client.refreshIfNeeded();
+    REQUIRE(honest.is_ok());
+    REQUIRE(honest.value() == State::Licensed);
+
+    // NTP corrects the clock backward past the tolerance. `now - anchor` is
+    // now negative, so the debounce short-circuit still fires -- it just must
+    // not report Licensed any more.
+    now = VALID_ACTIVE_NOW - 2 * 3600;
+
+    auto refreshed = client.refreshIfNeeded();
+    REQUIRE(refreshed.is_ok());
+    CHECK(refreshed.value() == State::Invalid);
+
+    // validate()'s network-failure path keeps the existing state; offline on
+    // a moved clock that state is no longer reportable either.
+    auto validated = client.validate();
+    REQUIRE(validated.is_ok());
+    CHECK(validated.value() == State::Invalid);
+
+    // The guard clears on its own once the clock is honest again -- it denies
+    // a moved clock, it does not brick the install.
+    now = VALID_ACTIVE_NOW;
+    CHECK(client.refreshIfNeeded().value() == State::Licensed);
+}
+
+TEST_CASE("Client: subscribers are told what state() reports, rollback included") {
+    // subscribe() is the documented way an integrator drives a paywall, and
+    // the JUCE adapter caches the callback's value in an audio-thread atomic.
+    // If the event channel hands out the raw state while state() applies the
+    // guard, the paywall and the gate disagree -- the same fail-open split
+    // the guard exists to close, just on the event path.
+    //
+    // A rolled-back clock also changes no RAW state, so a raw-value dedupe
+    // would emit nothing at all and a cached-last-event host would sit on a
+    // stale Licensed for the rest of the session.
+    auto cfg = make_config();
+
+    int64_t          now = VALID_ACTIVE_NOW;
+    FailingTransport offline;
+    MemoryStore      store;
+
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW);
+
+    Client client(cfg, offline, store, [&]{ return now; }, NO_SLEEP);
+    REQUIRE(client.state() == State::Licensed);
+
+    std::vector<State> seen;
+    auto sub = client.subscribe([&](State s){ seen.push_back(s); });
+
+    // Booting does not re-announce the state we started in.
+    client.refreshIfNeeded();
+    CHECK(seen.empty());
+
+    // NTP corrects the clock backward past the tolerance. No raw state
+    // changes -- the lease is untouched -- but what we may report does.
+    now = VALID_ACTIVE_NOW - 2 * 3600;
+    client.refreshIfNeeded();
+
+    REQUIRE(seen.size() == 1);
+    CHECK(seen.back() == State::Invalid);
+    CHECK(seen.back() == client.state());   // the two channels agree
+
+    // Polling again while still rolled back is not a new event.
+    client.refreshIfNeeded();
+    CHECK(seen.size() == 1);
+
+    // The clock comes back. The guard releases, and the subscriber is told --
+    // otherwise a host caching the last event stays locked forever.
+    now = VALID_ACTIVE_NOW;
+    client.refreshIfNeeded();
+
+    REQUIRE(seen.size() == 2);
+    CHECK(seen.back() == State::Licensed);
+    CHECK(seen.back() == client.state());
+}
+
+TEST_CASE("Client: concurrent notifiers cannot deliver events out of order") {
+    // Publishing the dedupe and THEN delivering lets two notifiers interleave:
+    // both pass the dedupe, then deliver in whatever order the scheduler
+    // picks, and because the dedupe is already satisfied no later poll ever
+    // corrects it. The subscriber is left permanently contradicting state().
+    //
+    // Not hypothetical for the shipped adapters: JUCE's callback does a
+    // blocking HTTP POST and an ed25519 verify before returning, while the
+    // auto-validation thread ticks refreshIfNeeded() concurrently with any
+    // dispatched validate().
+    auto cfg = make_config();
+
+    std::atomic<int64_t> now{VALID_ACTIVE_NOW};
+    FailingTransport     offline;
+    MemoryStore          store;
+
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW);
+
+    Client client(cfg, offline, store, [&]{ return now.load(); }, NO_SLEEP);
+    REQUIRE(client.state() == State::Licensed);
+
+    std::mutex         seen_mutex;
+    std::vector<State> seen;
+
+    // Set once A is provably inside its callback, so B starts from a known
+    // point instead of a sleep the CI scheduler is free to ignore.
+    std::atomic<bool> a_delivering{false};
+
+    // A deliberately slow subscriber, slower on the state the FIRST notifier
+    // carries, so an unordered delivery inverts: the second notifier
+    // overtakes the first and the last event seen is the STALE one.
+    auto sub = client.subscribe([&](State s) {
+        a_delivering.store(true);
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(s == State::Invalid ? 200 : 10));
+        std::lock_guard<std::mutex> lock(seen_mutex);
+        seen.push_back(s);
+    });
+
+    // Notifier A sees a rolled-back clock.
+    now.store(VALID_ACTIVE_NOW - 2 * 3600);
+    std::thread a([&]{ client.refreshIfNeeded(); });
+
+    // Notifier B sees the clock corrected, and starts only once A is actually
+    // delivering. Without this the two can both dedupe to nothing and the
+    // test would pass vacuously on a heavily loaded machine.
+    while (!a_delivering.load()) std::this_thread::yield();
+    now.store(VALID_ACTIVE_NOW);
+    std::thread b([&]{ client.refreshIfNeeded(); });
+
+    a.join();
+    b.join();
+
+    std::lock_guard<std::mutex> lock(seen_mutex);
+    REQUIRE_FALSE(seen.empty());
+
+    // The contract that matters: whatever the interleaving, the LAST thing a
+    // subscriber was told matches what state() answers. Anything else is a
+    // paywall and a feature gate that disagree, with no event left to fix it.
+    CHECK(seen.back() == client.state());
+    CHECK(seen.back() == State::Licensed);
+}
+
+// Run `body` with a watchdog. A regression here is a DEADLOCK, and a test
+// that hangs forever is worse than one that fails: it takes CI down with it
+// and tells you nothing. On timeout we fail loudly and deliberately leak the
+// scenario rather than tearing down objects threads are still parked in.
+// Spin until `pred`, but never forever — an unbounded wait in a test hangs the
+// whole suite and tells you nothing about which assertion was going to fail.
+static bool spin_until(std::chrono::milliseconds limit, std::function<bool()> pred)
+{
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    while (!pred()) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::yield();
+    }
+    return true;
+}
+
+static bool completes_within(std::chrono::milliseconds limit,
+                             std::function<void()>     body)
+{
+    auto done = std::make_shared<std::atomic<bool>>(false);
+    std::thread runner([done, body]{ body(); done->store(true); });
+
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    while (!done->load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    if (done->load()) { runner.join(); return true; }
+    runner.detach();   // parked on a lock; joining would hang the suite
+    return false;
+}
+
+TEST_CASE("Client: a listener may hold the application's own locks") {
+    // Holding an SDK lock across a listener puts that lock into the
+    // APPLICATION's lock-order graph, and the cycle needs no contract
+    // violation to close:
+    //
+    //   listener (SDK thread): holds SDK lock -> wants app_mutex
+    //   app thread:            holds app_mutex -> calls refreshIfNeeded()
+    //                                             -> wants SDK lock
+    //
+    // Taking your own mutex in a state-change handler is the most ordinary
+    // thing a handler does, and README recommends refreshIfNeeded() on
+    // focus/resume. So delivery must happen with no SDK lock held.
+    //
+    // Leaked on timeout, hence the raw new: a deadlocked run has threads
+    // parked inside these objects.
+    auto* store = new MemoryStore();
+    auto* offline = new FailingTransport();
+    auto* nowv = new std::atomic<int64_t>(VALID_ACTIVE_NOW);
+
+    seed_store_with_valid_lease(*store, VALID_ACTIVE_NOW);
+
+    auto  cfg    = make_config();
+    auto* client = new Client(cfg, *offline, *store, [nowv]{ return nowv->load(); });
+    REQUIRE(client->state() == State::Licensed);
+
+    auto* app_mutex   = new std::mutex();
+    auto* in_callback = new std::atomic<bool>(false);
+
+    auto* sub = new Subscription(client->subscribe([app_mutex, in_callback](State) {
+        in_callback->store(true);
+        std::lock_guard<std::mutex> lock(*app_mutex);   // the app's own lock
+    }));
+
+    const bool ok = completes_within(std::chrono::seconds(5), [=] {
+        // The SDK thread: transition while the app thread holds its mutex.
+        nowv->store(VALID_ACTIVE_NOW - 2 * 3600);
+        std::thread sdk([=]{ client->refreshIfNeeded(); });
+
+        {
+            std::lock_guard<std::mutex> lock(*app_mutex);
+            while (!in_callback->load()) std::this_thread::yield();
+            // The app thread, holding its own lock, calls into the SDK.
+            client->refreshIfNeeded();
+        }
+
+        sdk.join();
+    });
+
+    CHECK(ok);
+
+    if (ok) {
+        delete sub; delete client; delete offline;
+        delete store; delete nowv; delete app_mutex; delete in_callback;
+    }
+}
+
+TEST_CASE("Client: a listener may call back into the Client") {
+    // Delivery holds no lock, so re-entry queues rather than recursing or
+    // hanging. An integrator should not have to hand off to their own thread
+    // just to act on an event.
+    auto* store   = new MemoryStore();
+    auto* offline = new FailingTransport();
+    auto* nowv    = new std::atomic<int64_t>(VALID_ACTIVE_NOW);
+
+    seed_store_with_valid_lease(*store, VALID_ACTIVE_NOW);
+
+    auto  cfg    = make_config();
+    auto* client = new Client(cfg, *offline, *store, [nowv]{ return nowv->load(); });
+    REQUIRE(client->state() == State::Licensed);
+
+    auto* calls = new std::atomic<int>(0);
+    auto* sub   = new Subscription(client->subscribe([client, calls](State) {
+        if (calls->fetch_add(1) == 0) {
+            (void)client->validate();          // re-enter
+            (void)client->refreshIfNeeded();   // and again
+        }
+    }));
+
+    const bool ok = completes_within(std::chrono::seconds(5), [=] {
+        nowv->store(VALID_ACTIVE_NOW - 2 * 3600);
+        client->refreshIfNeeded();
+    });
+
+    CHECK(ok);
+    if (ok) {
+        CHECK(calls->load() >= 1);
+        delete sub; delete client; delete offline;
+        delete store; delete nowv; delete calls;
+    }
+}
+
+TEST_CASE("Client: a listener that throws does not kill the event channel") {
+    // The delivery baton is a plain bool, not a lock_guard, so it does not
+    // release on unwind. An exception escaping a listener would leave it stuck
+    // and every later notify_() would take the "someone else is draining"
+    // exit — the channel dead for the life of the Client while state() kept
+    // moving. A caching subscriber (JUCE's audio-thread snapshot) would then
+    // hold its last value forever, which on a rolled-back clock is a
+    // permanent fail-open.
+    auto cfg = make_config();
+
+    std::atomic<int64_t> now{VALID_ACTIVE_NOW};
+    FailingTransport     offline;
+    MemoryStore          store;
+
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW);
+
+    Client client(cfg, offline, store, [&]{ return now.load(); }, NO_SLEEP);
+    REQUIRE(client.state() == State::Licensed);
+
+    // A listener that throws once, and a well-behaved one after it.
+    std::atomic<int> thrower_calls{0};
+    auto bad = client.subscribe([&](State) {
+        if (thrower_calls.fetch_add(1) == 0) throw std::runtime_error("listener");
+    });
+
+    std::vector<State> seen;
+    std::mutex         seen_mutex;
+    auto good = client.subscribe([&](State s) {
+        std::lock_guard<std::mutex> lock(seen_mutex);
+        seen.push_back(s);
+    });
+
+    // The event the bad listener throws on must still reach the good one.
+    now.store(VALID_ACTIVE_NOW - 2 * 3600);
+    REQUIRE_NOTHROW(client.refreshIfNeeded());
+
+    {
+        std::lock_guard<std::mutex> lock(seen_mutex);
+        REQUIRE(seen.size() == 1);
+        CHECK(seen.back() == State::Invalid);
+    }
+
+    // And the channel must still be alive afterwards.
+    now.store(VALID_ACTIVE_NOW);
+    client.refreshIfNeeded();
+
+    std::lock_guard<std::mutex> lock(seen_mutex);
+    REQUIRE(seen.size() == 2);
+    CHECK(seen.back() == State::Licensed);
+    CHECK(seen.back() == client.state());
+}
+
+TEST_CASE("Client: auto-validation restarts after a listener stopped it") {
+    // "Stop polling when the licence goes invalid, restart when the user
+    // activates" is an ordinary integration pattern. The listener here is
+    // delivered ON the auto-validation thread, so stopAutoValidation() cannot
+    // join itself: it retires the worker by epoch and returns. A
+    // finished thread is still joinable(), so a later start must REAP it
+    // rather than mistake it for a live worker and no-op forever.
+    auto cfg = make_config();
+    cfg.autoValidationIntervalMs = 20;
+
+    std::atomic<int64_t> now{VALID_ACTIVE_NOW};
+    std::atomic<int>     ticks{0};
+    FailingTransport     offline;
+    MemoryStore          store;
+
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW);
+
+    Client client(cfg, offline, store, [&]{ ticks.fetch_add(1); return now.load(); });
+
+    std::atomic<bool> self_stopped{false};
+    auto sub = client.subscribe([&](State s) {
+        if (s == State::Invalid && !self_stopped.exchange(true)) {
+            client.stopAutoValidation();   // from the worker thread itself
+        }
+    });
+
+    auto count_ticks = [&](std::chrono::milliseconds window) {
+        const int before = ticks.load();
+        std::this_thread::sleep_for(window);
+        return ticks.load() - before;
+    };
+
+    client.startAutoValidation();
+    REQUIRE(count_ticks(std::chrono::milliseconds(200)) > 0);
+
+    // Roll the clock back: the worker's next tick raises the guard's event,
+    // delivers it on its own thread, and the listener stops it from there.
+    now.store(VALID_ACTIVE_NOW - 2 * 3600);
+    for (int i = 0; i < 100 && !self_stopped.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    REQUIRE(self_stopped.load());
+
+    // Settle: stop() retires the worker rather than joining it, so a cycle
+    // already in flight finishes. It must not start another.
+    (void)count_ticks(std::chrono::milliseconds(150));   // let it wind down
+    REQUIRE(count_ticks(std::chrono::milliseconds(200)) == 0);
+
+    // The user activates; the host restarts polling. This must actually
+    // restart — not silently no-op on an unreaped thread.
+    now.store(VALID_ACTIVE_NOW);
+    client.startAutoValidation();
+    CHECK(count_ticks(std::chrono::milliseconds(200)) > 0);
+
+    client.stopAutoValidation();
+}
+
+TEST_CASE("Client: delivery quiesces in agreement with state() under contention") {
+    // Review caught the earlier version of this test producing exactly ONE
+    // event per round — the second thread always deduped, so there was no
+    // order for the channel to get wrong and the assertion was trivial. This
+    // version toggles the clock from four threads so events genuinely queue
+    // behind a delivery in progress, which is the path that has to stay
+    // ordered.
+    //
+    // Honest limitation, unchanged: this does NOT reliably catch the baton
+    // HAND-BACK ordering (clearing delivering_ in a second critical section).
+    // That window is a few instructions wide and needs instrumentation to see.
+    // What it does catch is a delivery that is dropped or left stale once the
+    // notifiers have quiesced. Read notify_()'s comment for the ordering
+    // argument; do not read a green run here as proof of it.
+    auto cfg = make_config();
+
+    std::atomic<int64_t> now{VALID_ACTIVE_NOW};
+    FailingTransport     offline;
+    MemoryStore          store;
+
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW);
+
+    Client client(cfg, offline, store, [&]{ return now.load(); }, NO_SLEEP);
+    REQUIRE(client.state() == State::Licensed);
+
+    std::mutex         seen_mutex;
+    std::vector<State> seen;
+    auto sub = client.subscribe([&](State s) {
+        std::lock_guard<std::mutex> lock(seen_mutex);
+        seen.push_back(s);
+    });
+
+    constexpr int kThreads = 4;
+    constexpr int kRounds  = 5000;
+
+    std::vector<std::thread> workers;
+    for (int t = 0; t < kThreads; ++t) {
+        workers.emplace_back([&, t]{
+            for (int r = 0; r < kRounds; ++r) {
+                now.store(((r + t) % 2) ? VALID_ACTIVE_NOW - 2 * 3600
+                                        : VALID_ACTIVE_NOW);
+                client.refreshIfNeeded();
+            }
+        });
+    }
+    for (auto& w : workers) w.join();
+
+    // Quiesced. Settle the clock and poll once so the final state is
+    // unambiguous, then require the subscriber to have been told it.
+    now.store(VALID_ACTIVE_NOW);
+    client.refreshIfNeeded();
+
+    std::lock_guard<std::mutex> lock(seen_mutex);
+    REQUIRE_FALSE(seen.empty());
+    CHECK(seen.back() == State::Licensed);
+    CHECK(seen.back() == client.state());
+}
+
+TEST_CASE("Client: a start racing a stop leaves exactly one worker") {
+    // Under the previous design both start and stop released av_mutex_ to
+    // join, with the thread moved out. A start walking into that window saw
+    // "no worker", skipped the reap and spawned a SECOND one while the first
+    // had not observed the stop: two pollers for the session, plus a hang in
+    // the stopper's join(). The epoch model has no such window — neither call
+    // releases the lock mid-body — and this is the regression guard.
+    //
+    // Asserted by counting the DISTINCT threads that call the clock, not by
+    // watching a tick counter go quiet. Under the new contract stop() retires
+    // rather than joins, so "quiet" is inherently timing-dependent and made
+    // this test flaky; "how many workers are alive" is not.
+    auto  cfg = make_config();
+    cfg.autoValidationIntervalMs = 10;
+
+    // Heap-allocated and leaked on timeout: a hung run has threads parked
+    // inside these objects.
+    auto* nowv    = new std::atomic<int64_t>(VALID_ACTIVE_NOW);
+    auto* offline = new FailingTransport();
+    auto* store   = new MemoryStore();
+
+    auto* callers_mutex = new std::mutex();
+    auto* callers       = new std::set<std::thread::id>();
+    auto* ticks         = new std::atomic<int>(0);
+
+    seed_store_with_valid_lease(*store, VALID_ACTIVE_NOW);
+
+    auto* client = new Client(cfg, *offline, *store,
+        [nowv, callers_mutex, callers, ticks] {
+            ticks->fetch_add(1);
+            {
+                std::lock_guard<std::mutex> lock(*callers_mutex);
+                callers->insert(std::this_thread::get_id());
+            }
+            return nowv->load();
+        });
+
+    auto* in_callback = new std::atomic<bool>(false);
+    auto* sub = new Subscription(client->subscribe([in_callback](State) {
+        in_callback->store(true);
+        // Still inside the callback when the starts race below (they wait 30 ms).
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    }));
+
+    client->startAutoValidation();
+
+    // Force a transition so the worker is parked inside the slow listener.
+    nowv->store(VALID_ACTIVE_NOW - 2 * 3600);
+    REQUIRE(spin_until(std::chrono::seconds(5), [in_callback]{ return in_callback->load(); }));
+
+    const bool ok = completes_within(std::chrono::seconds(10), [=] {
+        std::thread s([=]{ client->stopAutoValidation(); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        std::thread t1([=]{ client->startAutoValidation(); });
+        std::thread t2([=]{ client->startAutoValidation(); });
+        s.join(); t1.join(); t2.join();
+    });
+
+    REQUIRE(ok);
+
+    // Let any retired worker finish its in-flight cycle and exit, then look at
+    // who is still polling. Two live workers both tick every 10 ms, so a
+    // 300 ms window sees both; one worker contributes exactly one id.
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    {
+        std::lock_guard<std::mutex> lock(*callers_mutex);
+        callers->clear();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    size_t distinct = 0;
+    {
+        std::lock_guard<std::mutex> lock(*callers_mutex);
+        distinct = callers->size();
+    }
+    CHECK(distinct <= 1);   // never two pollers
+
+    // ~Client() joins, so nothing can still be ticking once it returns. That
+    // is the safety property the epoch model must not give up, and unlike
+    // "quiet after stop" it is deterministic.
+    client->stopAutoValidation();
+    delete sub;
+    delete client;
+
+    const int after_destruction = ticks->load();
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    CHECK(ticks->load() == after_destruction);
+
+    delete store; delete offline; delete nowv;
+    delete in_callback; delete ticks; delete callers; delete callers_mutex;
+}
+
+TEST_CASE("Client: a listener may stop or restart auto-validation from the worker thread") {
+    // A listener is delivered on the worker thread and the contract permits it
+    // to call back in. Under the epoch model neither start nor stop joins or
+    // waits, so this cannot deadlock by construction — but it is exactly the
+    // shape that hung under the two previous designs (first by self-joining,
+    // then by blocking on a transition flag while an external stop was parked
+    // in join() waiting for this very thread). Kept as the regression guard
+    // for both.
+    //
+    // Still driven with a concurrent external stop, because that is what made
+    // the window reachable before.
+    auto  cfg = make_config();
+    cfg.autoValidationIntervalMs = 10;
+
+    // Heap-allocated and leaked on timeout: a hung run has threads parked
+    // inside these objects.
+    auto* nowv    = new std::atomic<int64_t>(VALID_ACTIVE_NOW);
+    auto* offline = new FailingTransport();
+    auto* store   = new MemoryStore();
+
+    seed_store_with_valid_lease(*store, VALID_ACTIVE_NOW);
+
+    auto* client = new Client(cfg, *offline, *store, [nowv]{ return nowv->load(); });
+
+    auto* in_callback = new std::atomic<bool>(false);
+    auto* released    = new std::atomic<bool>(false);
+    auto* did_call    = new std::atomic<bool>(false);
+
+    SUBCASE("the listener stops") {
+        auto* sub = new Subscription(client->subscribe(
+            [client, in_callback, released, did_call](State) {
+                in_callback->store(true);
+                // Stay inside the callback long enough for an external stop to
+                // reach join(), then call back in from the worker thread.
+                spin_until(std::chrono::seconds(5), [released]{ return released->load(); });
+                client->stopAutoValidation();
+                did_call->store(true);
+            }));
+
+        client->startAutoValidation();
+        nowv->store(VALID_ACTIVE_NOW - 2 * 3600);
+        REQUIRE(spin_until(std::chrono::seconds(5), [in_callback]{ return in_callback->load(); }));
+
+        const bool ok = completes_within(std::chrono::seconds(10), [=] {
+            std::thread ext([=]{ client->stopAutoValidation(); });
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            released->store(true);   // let the listener call back in
+            ext.join();
+        });
+
+        REQUIRE(ok);
+        // stop() no longer joins, so the external stop returns without waiting
+        // for the listener — the test has to wait for it explicitly rather
+        // than lean on a join that the epoch model deliberately removed.
+        CHECK(spin_until(std::chrono::seconds(5), [did_call]{ return did_call->load(); }));
+        if (ok) delete sub;
+    }
+
+    SUBCASE("the listener restarts") {
+        auto* sub = new Subscription(client->subscribe(
+            [client, in_callback, released, did_call](State) {
+                in_callback->store(true);
+                spin_until(std::chrono::seconds(5), [released]{ return released->load(); });
+                client->startAutoValidation();
+                did_call->store(true);
+            }));
+
+        client->startAutoValidation();
+        nowv->store(VALID_ACTIVE_NOW - 2 * 3600);
+        REQUIRE(spin_until(std::chrono::seconds(5), [in_callback]{ return in_callback->load(); }));
+
+        const bool ok = completes_within(std::chrono::seconds(10), [=] {
+            std::thread ext([=]{ client->stopAutoValidation(); });
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            released->store(true);
+            ext.join();
+        });
+
+        REQUIRE(ok);
+        // stop() no longer joins, so the external stop returns without waiting
+        // for the listener — the test has to wait for it explicitly rather
+        // than lean on a join that the epoch model deliberately removed.
+        CHECK(spin_until(std::chrono::seconds(5), [did_call]{ return did_call->load(); }));
+        if (ok) delete sub;
+    }
+
+    client->stopAutoValidation();
+    delete client; delete store; delete offline;
+    delete nowv; delete in_callback; delete released; delete did_call;
+}
+
+TEST_CASE("Client: stop returns without waiting on an in-flight cycle") {
+    // The epoch model's headline trade: stop() retires the worker instead of
+    // joining it, so it returns promptly even while the worker is stuck inside
+    // a slow listener. Under the previous designs this call blocked for the
+    // whole callback — measured at 703 ms with a 700 ms listener — which is
+    // what put an SDK lock in the caller's path and produced two rounds of
+    // deadlocks.
+    auto  cfg = make_config();
+    cfg.autoValidationIntervalMs = 10;
+
+    std::atomic<int64_t> now{VALID_ACTIVE_NOW};
+    FailingTransport     offline;
+    MemoryStore          store;
+
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW);
+
+    Client client(cfg, offline, store, [&]{ return now.load(); }, NO_SLEEP);
+
+    std::atomic<bool> in_callback{false};
+    auto sub = client.subscribe([&](State) {
+        in_callback.store(true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(600));
+    });
+
+    client.startAutoValidation();
+    now.store(VALID_ACTIVE_NOW - 2 * 3600);
+    REQUIRE(spin_until(std::chrono::seconds(5), [&]{ return in_callback.load(); }));
+
+    const auto before = std::chrono::steady_clock::now();
+    client.stopAutoValidation();
+    const auto elapsed = std::chrono::steady_clock::now() - before;
+
+    CHECK(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() < 200);
+
+    // ~Client() is what joins, so the worker still cannot outlive the Client.
+}
+
+// A transport that throws rather than returning an error. Nothing documents
+// Transport or LicenseStore as non-throwing — only now_fn is — and the SDK's
+// own JuceUrlTransport builds juce::String and std::string with no guard, so
+// bad_alloc alone reaches the worker through our code.
+class ThrowingTransport : public Transport {
+public:
+    std::atomic<int> calls{0};
+    Result<HttpResponse> request(const std::string&,
+                                 const std::string&,
+                                 const std::map<std::string, std::string>&,
+                                 const std::string&) override
+    {
+        calls.fetch_add(1);
+        throw std::runtime_error("transport");
+    }
+};
+
+TEST_CASE("Client: a throwing transport on the worker does not abort the process") {
+    // An exception escaping a thread's entry point is std::terminate — an
+    // uncatchable abort of the host, from a licensing SDK's background thread.
+    // The synchronous path lets it propagate to the caller, which is right;
+    // the worker has nobody to propagate to, so it has to contain it.
+    //
+    // The catch must live inside av_loop_, not around it: catching outside
+    // would leave the worker's thread object joinable with a dead thread
+    // behind it, and startAutoValidation() would no-op forever after.
+    auto cfg = make_config();
+    cfg.autoValidationIntervalMs = 10;
+
+    std::atomic<int64_t> now{VALID_ACTIVE_NOW};
+    ThrowingTransport    transport;
+    MemoryStore          store;
+
+    // Seed a lease old enough that refreshIfNeeded() actually reaches the
+    // transport rather than short-circuiting on the debounce.
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW, 1781681046LL,
+                                VALID_ACTIVE_NOW - 7 * 3600);
+
+    Client client(cfg, transport, store, [&]{ return now.load(); }, NO_SLEEP);
+
+    // Synchronous: the caller gets the exception. Unchanged, and correct.
+    CHECK_THROWS_AS(client.validate(), std::runtime_error);
+
+    // On the worker: it must survive, keep cycling, and stay restartable.
+    client.startAutoValidation();
+    REQUIRE(spin_until(std::chrono::seconds(5),
+                       [&]{ return transport.calls.load() >= 3; }));
+
+    // Restartable. Drain to a full stop FIRST: stop() does not join, so
+    // without this the "calls went up" below could be satisfied by the
+    // retired worker finishing its in-flight cycle rather than by the new
+    // one — the assertion would read stronger than it is.
+    client.stopAutoValidation();
+    REQUIRE(spin_until(std::chrono::seconds(5), [&]{
+        const int settled = transport.calls.load();
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        return transport.calls.load() == settled;
+    }));
+
+    const int before = transport.calls.load();
+    client.startAutoValidation();
+    REQUIRE(spin_until(std::chrono::seconds(5),
+                       [&]{ return transport.calls.load() > before; }));
+
+    client.stopAutoValidation();
+}
+
+TEST_CASE("Client: retired workers are actually reaped, not just queued") {
+    // Review neutered take_exited_() to reap nothing and the entire suite
+    // still passed — the one function whose whole job is bounding thread
+    // growth had zero coverage, and its test asserted CHECK(true).
+    //
+    // The symptom of a broken reaper (an unjoined pthread keeps its stack, so
+    // a few hundred cycles retain hundreds of MB) is far too slow to assert
+    // black-box, so this reads the retired count directly through a test seam.
+    auto  cfg = make_config();
+    cfg.autoValidationIntervalMs = 1000;   // long: workers park, then exit fast
+
+    std::atomic<int64_t> now{VALID_ACTIVE_NOW};
+    FailingTransport     offline;
+    MemoryStore          store;
+
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW);
+
+    Client client(cfg, offline, store, [&]{ return now.load(); }, NO_SLEEP);
+
+    constexpr int kCycles = 100;
+    for (int i = 0; i < kCycles; ++i) {
+        client.startAutoValidation();
+        client.stopAutoValidation();
+    }
+
+    // Each cycle retires one worker. With the reaper working, the queue drains
+    // as fast as workers finish and settles near zero; without it, all 100 sit
+    // there until ~Client(). A few may still be exiting, hence the spin.
+    REQUIRE(spin_until(std::chrono::seconds(10), [&]{
+        client.startAutoValidation();     // drives a reap
+        client.stopAutoValidation();
+        // spin_until only yields, and this predicate spawns a thread per
+        // iteration — on a genuine failure that is a 10-second pthread_create
+        // storm that could hit EAGAIN itself and obscure the real result.
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return client.retiredWorkerCount_ForTest() <= 4;
+    }));
+
+    // Idempotence still holds after all that churn.
+    client.startAutoValidation();
+    client.startAutoValidation();
+    client.stopAutoValidation();
+    client.stopAutoValidation();
+
+    CHECK(client.retiredWorkerCount_ForTest() <= 6);
+}
+
+TEST_CASE("Client: an anchor ahead of the clock does not pass the maxOfflineDays bound") {
+    // A clock pushed forward across a validate leaves the persisted anchor
+    // ahead of real time. `now - anchor` is then NEGATIVE, so a bare
+    // `> max_age` comparison can never fire and the offline bound is silently
+    // disabled for as long as the anchor stays in the future.
+    auto cfg = make_config();
+    cfg.maxOfflineDays = 2;
+
+    int64_t          now = VALID_ACTIVE_NOW;
+    FailingTransport offline;
+    MemoryStore      store;
+
+    const int64_t future_anchor = VALID_ACTIVE_NOW + 2 * 86400;
+    seed_store_with_valid_lease(store, now, 1781681046LL, future_anchor);
+
+    Client client(cfg, offline, store, [&]{ return now; }, NO_SLEEP);
+
+    // Read it back once the wall clock has caught up past the anchor, so the
+    // rollback guard is no longer the one answering and we observe the state
+    // refresh_state_from_store_ actually resolved at construction. The lease's
+    // own ~7-day TTL has not run out, so only the offline bound can catch it.
+    now = future_anchor + 3600;
+    CHECK(client.state() == State::Expired);
+}
+
+// ---------------------------------------------------------------------------
+// Retry policy applied to real requests. The sleep seam is injected, so these
+// assert the backoff without spending it.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("Client: a 429 is retried and can still succeed") {
+    auto cfg = make_config();
+    ScriptedTransport transport;
+    MemoryStore       store;
+
+    transport.replies = {
+        {429, R"({"error":"rate limited"})", {{"retry-after", "1"}}},
+        {200, ACTIVATE_RESPONSE, {}},
+    };
+
+    std::vector<uint64_t> slept;
+    Client client(cfg, transport, store,
+                  []{ return VALID_ACTIVE_NOW; },
+                  [&](uint64_t ms){ slept.push_back(ms); });
+
+    auto r = client.activate("XXXX-YYYY-ZZZZ-0001");
+    REQUIRE(r.is_ok());
+    CHECK(r.value() == State::Licensed);
+
+    // A rate limit must not be a flat activation failure for the end user.
+    CHECK(transport.calls == 2);
+    REQUIRE(slept.size() == 1);
+    CHECK(slept[0] == 1000);   // Retry-After: 1, honored over the curve
+}
+
+TEST_CASE("Client: a definitive rejection is not retried") {
+    auto cfg = make_config();
+    ScriptedTransport transport;
+    MemoryStore       store;
+
+    transport.replies = {{404, R"({"error":"License key not found"})", {}}};
+
+    std::vector<uint64_t> slept;
+    Client client(cfg, transport, store,
+                  []{ return VALID_ACTIVE_NOW; },
+                  [&](uint64_t ms){ slept.push_back(ms); });
+
+    auto r = client.activate("XXXX-YYYY-ZZZZ-0001");
+    REQUIRE(!r.is_ok());
+    CHECK(r.error().message == "License key not found");
+
+    // Retrying a wrong key wastes the user's time and the tenant's quota.
+    CHECK(transport.calls == 1);
+    CHECK(slept.empty());
+}
+
+TEST_CASE("Client: retries stop at the attempt ceiling") {
+    auto cfg = make_config();
+    ScriptedTransport transport;
+    MemoryStore       store;
+
+    transport.replies = {{503, R"({"error":"unavailable"})", {}}};
+
+    std::vector<uint64_t> slept;
+    Client client(cfg, transport, store,
+                  []{ return VALID_ACTIVE_NOW; },
+                  [&](uint64_t ms){ slept.push_back(ms); });
+
+    REQUIRE(!client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+    CHECK(transport.calls == RETRY_MAX_ATTEMPTS);
+    CHECK(slept.size() == RETRY_MAX_ATTEMPTS - 1);
+}
+
+
+// ---------------------------------------------------------------------------
+// Server-owned product config (trial length, free tier).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("Client: fetchConfig caches the server's trial duration") {
+    auto cfg = make_config();
+    cfg.trialDurationDays = 0;
+
+    FakeTransport transport;
+    MemoryStore   store;
+    transport.next_status = 200;
+    transport.next_body   =
+        R"({"trial_duration_days":14,"free_tier_enabled":true})";
+
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+    REQUIRE(client.fetchConfig().is_ok());
+
+    // The server value wins over the local seed: a tenant changes trial length
+    // in the dashboard without shipping an app release.
+    CHECK(client.effectiveTrialDurationDays() == 14);
+}
+
+TEST_CASE("Client: the cached server config survives a relaunch") {
+    auto cfg = make_config();
+    cfg.trialDurationDays = 0;
+
+    MemoryStore store;
+    {
+        FakeTransport transport;
+        transport.next_status = 200;
+        transport.next_body   =
+            R"({"trial_duration_days":14,"free_tier_enabled":true})";
+        Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+        REQUIRE(client.fetchConfig().is_ok());
+    }
+
+    // An offline launch must use the last known values, not fall back to 0.
+    FailingTransport offline;
+    Client relaunched(cfg, offline, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+    CHECK(relaunched.effectiveTrialDurationDays() == 14);
+}
+
+TEST_CASE("Client: a failed config fetch leaves the cached value alone") {
+    auto cfg = make_config();
+    cfg.trialDurationDays = 7;
+
+    FailingTransport offline;
+    MemoryStore      store;
+    Client client(cfg, offline, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+
+    CHECK(!client.fetchConfig().is_ok());
+    // Falls back to the local seed rather than to zero — a network blip must
+    // not silently switch trials off.
+    CHECK(client.effectiveTrialDurationDays() == 7);
+}
+
+TEST_CASE("Client: a server trial duration of 0 survives a relaunch as 0") {
+    // 0 is a legitimate server value meaning "trials off", and it has to be
+    // distinguishable from "no config has ever been fetched". The store's
+    // other numeric fields use 0-means-absent, so this is the case that would
+    // silently re-enable a 7-day trial the tenant deliberately turned off.
+    auto cfg = make_config();
+    cfg.trialDurationDays = 7;          // seed says 7; server says no trials
+
+    MemoryStore store;
+    {
+        FakeTransport transport;
+        transport.next_status = 200;
+        transport.next_body   =
+            R"({"trial_duration_days":0,"free_tier_enabled":false})";
+        Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+        REQUIRE(client.fetchConfig().is_ok());
+        CHECK(client.effectiveTrialDurationDays() == 0);
+    }
+
+    FailingTransport offline;
+    Client relaunched(cfg, offline, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+    CHECK(relaunched.effectiveTrialDurationDays() == 0);   // not 7
+}
+
+TEST_CASE("Client: with no config fetched, the seed governs") {
+    // The other half of the same distinction: absent must fall through to the
+    // seed rather than reading as a server-set 0.
+    auto cfg = make_config();
+    cfg.trialDurationDays = 7;
+    cfg.freeTierEnabled   = true;
+
+    FakeTransport transport;
+    MemoryStore   store;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+
+    CHECK(client.effectiveTrialDurationDays() == 7);
+    CHECK(client.effectiveFreeTierEnabled()   == true);
+}
+
+TEST_CASE("Client: a server free-tier flag of false survives a relaunch") {
+    auto cfg = make_config();
+    cfg.freeTierEnabled = true;         // seed on; server turns it off
+
+    MemoryStore store;
+    {
+        FakeTransport transport;
+        transport.next_status = 200;
+        transport.next_body   =
+            R"({"trial_duration_days":14,"free_tier_enabled":false})";
+        Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+        REQUIRE(client.fetchConfig().is_ok());
+    }
+
+    FailingTransport offline;
+    Client relaunched(cfg, offline, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+    CHECK(relaunched.effectiveFreeTierEnabled() == false);   // not the seed's true
+}
+
+
+// ---------------------------------------------------------------------------
+// Signed server config (Task 1b).
+//
+// An unsigned /config is the soft spot in an otherwise signed protocol: a lease
+// cannot be forged, so a fake server mints no licence — but without this it
+// mints an unlimited TRIAL, via nothing more than a hosts entry.
+//
+// The signing key below is TEST-ONLY, generated from the fixed seed 0x00..07.
+// It signs nothing real and must never appear in a tenant keyset.
+//
+// The SDK verifies but never signs — signing is the server's job — so these
+// fixtures cannot be produced by the suite itself. Regenerate them with
+// `python3 tools/gen_config_fixtures.py` after any change to
+// config_canonical_payload()'s format, and paste the output over the CFG_*
+// constants below.
+// ---------------------------------------------------------------------------
+
+static const char* CFG_PUBKEY =
+    "PuKopyg8sv1yiUPaoSfvCeSDBxqLS8aZukUi8JsUz94=";
+
+// cfg1|kcfg|testco|testapp|1781076246|1781680000|14|true
+static const char* CFG_SIG_VALID =
+    "OAhXFip/oKm06gPtCEKccWJ4hmnxMEU4NDLf47xzQ+Ip05L1ftgXIiowz2Np3h10nABov2M6WqrXshHRxsTICQ==";
+// cfg1|kcfg|testco|otherapp|... — a real signature, for the WRONG product
+static const char* CFG_SIG_OTHER_PRODUCT =
+    "+1LD7d2bAj2nTaZEDO2o42p/zEGxodPUabTVkTrQz2TBR33/F4oUnmMcuO6eIbdiewyGh07utbjg69zc80ZCDA==";
+// cfg1|kcfg|testco|testapp|1700000000|1700600000|30|true — genuinely signed, long expired
+static const char* CFG_SIG_EXPIRED =
+    "pncOoAY6bfzkIrfkhAW/uz3thV2C6ASo+d8zl8KwtIo3K3Of8aXELCYVDlumt0btbp9jqTd3N2BkcCmDad5FDw==";
+
+static const int64_t CFG_NOW = 1781076256LL;   // inside the valid window
+
+static Config config_signing_cfg() {
+    auto cfg = make_config();
+    // Set explicitly rather than inherited: these two strings are INSIDE the
+    // signed payload, so the fixtures above are only valid for these values.
+    cfg.tenantId  = "testco";
+    cfg.productId = "testapp";
+    cfg.trialDurationDays   = 7;       // the seed a rejected config falls back to
+    cfg.trustedKeys["kcfg"] = CFG_PUBKEY;
+    return cfg;
+}
+
+static std::string signed_config_body(const char* sig,
+                                      int trial_days   = 14,
+                                      int64_t issued   = 1781076246LL,
+                                      int64_t expires  = 1781680000LL) {
+    return std::string(R"({"trial_duration_days":)") + std::to_string(trial_days) +
+           R"(,"free_tier_enabled":true,"issued_at":)" + std::to_string(issued) +
+           R"(,"expires_at":)" + std::to_string(expires) +
+           R"(,"kid":"kcfg","signature":")" + sig + R"("})";
+}
+
+TEST_CASE("Config signature: a valid signature is trusted") {
+    auto cfg = config_signing_cfg();
+    FakeTransport transport;
+    MemoryStore   store;
+    transport.next_status = 200;
+    transport.next_body   = signed_config_body(CFG_SIG_VALID);
+
+    Client client(cfg, transport, store, []{ return CFG_NOW; }, NO_SLEEP);
+    REQUIRE(client.fetchConfig().is_ok());
+    CHECK(client.effectiveTrialDurationDays() == 14);
+}
+
+TEST_CASE("Config signature: a tampered trial duration is ignored") {
+    // The exact attack: a fake server answers with a longer trial. The
+    // signature no longer covers the body, so the seed governs instead.
+    auto cfg = config_signing_cfg();
+    FakeTransport transport;
+    MemoryStore   store;
+    transport.next_status = 200;
+    transport.next_body   = signed_config_body(CFG_SIG_VALID, 3650);
+
+    Client client(cfg, transport, store, []{ return CFG_NOW; }, NO_SLEEP);
+    CHECK(!client.fetchConfig().is_ok());
+    CHECK(client.effectiveTrialDurationDays() == 7);   // the seed, not 3650
+}
+
+TEST_CASE("Config signature: a signature for another product is rejected") {
+    // Without tenant/product inside the payload, a config legitimately signed
+    // for one product replays against another under the same tenant keyset.
+    auto cfg = config_signing_cfg();
+    FakeTransport transport;
+    MemoryStore   store;
+    transport.next_status = 200;
+    transport.next_body   = signed_config_body(CFG_SIG_OTHER_PRODUCT);
+
+    Client client(cfg, transport, store, []{ return CFG_NOW; }, NO_SLEEP);
+    CHECK(!client.fetchConfig().is_ok());
+    CHECK(client.effectiveTrialDurationDays() == 7);
+}
+
+TEST_CASE("Config signature: an expired config from the network is rejected") {
+    // Replay of an old, genuinely-signed config that granted a longer trial.
+    auto cfg = config_signing_cfg();
+    FakeTransport transport;
+    MemoryStore   store;
+    transport.next_status = 200;
+    transport.next_body   =
+        signed_config_body(CFG_SIG_EXPIRED, 30, 1700000000LL, 1700600000LL);
+
+    Client client(cfg, transport, store, []{ return CFG_NOW; }, NO_SLEEP);
+    CHECK(!client.fetchConfig().is_ok());
+    CHECK(client.effectiveTrialDurationDays() == 7);
+}
+
+TEST_CASE("Config signature: an expired config from the CACHE is still used") {
+    // Freshness bounds the wire, not the cache. The cached value was verified
+    // once and lives in the machine-bound store; expiring it would cut an
+    // offline user's trial short to punish an attack they are not committing.
+    auto cfg = config_signing_cfg();
+    MemoryStore store;
+    {
+        FakeTransport transport;
+        transport.next_status = 200;
+        transport.next_body   = signed_config_body(CFG_SIG_VALID);
+        Client client(cfg, transport, store, []{ return CFG_NOW; }, NO_SLEEP);
+        REQUIRE(client.fetchConfig().is_ok());
+    }
+
+    // Relaunch long after the config's own expires_at.
+    FailingTransport offline;
+    Client relaunched(cfg, offline, store, []{ return 1900000000LL; }, NO_SLEEP);
+    CHECK(relaunched.effectiveTrialDurationDays() == 14);
+}
+
+TEST_CASE("Config signature: unsigned is tolerated by default, rejected when required") {
+    auto cfg = config_signing_cfg();
+    const std::string unsigned_body =
+        R"({"trial_duration_days":14,"free_tier_enabled":true})";
+
+    SUBCASE("default accepts unsigned during the signing rollout") {
+        REQUIRE(cfg.requireSignedConfig == false);
+        FakeTransport transport;
+        MemoryStore   store;
+        transport.next_status = 200;
+        transport.next_body   = unsigned_body;
+
+        Client client(cfg, transport, store, []{ return CFG_NOW; }, NO_SLEEP);
+        REQUIRE(client.fetchConfig().is_ok());
+        CHECK(client.effectiveTrialDurationDays() == 14);
+    }
+
+    SUBCASE("requireSignedConfig rejects it") {
+        cfg.requireSignedConfig = true;
+        FakeTransport transport;
+        MemoryStore   store;
+        transport.next_status = 200;
+        transport.next_body   = unsigned_body;
+
+        Client client(cfg, transport, store, []{ return CFG_NOW; }, NO_SLEEP);
+        CHECK(!client.fetchConfig().is_ok());
+        CHECK(client.effectiveTrialDurationDays() == 7);
+    }
+}
+
+TEST_CASE("Config signature: an unknown kid is rejected") {
+    auto cfg = config_signing_cfg();
+    cfg.trustedKeys.erase("kcfg");     // key rotated out from under us
+
+    FakeTransport transport;
+    MemoryStore   store;
+    transport.next_status = 200;
+    transport.next_body   = signed_config_body(CFG_SIG_VALID);
+
+    Client client(cfg, transport, store, []{ return CFG_NOW; }, NO_SLEEP);
+    CHECK(!client.fetchConfig().is_ok());
+    CHECK(client.effectiveTrialDurationDays() == 7);
+}
+
+TEST_CASE("config_canonical_payload matches the documented format") {
+    // The bytes the other four SDKs must reproduce. Pinned literally, because
+    // a silent change here makes this SDK disagree with them about one tenant.
+    CHECK(config_canonical_payload("kcfg", "testco", "testapp",
+                                   1781076246LL, 1781680000LL, 14, true)
+          == "cfg1|kcfg|testco|testapp|1781076246|1781680000|14|true");
+    CHECK(config_canonical_payload("kcfg", "testco", "testapp",
+                                   1781076246LL, 1781680000LL, 0, false)
+          == "cfg1|kcfg|testco|testapp|1781076246|1781680000|0|false");
+}
+
+
+TEST_CASE("Client: cached lease accessors") {
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+
+    CHECK(client.hasStoredLicense() == false);
+    CHECK(client.cachedLease().has_value() == false);
+    CHECK(client.cachedLicenseKey().has_value() == false);
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    CHECK(client.hasStoredLicense() == true);
+    REQUIRE(client.cachedLease().has_value());
+    CHECK(client.cachedLease()->status == "active");
+    REQUIRE(client.cachedLicenseKey().has_value());
+    CHECK(*client.cachedLicenseKey() == "XXXX-YYYY-ZZZZ-0001");
+}
+
+TEST_CASE("Client: cachedLease is returned as-is, not re-verified") {
+    // The docstring promises the lease comes back unverified and that callers
+    // wanting trust should use state()/hasEntitlement(). Pin that, or someone
+    // will later "helpfully" make this verify and change its meaning.
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW);
+
+    // Far past the lease's own expiry: state() reports Expired, but the
+    // cached lease is still handed back for a UI to display.
+    const int64_t long_after = 1781681046LL + 60 * 86400;
+    Client client(cfg, transport, store, [&]{ return long_after; }, NO_SLEEP);
+
+    CHECK(client.state() != State::Licensed);
+    REQUIRE(client.cachedLease().has_value());
+    CHECK(client.cachedLease()->status == "active");
+}
+
+
+TEST_CASE("Client: normalizeKey matches the worker's normalization") {
+    CHECK(Client::normalizeKey("xxxx-yyyy-zzzz-0001") == "XXXXYYYYZZZZ0001");
+    CHECK(Client::normalizeKey("  XXXX YYYY  ")       == "XXXXYYYY");
+    CHECK(Client::normalizeKey("")                    == "");
+}
+
+TEST_CASE("Client: upgradeUrl targets the authenticated portal route") {
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+    // No key stored, nothing to link to.
+    CHECK(client.upgradeUrl().has_value() == false);
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    REQUIRE(client.upgradeUrl().has_value());
+    // The standalone /p/{tenant}/upgrade/{product} form is retired; the portal
+    // path segment IS the normalized key.
+    CHECK(*client.upgradeUrl() ==
+          "https://portal.keylight.dev/t/tenant1/license/XXXXYYYYZZZZ0001/upgrade");
+}
+
+TEST_CASE("Client: key format validation uses the configured prefix") {
+    auto cfg = make_config();
+    cfg.keyPrefix = "KL";
+
+    FakeTransport transport;
+    MemoryStore   store;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+
+    CHECK(client.isValidKeyFormat("KL-AAAA-BBBB") == true);
+    CHECK(client.isValidKeyFormat("kl-aaaa-bbbb") == true);   // case-insensitive
+    CHECK(client.isValidKeyFormat("XX-AAAA-BBBB") == false);
+    CHECK(client.isValidKeyFormat("")             == false);
+}
+
+TEST_CASE("Client: an unset prefix accepts any non-empty key") {
+    auto cfg = make_config();   // keyPrefix left empty
+    FakeTransport transport;
+    MemoryStore   store;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+
+    // Rejecting everything when no prefix is configured would break every
+    // integrator who never set the field.
+    CHECK(client.isValidKeyFormat("anything") == true);
+    CHECK(client.isValidKeyFormat("")         == false);
+}
+
+TEST_CASE("Client: a key of only separators is not a valid format") {
+    // normalizeKey strips these to nothing, so the empty-check has to run on
+    // the NORMALIZED string or "---" reads as a plausible key.
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+
+    CHECK(client.isValidKeyFormat("---")   == false);
+    CHECK(client.isValidKeyFormat("   ")   == false);
+}
+
+
+TEST_CASE("Client: activeRevalidate is debounced to 60 seconds") {
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    int64_t now = VALID_ACTIVE_NOW;
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    Client client(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    transport.next_body = VALIDATE_RESPONSE;
+    const size_t after_activate = transport.calls_made;
+
+    CHECK(client.activeRevalidate() == true);
+    CHECK(transport.calls_made == after_activate + 1);
+
+    // Foregrounding an app repeatedly must not hammer the API.
+    now += 30;
+    CHECK(client.activeRevalidate() == false);
+    CHECK(transport.calls_made == after_activate + 1);
+
+    now += 31;   // past the 60s window
+    CHECK(client.activeRevalidate() == true);
+    CHECK(transport.calls_made == after_activate + 2);
+}
+
+TEST_CASE("Client: activeRevalidate does nothing without a stored license") {
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+
+    CHECK(client.activeRevalidate() == false);
+    CHECK(transport.calls_made == 0);
+}
+
+TEST_CASE("Client: the activeRevalidate debounce is per-session, not persisted") {
+    // A relaunch must always revalidate. Persisting the debounce would let a
+    // user dodge a revoke by restarting inside the window.
+    auto cfg = make_config();
+    MemoryStore store;
+    int64_t now = VALID_ACTIVE_NOW;
+
+    {
+        FakeTransport transport;
+        transport.next_status = 200;
+        transport.next_body   = ACTIVATE_RESPONSE;
+        Client client(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
+        REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+        transport.next_body = VALIDATE_RESPONSE;
+        REQUIRE(client.activeRevalidate() == true);
+    }
+
+    // Same instant, brand new Client: the debounce does not survive.
+    FakeTransport transport;
+    transport.next_status = 200;
+    transport.next_body   = VALIDATE_RESPONSE;
+    Client relaunched(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
+    CHECK(relaunched.activeRevalidate() == true);
+    CHECK(transport.calls_made == 1);
+}
+
+
+TEST_CASE("Client: refreshAfterUpgrade returns true when entitlements change") {
+    auto cfg = make_config();
+    ScriptedTransport transport;
+    MemoryStore       store;
+
+    transport.replies = {
+        {200, ACTIVATE_RESPONSE, {}},           // activate -> Licensed
+        {200, FALLBACK_VALIDATE_RESPONSE, {}},  // validate -> Limited
+    };
+
+    std::vector<uint64_t> slept;
+    Client client(cfg, transport, store,
+                  []{ return VALID_ACTIVE_NOW; },
+                  [&](uint64_t ms){ slept.push_back(ms); });
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    // refreshAfterUpgrade returns true on an entitlements change OR a state
+    // change; this drives the state edge, which needs no new fixture.
+    CHECK(client.refreshAfterUpgrade(30000, 2000) == true);
+    CHECK(client.state() == State::Limited);
+}
+
+TEST_CASE("Client: refreshAfterUpgrade gives up at the timeout") {
+    auto cfg = make_config();
+    ScriptedTransport transport;
+    MemoryStore       store;
+
+    // The server never reports a change — payment webhook lag that never
+    // resolves inside the window. The normal cadence applies it later.
+    transport.replies = {
+        {200, ACTIVATE_RESPONSE, {}},
+        {200, VALIDATE_RESPONSE, {}},
+    };
+
+    std::vector<uint64_t> slept;
+    int64_t now = VALID_ACTIVE_NOW;
+    // The injected sleep advances the test clock, or the deadline is never
+    // reached and this loops forever.
+    Client client(cfg, transport, store,
+                  [&]{ return now; },
+                  [&](uint64_t ms){ slept.push_back(ms);
+                                    now += static_cast<int64_t>(ms) / 1000; });
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    CHECK(client.refreshAfterUpgrade(5000, 1000) == false);
+    // Bounded: it polls, it does not spin.
+    CHECK(slept.size() <= 5);
+    CHECK(slept.size() >= 1);
+}
+
+TEST_CASE("Client: refreshAfterUpgrade does nothing without a stored license") {
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+
+    CHECK(client.refreshAfterUpgrade(1000, 100) == false);
+    CHECK(transport.calls_made == 0);
+}
+
+TEST_CASE("Client: refreshAfterUpgrade does not spin on a non-positive interval") {
+    // A caller passing 0 would otherwise poll the API as fast as the loop runs.
+    auto cfg = make_config();
+    ScriptedTransport transport;
+    MemoryStore       store;
+    transport.replies = {
+        {200, ACTIVATE_RESPONSE, {}},
+        {200, VALIDATE_RESPONSE, {}},
+    };
+
+    std::vector<uint64_t> slept;
+    int64_t now = VALID_ACTIVE_NOW;
+    Client client(cfg, transport, store,
+                  [&]{ return now; },
+                  [&](uint64_t ms){ slept.push_back(ms);
+                                    now += static_cast<int64_t>(ms) / 1000 + 1; });
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    CHECK(client.refreshAfterUpgrade(3000, 0) == false);
+    for (uint64_t ms : slept) CHECK(ms > 0);
+}
+
+
+TEST_CASE("Client: onLifecycle fires Restored when a license activates") {
+    // The pure transition table is covered in test_lifecycle.cpp. This covers
+    // the wiring — that set_state_ actually computes and dispatches an event —
+    // which the table tests cannot see.
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    std::vector<LifecycleEvent> events;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+    auto sub = client.onLifecycle([&](LifecycleEvent e){ events.push_back(e); });
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    REQUIRE(events.size() >= 1);
+    CHECK(events.front() == LifecycleEvent::Restored);
+}
+
+TEST_CASE("Client: on(\"restored\") routes to the lifecycle channel") {
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    std::vector<State> seen;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+    auto sub = client.on("restored", [&](State s){ seen.push_back(s); });
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    REQUIRE(seen.size() == 1);
+    CHECK(seen[0] == State::Licensed);
+}
+
+TEST_CASE("Client: an unrecognized event name still subscribes to every change") {
+    // Existing callers pass "change", and some pass anything at all. Routing
+    // only known lifecycle names must not silently drop the rest on the floor.
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    std::vector<State> change_seen, bogus_seen;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+    auto a = client.on("change",       [&](State s){ change_seen.push_back(s); });
+    auto b = client.on("not-an-event", [&](State s){ bogus_seen.push_back(s); });
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    CHECK(change_seen.size() >= 1);
+    CHECK(bogus_seen.size() == change_seen.size());
+}
+
+TEST_CASE("Client: unsubscribing a lifecycle listener stops delivery") {
+    // Both listener kinds draw ids from one counter, so remove_listener_ has
+    // to clear either list. A Subscription does not know which kind it holds.
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    std::vector<LifecycleEvent> events;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+    {
+        auto sub = client.onLifecycle([&](LifecycleEvent e){ events.push_back(e); });
+    }   // RAII unsubscribe
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    CHECK(events.empty());
+}
+
+TEST_CASE("Client: a throwing lifecycle listener costs no other listener its event") {
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    int delivered = 0;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+    auto a = client.onLifecycle([](LifecycleEvent){ throw std::runtime_error("boom"); });
+    auto b = client.onLifecycle([&](LifecycleEvent){ ++delivered; });
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    CHECK(delivered == 1);
+}
+
+
+TEST_CASE("Client: a validate response carries the server config") {
+    auto cfg = make_config();
+    cfg.trialDurationDays = 0;
+
+    FakeTransport transport;
+    MemoryStore   store;
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    transport.next_body = VALIDATE_RESPONSE_WITH_CONFIG;
+    REQUIRE(client.validate().is_ok());
+
+    CHECK(client.effectiveTrialDurationDays() == 14);
+}
+
+TEST_CASE("Client: a response without config fields leaves the cache alone") {
+    auto cfg = make_config();
+    cfg.trialDurationDays = 0;
+
+    FakeTransport transport;
+    MemoryStore   store;
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    transport.next_body = VALIDATE_RESPONSE_WITH_CONFIG;
+    REQUIRE(client.validate().is_ok());
+    REQUIRE(client.effectiveTrialDurationDays() == 14);
+
+    // An older worker that does not send the fields must not wipe what we know.
+    transport.next_body = VALIDATE_RESPONSE;
+    REQUIRE(client.validate().is_ok());
+    CHECK(client.effectiveTrialDurationDays() == 14);
+}
+
+TEST_CASE("Client: requireSignedConfig also covers a validate body") {
+    // The bypass this closes: the /config route verifies a signature, so a
+    // fake server would otherwise just deliver the long trial on a validate
+    // body instead. Authentication has to be a property of the FIELDS, not of
+    // the route they arrived on.
+    auto cfg = make_config();
+    cfg.trialDurationDays     = 7;
+    cfg.requireSignedConfig   = true;
+
+    FakeTransport transport;
+    MemoryStore   store;
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    transport.next_body = VALIDATE_RESPONSE_WITH_CONFIG;   // unsigned fields
+    REQUIRE(client.validate().is_ok());
+
+    // The validate itself still succeeds — only the unsigned config is ignored.
+    CHECK(client.effectiveTrialDurationDays() == 7);
 }

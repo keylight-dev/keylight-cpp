@@ -68,7 +68,26 @@ void UKeylightSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 void UKeylightSubsystem::Deinitialize()
 {
-    // Stop background auto-validation before tearing down the client.
+    // Stop background auto-validation, then tear down the client.
+    //
+    // SAME DANGLING-POINTER HAZARD AS Configure(), and harder to avoid here.
+    // An in-flight Activate()/Validate()/Deactivate() AsyncTask holds a raw ClientPtr to
+    // this Client_ and dereferences it before any WeakThis check; resetting
+    // Client_ under it is a use-after-free. Configure() can be gated on "no
+    // request in flight", but Deinitialize() is called by the engine at
+    // shutdown, where an integrator often cannot. If that matters for your
+    // title, keep your own in-flight counter and drain it before shutdown.
+    //
+    // Since 0.2.0 stopAutoValidation() does NOT wait for the worker — it
+    // retires it and returns. The waiting, if any, happens in ~Client() via
+    // Client_.Reset(), which is what guarantees no worker outlives the client.
+    //
+    // On the GAME THREAD, so know the cost: usually zero, because ~Client()
+    // wakes the worker before it joins and one parked in its interval wait
+    // exits without another cycle. It blocks only when the worker is
+    // mid-cycle — up to one round trip, plus every listener callback for every
+    // queued event if that worker is delivering. Your listeners set that
+    // ceiling; nothing in the SDK caps it.
     if (Client_)
     {
         Client_->stopAutoValidation();
@@ -97,6 +116,9 @@ void UKeylightSubsystem::Configure(
     // Client_ and frees that object, leaving the background task with a
     // dangling ClientPtr. Ensure any in-flight operations have completed
     // (e.g. their delegates have fired) before calling Configure() again.
+    //
+    // Same game-thread cost as Deinitialize() — see the note there. Worse
+    // here, in fact: Configure() runs mid-session, so a hitch is visible.
     if (Client_)
     {
         Client_->stopAutoValidation();
@@ -289,12 +311,15 @@ EKeylightState UKeylightSubsystem::GetState() const
 /*static*/ EKeylightState UKeylightSubsystem::ToUEState(int NativeState)
 {
     // keylight::State enum values in declaration order:
-    //   0 = Licensed, 1 = Trial, 2 = Expired, 3 = Invalid
+    //   0 = Licensed, 1 = Trial, 2 = Expired, 3 = Invalid, 4 = FreeTier,
+    //   5 = Limited
     switch (static_cast<keylight::State>(NativeState))
     {
         case keylight::State::Licensed: return EKeylightState::Licensed;
         case keylight::State::Trial:    return EKeylightState::Trial;
         case keylight::State::Expired:  return EKeylightState::Expired;
+        case keylight::State::FreeTier: return EKeylightState::FreeTier;
+        case keylight::State::Limited:  return EKeylightState::Limited;
         default:                        return EKeylightState::Invalid;
     }
 }

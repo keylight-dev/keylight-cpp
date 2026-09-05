@@ -22,10 +22,39 @@ struct Config {
     std::string apiBaseUrl         = "https://api.keylight.dev";
     std::string appVersion;        // optional; sent as telemetry in activate/validate
 
+    // Reject a GET /config response that carries no signature at all.
+    //
+    // A signature that is PRESENT is always verified, and a bad one is always
+    // rejected, regardless of this flag. This only decides what to do with a
+    // response that has none.
+    //
+    // Defaults to false for 0.2.0 because the worker does not sign /config
+    // yet; defaulting to true would silently break every tenant's dashboard
+    // trial setting on upgrade. Set it to true once your server signs — and
+    // expect the default to flip in a later release.
+    bool        requireSignedConfig = false;
+
+    // Interval between anonymous keyless-beacon heartbeats (milliseconds).
+    // 0 disables the heartbeat entirely.
+    //
+    // The beacon itself is debounced to one report per 24h per state, so this
+    // interval only decides how promptly a state CHANGE is noticed, not how
+    // much traffic is sent. Six hours means a device that converts or lapses
+    // is reflected within a quarter day without the app being relaunched.
+    //
+    // The thread is not spawned by the constructor and its first tick is at
+    // +interval, never immediate — an AU/VST3 host instantiating and
+    // discarding plugin instances during a scan must not pay for either.
+    int         keylessHeartbeatIntervalMs = 6 * 60 * 60 * 1000;  // 6h
+
     // Interval between background auto-validation ticks (milliseconds).
     // Default is 30 minutes (1 800 000 ms).  Set a smaller value in tests
     // as a deterministic seam — the background thread uses this as its
     // interruptible wait timeout.
+    //
+    // A non-positive value is clamped to 1 ms. Left unclamped it would make
+    // the wait return immediately and turn the worker into a busy-spin over
+    // refreshIfNeeded(); 1 ms is still a bad interval, but it is a rate.
     int autoValidationIntervalMs = 1'800'000; // 30 min
 };
 

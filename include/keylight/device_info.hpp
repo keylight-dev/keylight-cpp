@@ -28,11 +28,16 @@
 #if defined(__APPLE__)
 #  include <sys/types.h>
 #  include <sys/sysctl.h>
+#  include <unistd.h>
 #elif defined(_WIN32) || defined(_WIN64)
 #  include <windows.h>
 #else
 #  include <unistd.h>
+#  include <sys/utsname.h>
 #endif
+
+#include <cctype>
+#include <string>
 
 namespace keylight {
 namespace detail {
@@ -85,6 +90,186 @@ inline uint64_t detect_physical_memory_bytes() {
     const long page_size = sysconf(_SC_PAGE_SIZE);
     if (pages <= 0 || page_size <= 0) return 0;
     return static_cast<uint64_t>(pages) * static_cast<uint64_t>(page_size);
+#endif
+}
+
+// Canonical CPU-architecture token for this build target.
+//
+// The server allow-lists exactly two spellings — "arm64" and "x86_64" — and
+// canonicalizes aliases (aarch64 -> arm64) server-side, but we send the
+// canonical spelling ourselves. Targets outside the vocabulary (32-bit,
+// exotic ISAs) return "" and the caller omits the field: absent reads better
+// server-side than a long tail of one-off buckets it would drop anyway.
+inline const char* current_arch() {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return "arm64";
+#elif defined(__x86_64__) || defined(_M_X64)
+    return "x86_64";
+#else
+    return "";
+#endif
+}
+
+// Server cap for os_version (zod `z.string().max(32)`).
+inline constexpr size_t OS_VERSION_MAX = 32;
+
+// Extract the first dotted-numeric run (\d+(\.\d+)*) from a raw OS string.
+//
+// Handles every shape the per-OS reads produce: the macOS sysctl is already
+// clean ("15.5"), a Linux kernel release carries a suffix ("6.8.0-45-generic"),
+// and the Windows version is assembled from three numbers. A trailing dot is
+// dropped; a run over the server's cap is REJECTED rather than truncated —
+// truncation would mint a fake version bucket out of a client bug.
+//
+// A patch zero is NOT stripped: "15.0" is sent as "15.0". keylight-rust sends
+// `sw_vers -productVersion` verbatim, and keylight-swift drops the patch
+// component only when it is zero AND there are three components — so macOS
+// 15.0 is "15.0" in all three SDKs. Stripping it here would be the one client
+// reporting "15" and would split a single population across two dashboard
+// buckets on every x.0 release.
+//
+// Pure. Mirrors keylight-rust telemetry::dotted_numeric.
+inline std::string dotted_numeric(const std::string& raw) {
+    size_t start = raw.find_first_of("0123456789");
+    if (start == std::string::npos) return {};
+
+    size_t end = start;
+    while (end < raw.size()) {
+        unsigned char c = static_cast<unsigned char>(raw[end]);
+        if (!std::isdigit(c) && raw[end] != '.') break;
+        ++end;
+    }
+
+    std::string v = raw.substr(start, end - start);
+    while (!v.empty() && v.back() == '.') v.pop_back();
+
+    if (v.empty() || v.size() > OS_VERSION_MAX) return {};
+
+    // Every dot-separated component must be non-empty. The scan above already
+    // guarantees each character is a digit or a dot, so this is the only
+    // remaining way to be malformed ("1..2").
+    size_t i = 0;
+    while (i <= v.size()) {
+        size_t dot  = v.find('.', i);
+        size_t stop = (dot == std::string::npos) ? v.size() : dot;
+        if (stop == i) return {};
+        if (dot == std::string::npos) break;
+        i = dot + 1;
+    }
+    return v;
+}
+
+// Raw per-platform OS version read. NEVER spawns a process: this SDK ships
+// inside JUCE plugins and Unreal, and a sandboxed AU/VST3 host may block
+// process spawn. keylight-rust shells out to `sw_vers` / `cmd /c ver`; this is
+// the same output by a different mechanism. Returns "" on any failure.
+inline std::string read_os_version_raw() {
+#if defined(__APPLE__)
+    char   buf[64];
+    size_t len = sizeof(buf);
+    if (::sysctlbyname("kern.osproductversion", buf, &len, nullptr, 0) != 0) {
+        return {};
+    }
+    // sysctlbyname reports the length INCLUDING the NUL terminator.
+    return std::string(buf, len > 0 ? len - 1 : 0);
+#elif defined(_WIN32) || defined(_WIN64)
+    // GetVersionEx lies for unmanifested apps; RtlGetVersion does not. The
+    // struct is declared locally so this header needs no <winternl.h> — the
+    // layout is RTL_OSVERSIONINFOW's, which is ABI-stable.
+    struct KlOsVersionInfoW {
+        ULONG dwOSVersionInfoSize;
+        ULONG dwMajorVersion;
+        ULONG dwMinorVersion;
+        ULONG dwBuildNumber;
+        ULONG dwPlatformId;
+        WCHAR szCSDVersion[128];
+    };
+    using RtlGetVersionFn = LONG(WINAPI*)(KlOsVersionInfoW*);
+
+    HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll) return {};
+    auto fn = reinterpret_cast<RtlGetVersionFn>(
+        reinterpret_cast<void*>(::GetProcAddress(ntdll, "RtlGetVersion")));
+    if (!fn) return {};
+
+    KlOsVersionInfoW vi{};
+    vi.dwOSVersionInfoSize = sizeof(vi);
+    if (fn(&vi) != 0) return {};
+    return std::to_string(vi.dwMajorVersion) + "." +
+           std::to_string(vi.dwMinorVersion) + "." +
+           std::to_string(vi.dwBuildNumber);
+#else
+    // Kernel release ("6.8.0-45-generic") — the one version every Linux has.
+    // Distro versions live in /etc/os-release but are not comparable across
+    // distros, and the kernel is what OS-level behavior actually tracks.
+    struct utsname u{};
+    if (::uname(&u) != 0) return {};
+    return std::string(u.release);
+#endif
+}
+
+// Normalized OS version, or "" when the platform read fails or yields nothing
+// dotted-numeric. Read once per process — the value cannot change while the
+// app runs, and on Windows this costs a GetProcAddress.
+inline std::string detect_os_version() {
+    static const std::string cached = dotted_numeric(read_os_version_raw());
+    return cached;
+}
+
+// Longest instance_name this SDK will send. The server schema is
+// `z.string().min(1)` with no maximum, so this cap is ours: a hostname is
+// user-controlled input and an unbounded one has no business on the wire.
+inline constexpr size_t INSTANCE_NAME_MAX = 64;
+
+// Strip control characters, trim trailing spaces, cap the length. Pure.
+inline std::string sanitize_instance_name(std::string s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        unsigned char u = static_cast<unsigned char>(c);
+        if (u >= 0x20 && u != 0x7f) out += c;
+    }
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    if (out.size() > INSTANCE_NAME_MAX) {
+        // Cap by BYTES, but never mid-character. High bytes are kept above, so
+        // a non-ASCII hostname over the cap would otherwise be cut through the
+        // middle of a UTF-8 sequence. json_str does not escape high bytes, so
+        // the malformed tail would reach the wire verbatim and the worker can
+        // reject the whole activate request over a machine name.
+        //
+        // Continuation bytes are 10xxxxxx; walk back off them to the lead byte
+        // and drop the partial character entirely.
+        size_t cut = INSTANCE_NAME_MAX;
+        while (cut > 0 &&
+               (static_cast<unsigned char>(out[cut]) & 0xC0) == 0x80) {
+            --cut;
+        }
+        out.resize(cut);
+    }
+    return out;
+}
+
+// Best-effort human-readable machine name for the activation's instance_name.
+// This is what a customer sees in their device list, so a real hostname beats
+// a constant. Returns "" on failure; the caller supplies the fallback.
+inline std::string detect_machine_name() {
+#if defined(_WIN32) || defined(_WIN64)
+    wchar_t buf[MAX_COMPUTERNAME_LENGTH + 1];
+    DWORD   len = static_cast<DWORD>(sizeof(buf) / sizeof(buf[0]));
+    if (!::GetComputerNameW(buf, &len)) return {};
+    // Hostnames are ASCII in practice; anything outside it is dropped rather
+    // than mangled into a lossy multi-byte guess.
+    std::string out;
+    for (DWORD i = 0; i < len; ++i) {
+        wchar_t c = buf[i];
+        if (c > 0 && c < 128) out += static_cast<char>(c);
+    }
+    return sanitize_instance_name(out);
+#else
+    char buf[256];
+    if (::gethostname(buf, sizeof(buf)) != 0) return {};
+    buf[sizeof(buf) - 1] = '\0';
+    return sanitize_instance_name(std::string(buf));
 #endif
 }
 

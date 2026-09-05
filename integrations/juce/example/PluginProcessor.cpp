@@ -100,10 +100,11 @@ void MyAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     // no heap access, no JUCE class construction.  This is safe on the real-
     // time thread.
     //
-    // The atomic is updated by the Licensing subscription callback which runs
-    // on the background network thread after every state change and posts to
-    // the message thread via callAsync.  The audio thread never touches
-    // the SDK's internal mutex or networking paths.
+    // The atomic is updated by the Licensing subscription callback, which runs
+    // on whichever thread is draining the SDK's event queue after every state
+    // change -- never the audio thread -- and posts to the message thread via
+    // callAsync.  The audio thread never touches the SDK's internal mutex or
+    // networking paths.
     //
     if (!licensing_->hasFeature("pro"))
     {

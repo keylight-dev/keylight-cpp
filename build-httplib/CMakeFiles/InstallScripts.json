@@ -1,8 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/Users/halloweed/Coding/Projects/keylight-cpp/build-httplib/cmake_install.cmake",
-		"/Users/halloweed/Coding/Projects/keylight-cpp/build-httplib/demo/notes/cmake_install.cmake"
-	],
-	"Parallel" : false
-}

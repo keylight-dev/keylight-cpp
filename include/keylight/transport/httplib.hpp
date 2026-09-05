@@ -26,6 +26,7 @@
 #  pragma GCC diagnostic pop
 #endif
 
+#include <cctype>
 #include <string>
 #include <map>
 #include <stdexcept>
@@ -174,6 +175,18 @@ public:
         HttpResponse resp;
         resp.status = hl_res->status;
         resp.body   = hl_res->body;
+
+        // Lowercase every name so callers can look up "retry-after" without
+        // guessing the server's capitalisation. httplib's own map is
+        // case-insensitive; HttpResponse's is a plain std::map, so the
+        // normalisation has to happen here.
+        for (const auto& kv : hl_res->headers) {
+            std::string name = kv.first;
+            for (char& c : name) {
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            }
+            resp.headers[name] = kv.second;
+        }
         return Result<HttpResponse>::ok(std::move(resp));
     }
 };

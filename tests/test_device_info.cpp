@@ -89,3 +89,121 @@ TEST_CASE("device_info: host detection yields a contract-legal bucket") {
     CHECK((mem.empty() || mem == "<4GB" || mem == "4-8GB" || mem == "8-16GB"
            || mem == "16-32GB" || mem == "32-64GB" || mem == "64GB+"));
 }
+
+TEST_CASE("device_info: current_arch is a server-allowed token or empty") {
+    std::string a = keylight::detail::current_arch();
+    // The server allow-lists exactly two spellings and canonicalizes aliases.
+    // A target outside that vocabulary omits the field rather than inventing
+    // a one-off bucket the server would drop anyway.
+    CHECK((a == "arm64" || a == "x86_64" || a.empty()));
+}
+
+TEST_CASE("device_info: current_arch is non-empty on the CI architectures") {
+#if defined(__aarch64__) || defined(_M_ARM64) || defined(__x86_64__) || defined(_M_X64)
+    CHECK(std::string(keylight::detail::current_arch()).empty() == false);
+#endif
+}
+
+TEST_CASE("device_info: dotted_numeric extracts the first well-formed run") {
+    using keylight::detail::dotted_numeric;
+
+    // macOS sysctl is already clean.
+    CHECK(dotted_numeric("15.5") == "15.5");
+    // A Linux kernel release carries a suffix; only the leading run is kept.
+    CHECK(dotted_numeric("6.8.0-45-generic") == "6.8.0");
+    // Windows wraps the number in prose that may be localized.
+    CHECK(dotted_numeric("Microsoft Windows [Version 10.0.22631.3737]")
+          == "10.0.22631.3737");
+    // A trailing dot is dropped rather than sent.
+    CHECK(dotted_numeric("15.") == "15");
+}
+
+TEST_CASE("device_info: a patch zero is preserved, matching Rust and Swift") {
+    using keylight::detail::dotted_numeric;
+
+    // The macOS read (`kern.osproductversion`) returns exactly the string
+    // `sw_vers -productVersion` prints, which is the value keylight-rust
+    // sends verbatim. keylight-swift drops the patch component only when it
+    // is zero AND there are three components, so macOS 15.0 reaches the
+    // server as "15.0" there too. Stripping a trailing ".0" here would put
+    // C++ on "15" while Rust and Swift sent "15.0" — it splits one
+    // population across two os_version buckets on every x.0 release, which
+    // is the opposite of the parity it was meant to buy.
+    CHECK(dotted_numeric("15.5.0")     == "15.5.0");
+    CHECK(dotted_numeric("14.0")       == "14.0");
+    CHECK(dotted_numeric("10.0.19045") == "10.0.19045");
+    CHECK(dotted_numeric("6.8.0-45-generic") == "6.8.0");
+}
+
+TEST_CASE("device_info: dotted_numeric rejects rather than repairs") {
+    using keylight::detail::dotted_numeric;
+
+    CHECK(dotted_numeric("").empty());
+    CHECK(dotted_numeric("no digits here").empty());
+    // An empty component is malformed, not something to patch up.
+    CHECK(dotted_numeric("1..2").empty());
+    // Over the server's 32-char cap: rejected, never truncated. Truncating
+    // would mint a fake version bucket out of a client bug.
+    CHECK(dotted_numeric("1.2.3.4.5.6.7.8.9.10.11.12.13.14.15.16").empty());
+}
+
+TEST_CASE("device_info: detect_os_version is dotted-numeric or empty") {
+    std::string v = keylight::detail::detect_os_version();
+    CHECK(v == keylight::detail::dotted_numeric(v));
+    CHECK(v.size() <= 32);
+}
+
+TEST_CASE("device_info: sanitize_instance_name strips control chars and caps length") {
+    using keylight::detail::sanitize_instance_name;
+
+    CHECK(sanitize_instance_name("studio-imac") == "studio-imac");
+    CHECK(sanitize_instance_name("name\twith\nctl") == "namewithctl");
+    CHECK(sanitize_instance_name("trailing   ") == "trailing");
+    CHECK(sanitize_instance_name(std::string(200, 'x')).size() == 64);
+    CHECK(sanitize_instance_name("").empty());
+}
+
+// Minimal RFC 3629 well-formedness check: rejects a truncated sequence, a
+// continuation byte with no lead byte, and an invalid start byte.
+static bool is_valid_utf8(const std::string& s) {
+    size_t i = 0;
+    while (i < s.size()) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        size_t extra;
+        if      (c < 0x80)           extra = 0;
+        else if ((c & 0xE0) == 0xC0) extra = 1;
+        else if ((c & 0xF0) == 0xE0) extra = 2;
+        else if ((c & 0xF8) == 0xF0) extra = 3;
+        else                         return false;  // 0x80-0xBF lead, or 0xF8+
+        if (i + extra >= s.size()) return false;    // truncated sequence
+        for (size_t k = 1; k <= extra; ++k) {
+            if ((static_cast<unsigned char>(s[i + k]) & 0xC0) != 0x80) return false;
+        }
+        i += extra + 1;
+    }
+    return true;
+}
+
+TEST_CASE("device_info: sanitize_instance_name never splits a UTF-8 sequence") {
+    using keylight::detail::sanitize_instance_name;
+
+    // A non-ASCII hostname longer than the 64-byte cap. High bytes are kept on
+    // purpose, so a blind resize(64) cuts through the middle of a character.
+    // json_str does not escape high bytes, so those malformed bytes would go
+    // straight onto the wire and the worker can reject the whole activate
+    // request — over a machine name.
+    //
+    // 30 x U+65E5 (3 bytes each) = 90 bytes; the cap lands inside character 22.
+    std::string host;
+    for (int i = 0; i < 30; ++i) host += "\xE6\x97\xA5";
+    REQUIRE(host.size() == 90);
+
+    const std::string out = sanitize_instance_name(host);
+
+    CHECK(out.size() <= keylight::detail::INSTANCE_NAME_MAX);
+    CHECK(out.empty() == false);
+    CHECK(is_valid_utf8(out) == true);
+    // Backing off to the character boundary drops the partial character and
+    // nothing more: 21 whole characters, 63 bytes.
+    CHECK(out.size() == 63);
+}

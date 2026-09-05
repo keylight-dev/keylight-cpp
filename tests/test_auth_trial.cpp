@@ -285,9 +285,20 @@ TEST_CASE("Trial: disabled when trialDurationDays == 0") {
     CHECK(r.value()           == State::Invalid);
     CHECK(client.state()      == State::Invalid);
     CHECK(client.checkTrial() == TrialStatus::NotStarted);
-    // Nothing was persisted — a trial start must never be written when
-    // trials are disabled.
-    CHECK(store.has_data_ == false);
+
+    // The stamp IS written, and this assertion is inverted from what it used
+    // to be. A zero effective duration no longer means "trials are disabled"
+    // — it is indistinguishable from "the server config has not arrived yet",
+    // because the duration became a server-owned setting. Refusing to stamp
+    // left no clock for a later duration to measure, which is precisely what
+    // made a dashboard-set trial do nothing.
+    //
+    // Nothing is granted by the stamp on its own: state, checkTrial() and
+    // trialDaysLeft() above all still report no trial. It only means that IF a
+    // duration arrives, the window runs from this moment rather than from
+    // whenever the config happened to land.
+    CHECK(store.has_data_ == true);
+    CHECK(store.int_field("trialStart") == T0);
 }
 
 TEST_CASE("Trial: first startTrial enters Trial and persists trialStart") {
@@ -697,4 +708,140 @@ TEST_CASE("Trial: refreshIfNeeded leaves a licensed client alone") {
     REQUIRE(r.is_ok());
     CHECK(r.value() == State::Licensed);
     CHECK(transport.calls.empty());
+}
+
+
+// ===========================================================================
+// Server-owned trial duration (Plan 3 Task 2).
+//
+// The hard `trialDurationDays <= 0` gates made a dashboard-set trial do
+// nothing: with the seed at 0, startTrial() returned before persisting, so
+// there was no clock for the server value to measure.
+// ===========================================================================
+
+namespace {
+// Retry backoff is real time; these tests drive a failing transport.
+const std::function<void(uint64_t)> NO_SLEEP_TRIAL = [](uint64_t){};
+
+class FailingTransport : public Transport {
+public:
+    Result<HttpResponse> request(
+        const std::string&, const std::string&,
+        const std::map<std::string, std::string>&, const std::string&) override
+    {
+        return Result<HttpResponse>::err({ErrorCode::Network, "offline"});
+    }
+};
+} // namespace
+
+TEST_CASE("Trial: a server duration grants a trial even when the seed is 0") {
+    auto cfg = make_config(0);
+
+    RecordingTransport transport;
+    MemStore           store;
+    transport.next_status = 200;
+    transport.next_body   = R"({"trial_duration_days":14,"free_tier_enabled":false})";
+
+    Client client(cfg, transport, store, []{ return T0; }, NO_SLEEP_TRIAL);
+    REQUIRE(client.fetchConfig().is_ok());
+    REQUIRE(client.startTrial().is_ok());
+
+    CHECK(client.checkTrial() == TrialStatus::Active);
+    CHECK(client.trialDaysLeft() == 14);
+    CHECK(client.state() == State::Trial);
+}
+
+TEST_CASE("Trial: startTrial stamps the clock before the config lands") {
+    auto cfg = make_config(0);
+
+    FailingTransport offline;
+    MemStore         store;
+
+    // First launch, offline: the config has not arrived, so the effective
+    // duration is 0 and no trial is reported...
+    Client client(cfg, offline, store, []{ return T0; }, NO_SLEEP_TRIAL);
+    REQUIRE(client.startTrial().is_ok());
+    CHECK(client.checkTrial() == TrialStatus::NotStarted);
+
+    // ...but the clock was stamped anyway, so when the duration does arrive
+    // the trial runs from first launch. Bailing early here is exactly the race
+    // that made a dashboard-set trial do nothing.
+    RecordingTransport online;
+    online.next_status = 200;
+    online.next_body   = R"({"trial_duration_days":14,"free_tier_enabled":false})";
+    Client second(cfg, online, store, []{ return T0; }, NO_SLEEP_TRIAL);
+    REQUIRE(second.fetchConfig().is_ok());
+    CHECK(second.checkTrial() == TrialStatus::Active);
+    CHECK(second.trialDaysLeft() == 14);
+}
+
+TEST_CASE("Trial: an old stamp is honored, not restarted") {
+    auto cfg = make_config(0);
+
+    MemStore store;
+    {
+        FailingTransport offline;
+        Client first(cfg, offline, store, []{ return T0; }, NO_SLEEP_TRIAL);
+        REQUIRE(first.startTrial().is_ok());
+    }
+
+    // The tenant enables a 14-day trial 60 days later. Installs that already
+    // stamped a start do NOT get a fresh window — one field, one rule, and it
+    // cannot be farmed by reinstalling.
+    const int64_t sixty_days_later = T0 + 60 * DAY;
+    RecordingTransport online;
+    online.next_status = 200;
+    online.next_body   = R"({"trial_duration_days":14,"free_tier_enabled":false})";
+
+    Client later(cfg, online, store, [&]{ return sixty_days_later; }, NO_SLEEP_TRIAL);
+    REQUIRE(later.fetchConfig().is_ok());
+    CHECK(later.checkTrial() == TrialStatus::Expired);
+    CHECK(later.trialDaysLeft() == 0);
+}
+
+TEST_CASE("Trial: an effective duration of 0 reports NotStarted") {
+    auto cfg = make_config(0);
+
+    FailingTransport offline;
+    MemStore         store;
+    Client client(cfg, offline, store, []{ return T0; }, NO_SLEEP_TRIAL);
+
+    REQUIRE(client.startTrial().is_ok());
+    CHECK(client.checkTrial() == TrialStatus::NotStarted);
+    CHECK(client.trialDaysLeft() == 0);
+}
+
+TEST_CASE("Trial: a server duration of 0 turns off a seed-enabled trial") {
+    // The reverse direction, and the one a tenant would notice: the app ships
+    // with a 30-day seed and the dashboard says trials are off. The server has
+    // to win, or the setting is decorative.
+    auto cfg = make_config(30);
+
+    RecordingTransport transport;
+    MemStore           store;
+    transport.next_status = 200;
+    transport.next_body   = R"({"trial_duration_days":0,"free_tier_enabled":false})";
+
+    Client client(cfg, transport, store, []{ return T0; }, NO_SLEEP_TRIAL);
+    REQUIRE(client.fetchConfig().is_ok());
+    REQUIRE(client.startTrial().is_ok());
+
+    CHECK(client.checkTrial() == TrialStatus::NotStarted);
+    CHECK(client.trialDaysLeft() == 0);
+}
+
+TEST_CASE("Trial: the server free-tier flag drives state resolution") {
+    // resolve_with_trial_ read cfg_.freeTierEnabled directly, so a
+    // dashboard-enabled free tier did nothing until the app shipped again.
+    auto cfg = make_config(0);
+    cfg.freeTierEnabled = false;
+
+    RecordingTransport transport;
+    MemStore           store;
+    transport.next_status = 200;
+    transport.next_body   = R"({"trial_duration_days":0,"free_tier_enabled":true})";
+
+    Client client(cfg, transport, store, []{ return T0; }, NO_SLEEP_TRIAL);
+    REQUIRE(client.fetchConfig().is_ok());
+    CHECK(client.state() == State::FreeTier);
 }

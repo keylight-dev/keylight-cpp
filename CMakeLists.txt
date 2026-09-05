@@ -126,6 +126,9 @@ if(KEYLIGHT_BUILD_TESTS)
   target_link_libraries(keylight_tests PRIVATE keylight)
   keylight_enable_warnings(keylight_tests)
   target_include_directories(keylight_tests PRIVATE tests)
+  # Compiles Client's test seams (e.g. retiredWorkerCount_ForTest). Set ONLY
+  # here, so they never reach a shipped build or the amalgamation's API.
+  target_compile_definitions(keylight_tests PRIVATE KEYLIGHT_ENABLE_TEST_SEAMS)
   add_test(NAME keylight_tests COMMAND keylight_tests)
   set_tests_properties(keylight_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
@@ -134,6 +137,7 @@ if(KEYLIGHT_BUILD_TESTS)
     # Separate executable so default ctest stays zero-dep.
     add_executable(keylight_tests_httplib ${KL_TESTS} tests/test_live.cpp)
     target_link_libraries(keylight_tests_httplib PRIVATE keylight_httplib_transport)
+    target_compile_definitions(keylight_tests_httplib PRIVATE KEYLIGHT_ENABLE_TEST_SEAMS)
   keylight_enable_warnings(keylight_tests_httplib)
     target_include_directories(keylight_tests_httplib PRIVATE tests)
     add_test(NAME keylight_tests_httplib COMMAND keylight_tests_httplib)

@@ -94,7 +94,11 @@ The `.github/workflows/release.yml` workflow:
 
 1. Runs the full build + conformance test matrix on Ubuntu, macOS, and Windows.
 2. Regenerates `keylight_single.hpp` and verifies it matches the committed copy.
-3. Creates a GitHub Release named after the tag and attaches `keylight_single.hpp`
+3. Verifies the checklist above was actually done — all three version
+   declarations match the tag, and `CHANGELOG.md` has a finalised
+   `## [x.y.z] - YYYY-MM-DD` heading for it. The release body is extracted from
+   that heading, so a `(unreleased)` one would publish stub notes.
+4. Creates a GitHub Release named after the tag and attaches `keylight_single.hpp`
    as a release artifact.
 
 > C++ has no central package registry equivalent to crates.io, npm, or NuGet. Distribution

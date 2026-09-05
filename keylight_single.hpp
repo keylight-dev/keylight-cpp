@@ -16,6 +16,7 @@
 #include <array>
 #include <atomic>
 #include <cassert>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -26,6 +27,7 @@
 #include <fstream>
 #include <functional>
 #include <future>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -40,7 +42,7 @@
 // include/keylight/version.hpp
 // ──────────────────────────────────────────────────────────────────────────
 
-#define KEYLIGHT_SDK_VERSION "0.1.6"
+#define KEYLIGHT_SDK_VERSION "0.2.0"
 
 // Identifies this SDK to the backend, sent as `sdk` alongside `platform`.
 // Server cap is 16 characters (zod `z.string().max(16)`).
@@ -223,6 +225,187 @@ inline std::string base64_decode(const std::string& input) {
 } // namespace keylight
 
 // ──────────────────────────────────────────────────────────────────────────
+// include/keylight/clock.hpp
+// ──────────────────────────────────────────────────────────────────────────
+
+// keylight/clock.hpp — heuristic detection of system-clock manipulation.
+// Ported from keylight-rust keylight/src/clock.rs.
+
+
+namespace keylight {
+
+// How far the clock may move backward before we call it manipulation rather
+// than drift. NTP corrections and suspend/resume routinely move it a little.
+inline constexpr int64_t CLOCK_BACKWARD_TOLERANCE = 3600; // 1h
+
+// True when `now` is more than the tolerance behind `last_seen` — the clock
+// was rolled back since the last recorded contact.
+//
+// This deliberately OMITS the forward-jump component of Rust's
+// clock_manipulated(), so it can gate the read-only state() resolver without
+// governing offline duration — that stays with maxOfflineDays. Conflating the
+// two would fail-close on every user who simply went offline for a while.
+//
+// Operates on UTC epoch seconds, so a timezone change never trips it.
+inline bool clock_rolled_back(int64_t last_seen, int64_t now) {
+    return last_seen - now > CLOCK_BACKWARD_TOLERANCE;
+}
+
+} // namespace keylight
+
+// ──────────────────────────────────────────────────────────────────────────
+// include/keylight/lifecycle.hpp
+// ──────────────────────────────────────────────────────────────────────────
+
+// keylight/lifecycle.hpp — license state and lifecycle transitions.
+// lifecycle_event is ported from keylight-rust keylight/src/state.rs.
+//
+// The transition table is cross-SDK. Changing an arm here diverges C++ from
+// Rust and Swift silently, so it is pinned by tests rather than reasoned about
+// at each call site.
+//
+// `State` lives here rather than in client.hpp because two headers now need
+// it and it has no dependencies of its own. client.hpp includes this.
+
+
+namespace keylight {
+
+// ---------------------------------------------------------------------------
+// State — high-level license state (C++ subset of Rust/C# states)
+// ---------------------------------------------------------------------------
+enum class State {
+    Licensed,   // trusted, unexpired active lease
+    Trial,      // no license; within trial window
+    Expired,    // trusted lease expired, or license status "expired"
+    Invalid,    // no trusted lease, no active trial
+    FreeTier,   // no license and no trial, but the product offers a free tier.
+                // Appended last on purpose: renumbering the values above would
+                // break any integrator that persisted a State as an integer.
+    Limited,    // trusted lease with server status "fallback": the server could
+                // not mint a full lease, so the app runs degraded rather than
+                // locked. Appended last for the same reason as FreeTier —
+                // renumbering would break any integrator that persisted a
+                // State as an integer.
+};
+
+// ---------------------------------------------------------------------------
+// LifecycleEvent — the subset of transitions worth telling a customer about.
+//
+// Distinct from a state-change subscription, which fires on EVERY transition.
+// "Your licence renewed" is an event; "we re-resolved to the same state" is
+// not, and a customer-facing notification driven off the latter is noise.
+// ---------------------------------------------------------------------------
+enum class LifecycleEvent {
+    Renewed,    // still licensed, expiry moved later
+    Cancelled,  // was licensed, now expired or degraded
+    Expired,    // reached Expired from anything that was not already Expired
+    Restored,   // reached Licensed from a non-licensed state
+};
+
+// `expiry_moved_later` is true when the newly observed expiry is later than the
+// previous one, including the case where there was no previous expiry.
+inline std::optional<LifecycleEvent> lifecycle_event(State prev,
+                                                     State next,
+                                                     bool  expiry_moved_later) {
+    if (prev == State::Licensed && next == State::Licensed) {
+        if (expiry_moved_later) return LifecycleEvent::Renewed;
+        return std::nullopt;
+    }
+    if (prev == State::Licensed &&
+        (next == State::Expired || next == State::Limited)) {
+        return LifecycleEvent::Cancelled;
+    }
+    if (next == State::Licensed &&
+        (prev == State::Expired || prev == State::Limited || prev == State::Invalid)) {
+        return LifecycleEvent::Restored;
+    }
+    if (next == State::Expired && prev != State::Expired) {
+        return LifecycleEvent::Expired;
+    }
+    return std::nullopt;
+}
+
+} // namespace keylight
+
+// ──────────────────────────────────────────────────────────────────────────
+// include/keylight/retry.hpp
+// ──────────────────────────────────────────────────────────────────────────
+
+// keylight/retry.hpp — retry policy for transient HTTP failures.
+// Ported from keylight-rust keylight/src/http/retry.rs.
+//
+// Pure logic, deliberately separated from the transport so the policy is
+// unit-tested without sleeping or networking.
+
+
+namespace keylight {
+
+inline constexpr uint32_t RETRY_MAX_ATTEMPTS = 3;
+inline constexpr uint64_t RETRY_BASE_MS      = 500;
+inline constexpr uint64_t RETRY_CAP_MS       = 4000;
+// Ceiling for any sleep we will perform, including a server-supplied one.
+inline constexpr uint64_t RETRY_MAX_SLEEP_MS = 3600000; // 1h
+
+struct RetryDecision {
+    bool     retry    = false;
+    uint64_t delay_ms = 0;
+};
+
+// Backoff for a 1-based attempt number, without jitter (the caller adds it).
+inline uint64_t backoff_ms(uint32_t attempt) {
+    if (attempt == 0) return RETRY_BASE_MS;
+    // Shift is bounded before it is applied: 1u << 64 is undefined behavior,
+    // and the value saturates at the cap long before that anyway.
+    const uint32_t shift = attempt - 1 > 20 ? 20 : attempt - 1;
+    const uint64_t exp   = RETRY_BASE_MS << shift;
+    return exp > RETRY_CAP_MS ? RETRY_CAP_MS : exp;
+}
+
+// Is this HTTP status worth trying again?
+inline bool status_retryable(int status) {
+    return status == 408 || status == 429 || (status >= 500 && status <= 599);
+}
+
+// Parse a Retry-After header value. Only the delay-seconds form is accepted:
+// the HTTP-date form is legal but the worker never sends it, and a date
+// parser is a lot of surface for a case that does not occur.
+inline std::optional<uint64_t> parse_retry_after(const std::string& value) {
+    size_t b = value.find_first_not_of(" \t");
+    if (b == std::string::npos) return std::nullopt;
+    size_t e = value.find_last_not_of(" \t");
+    const std::string v = value.substr(b, e - b + 1);
+    if (v.empty()) return std::nullopt;
+
+    uint64_t out = 0;
+    for (char c : v) {
+        if (c < '0' || c > '9') return std::nullopt;
+        if (out > (UINT64_MAX - static_cast<uint64_t>(c - '0')) / 10) {
+            return std::nullopt; // absurd value; treat as unparseable
+        }
+        out = out * 10 + static_cast<uint64_t>(c - '0');
+    }
+    return out;
+}
+
+// Decide the next step for a status on a given 1-based attempt.
+inline RetryDecision retry_decide(int                      status,
+                                  uint32_t                 attempt,
+                                  std::optional<uint64_t>  retry_after_secs) {
+    if (attempt >= RETRY_MAX_ATTEMPTS || !status_retryable(status)) {
+        return RetryDecision{false, 0};
+    }
+    uint64_t raw = backoff_ms(attempt);
+    if (status == 429 && retry_after_secs.has_value()) {
+        const uint64_t secs = *retry_after_secs;
+        // Multiply carefully: a huge Retry-After must clamp, not wrap.
+        raw = secs > RETRY_MAX_SLEEP_MS / 1000 ? RETRY_MAX_SLEEP_MS : secs * 1000;
+    }
+    return RetryDecision{true, raw > RETRY_MAX_SLEEP_MS ? RETRY_MAX_SLEEP_MS : raw};
+}
+
+} // namespace keylight
+
+// ──────────────────────────────────────────────────────────────────────────
 // include/keylight/config.hpp
 // ──────────────────────────────────────────────────────────────────────────
 
@@ -247,10 +430,39 @@ struct Config {
     std::string apiBaseUrl         = "https://api.keylight.dev";
     std::string appVersion;        // optional; sent as telemetry in activate/validate
 
+    // Reject a GET /config response that carries no signature at all.
+    //
+    // A signature that is PRESENT is always verified, and a bad one is always
+    // rejected, regardless of this flag. This only decides what to do with a
+    // response that has none.
+    //
+    // Defaults to false for 0.2.0 because the worker does not sign /config
+    // yet; defaulting to true would silently break every tenant's dashboard
+    // trial setting on upgrade. Set it to true once your server signs — and
+    // expect the default to flip in a later release.
+    bool        requireSignedConfig = false;
+
+    // Interval between anonymous keyless-beacon heartbeats (milliseconds).
+    // 0 disables the heartbeat entirely.
+    //
+    // The beacon itself is debounced to one report per 24h per state, so this
+    // interval only decides how promptly a state CHANGE is noticed, not how
+    // much traffic is sent. Six hours means a device that converts or lapses
+    // is reflected within a quarter day without the app being relaunched.
+    //
+    // The thread is not spawned by the constructor and its first tick is at
+    // +interval, never immediate — an AU/VST3 host instantiating and
+    // discarding plugin instances during a scan must not pay for either.
+    int         keylessHeartbeatIntervalMs = 6 * 60 * 60 * 1000;  // 6h
+
     // Interval between background auto-validation ticks (milliseconds).
     // Default is 30 minutes (1 800 000 ms).  Set a smaller value in tests
     // as a deterministic seam — the background thread uses this as its
     // interruptible wait timeout.
+    //
+    // A non-positive value is clamped to 1 ms. Left unclamped it would make
+    // the wait return immediately and turn the worker into a busy-spin over
+    // refreshIfNeeded(); 1 ms is still a bad interval, but it is a rate.
     int autoValidationIntervalMs = 1'800'000; // 30 min
 };
 
@@ -287,11 +499,14 @@ struct Config {
 #if defined(__APPLE__)
 #  include <sys/types.h>
 #  include <sys/sysctl.h>
+#  include <unistd.h>
 #elif defined(_WIN32) || defined(_WIN64)
 #  include <windows.h>
 #else
 #  include <unistd.h>
+#  include <sys/utsname.h>
 #endif
+
 
 namespace keylight {
 namespace detail {
@@ -344,6 +559,186 @@ inline uint64_t detect_physical_memory_bytes() {
     const long page_size = sysconf(_SC_PAGE_SIZE);
     if (pages <= 0 || page_size <= 0) return 0;
     return static_cast<uint64_t>(pages) * static_cast<uint64_t>(page_size);
+#endif
+}
+
+// Canonical CPU-architecture token for this build target.
+//
+// The server allow-lists exactly two spellings — "arm64" and "x86_64" — and
+// canonicalizes aliases (aarch64 -> arm64) server-side, but we send the
+// canonical spelling ourselves. Targets outside the vocabulary (32-bit,
+// exotic ISAs) return "" and the caller omits the field: absent reads better
+// server-side than a long tail of one-off buckets it would drop anyway.
+inline const char* current_arch() {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return "arm64";
+#elif defined(__x86_64__) || defined(_M_X64)
+    return "x86_64";
+#else
+    return "";
+#endif
+}
+
+// Server cap for os_version (zod `z.string().max(32)`).
+inline constexpr size_t OS_VERSION_MAX = 32;
+
+// Extract the first dotted-numeric run (\d+(\.\d+)*) from a raw OS string.
+//
+// Handles every shape the per-OS reads produce: the macOS sysctl is already
+// clean ("15.5"), a Linux kernel release carries a suffix ("6.8.0-45-generic"),
+// and the Windows version is assembled from three numbers. A trailing dot is
+// dropped; a run over the server's cap is REJECTED rather than truncated —
+// truncation would mint a fake version bucket out of a client bug.
+//
+// A patch zero is NOT stripped: "15.0" is sent as "15.0". keylight-rust sends
+// `sw_vers -productVersion` verbatim, and keylight-swift drops the patch
+// component only when it is zero AND there are three components — so macOS
+// 15.0 is "15.0" in all three SDKs. Stripping it here would be the one client
+// reporting "15" and would split a single population across two dashboard
+// buckets on every x.0 release.
+//
+// Pure. Mirrors keylight-rust telemetry::dotted_numeric.
+inline std::string dotted_numeric(const std::string& raw) {
+    size_t start = raw.find_first_of("0123456789");
+    if (start == std::string::npos) return {};
+
+    size_t end = start;
+    while (end < raw.size()) {
+        unsigned char c = static_cast<unsigned char>(raw[end]);
+        if (!std::isdigit(c) && raw[end] != '.') break;
+        ++end;
+    }
+
+    std::string v = raw.substr(start, end - start);
+    while (!v.empty() && v.back() == '.') v.pop_back();
+
+    if (v.empty() || v.size() > OS_VERSION_MAX) return {};
+
+    // Every dot-separated component must be non-empty. The scan above already
+    // guarantees each character is a digit or a dot, so this is the only
+    // remaining way to be malformed ("1..2").
+    size_t i = 0;
+    while (i <= v.size()) {
+        size_t dot  = v.find('.', i);
+        size_t stop = (dot == std::string::npos) ? v.size() : dot;
+        if (stop == i) return {};
+        if (dot == std::string::npos) break;
+        i = dot + 1;
+    }
+    return v;
+}
+
+// Raw per-platform OS version read. NEVER spawns a process: this SDK ships
+// inside JUCE plugins and Unreal, and a sandboxed AU/VST3 host may block
+// process spawn. keylight-rust shells out to `sw_vers` / `cmd /c ver`; this is
+// the same output by a different mechanism. Returns "" on any failure.
+inline std::string read_os_version_raw() {
+#if defined(__APPLE__)
+    char   buf[64];
+    size_t len = sizeof(buf);
+    if (::sysctlbyname("kern.osproductversion", buf, &len, nullptr, 0) != 0) {
+        return {};
+    }
+    // sysctlbyname reports the length INCLUDING the NUL terminator.
+    return std::string(buf, len > 0 ? len - 1 : 0);
+#elif defined(_WIN32) || defined(_WIN64)
+    // GetVersionEx lies for unmanifested apps; RtlGetVersion does not. The
+    // struct is declared locally so this header needs no <winternl.h> — the
+    // layout is RTL_OSVERSIONINFOW's, which is ABI-stable.
+    struct KlOsVersionInfoW {
+        ULONG dwOSVersionInfoSize;
+        ULONG dwMajorVersion;
+        ULONG dwMinorVersion;
+        ULONG dwBuildNumber;
+        ULONG dwPlatformId;
+        WCHAR szCSDVersion[128];
+    };
+    using RtlGetVersionFn = LONG(WINAPI*)(KlOsVersionInfoW*);
+
+    HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll) return {};
+    auto fn = reinterpret_cast<RtlGetVersionFn>(
+        reinterpret_cast<void*>(::GetProcAddress(ntdll, "RtlGetVersion")));
+    if (!fn) return {};
+
+    KlOsVersionInfoW vi{};
+    vi.dwOSVersionInfoSize = sizeof(vi);
+    if (fn(&vi) != 0) return {};
+    return std::to_string(vi.dwMajorVersion) + "." +
+           std::to_string(vi.dwMinorVersion) + "." +
+           std::to_string(vi.dwBuildNumber);
+#else
+    // Kernel release ("6.8.0-45-generic") — the one version every Linux has.
+    // Distro versions live in /etc/os-release but are not comparable across
+    // distros, and the kernel is what OS-level behavior actually tracks.
+    struct utsname u{};
+    if (::uname(&u) != 0) return {};
+    return std::string(u.release);
+#endif
+}
+
+// Normalized OS version, or "" when the platform read fails or yields nothing
+// dotted-numeric. Read once per process — the value cannot change while the
+// app runs, and on Windows this costs a GetProcAddress.
+inline std::string detect_os_version() {
+    static const std::string cached = dotted_numeric(read_os_version_raw());
+    return cached;
+}
+
+// Longest instance_name this SDK will send. The server schema is
+// `z.string().min(1)` with no maximum, so this cap is ours: a hostname is
+// user-controlled input and an unbounded one has no business on the wire.
+inline constexpr size_t INSTANCE_NAME_MAX = 64;
+
+// Strip control characters, trim trailing spaces, cap the length. Pure.
+inline std::string sanitize_instance_name(std::string s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        unsigned char u = static_cast<unsigned char>(c);
+        if (u >= 0x20 && u != 0x7f) out += c;
+    }
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    if (out.size() > INSTANCE_NAME_MAX) {
+        // Cap by BYTES, but never mid-character. High bytes are kept above, so
+        // a non-ASCII hostname over the cap would otherwise be cut through the
+        // middle of a UTF-8 sequence. json_str does not escape high bytes, so
+        // the malformed tail would reach the wire verbatim and the worker can
+        // reject the whole activate request over a machine name.
+        //
+        // Continuation bytes are 10xxxxxx; walk back off them to the lead byte
+        // and drop the partial character entirely.
+        size_t cut = INSTANCE_NAME_MAX;
+        while (cut > 0 &&
+               (static_cast<unsigned char>(out[cut]) & 0xC0) == 0x80) {
+            --cut;
+        }
+        out.resize(cut);
+    }
+    return out;
+}
+
+// Best-effort human-readable machine name for the activation's instance_name.
+// This is what a customer sees in their device list, so a real hostname beats
+// a constant. Returns "" on failure; the caller supplies the fallback.
+inline std::string detect_machine_name() {
+#if defined(_WIN32) || defined(_WIN64)
+    wchar_t buf[MAX_COMPUTERNAME_LENGTH + 1];
+    DWORD   len = static_cast<DWORD>(sizeof(buf) / sizeof(buf[0]));
+    if (!::GetComputerNameW(buf, &len)) return {};
+    // Hostnames are ASCII in practice; anything outside it is dropped rather
+    // than mangled into a lossy multi-byte guess.
+    std::string out;
+    for (DWORD i = 0; i < len; ++i) {
+        wchar_t c = buf[i];
+        if (c > 0 && c < 128) out += static_cast<char>(c);
+    }
+    return sanitize_instance_name(out);
+#else
+    char buf[256];
+    if (::gethostname(buf, sizeof(buf)) != 0) return {};
+    buf[sizeof(buf) - 1] = '\0';
+    return sanitize_instance_name(std::string(buf));
 #endif
 }
 
@@ -947,7 +1342,7 @@ static void kl_sha512_update(KlSha512Ctx& ctx, const kl_u8* data, size_t len) {
         int space = 128 - ctx.used;
         int take  = (len < (size_t)space) ? (int)len : space;
         for (int i = 0; i < take; ++i) ctx.buf[ctx.used + i] = data[i];
-        ctx.used += take; data += take; len -= take;
+        ctx.used += take; data += take; len -= static_cast<size_t>(take);
         if (ctx.used == 128) {
             kl_sha512_block(ctx.h, ctx.buf);
             ctx.total += 128; ctx.used = 0;
@@ -1282,8 +1677,8 @@ inline bool ed25519_verify(const uint8_t* msg, size_t msg_len,
     // h = SHA-512(R ‖ A ‖ M) mod L
     // where R = sig[0..31], A = pubkey[0..31].
     kl_u8 prefix[64];
-    for (int i = 0; i < 32; ++i) prefix[i]    = sig[i];
-    for (int i = 0; i < 32; ++i) prefix[32+i] = pubkey[i];
+    for (size_t i = 0; i < 32; ++i) prefix[i]    = sig[i];
+    for (size_t i = 0; i < 32; ++i) prefix[32+i] = pubkey[i];
 
     KlSha512Ctx sha_ctx;
     kl_sha512_init(sha_ctx);
@@ -1390,11 +1785,11 @@ public:
 
             // Build the typed arrays required by ed25519_verify
             std::array<uint8_t, 32> pubkey;
-            for (int i = 0; i < 32; ++i)
+            for (size_t i = 0; i < 32; ++i)
                 pubkey[i] = static_cast<uint8_t>(pk_bytes[i]);
 
             std::array<uint8_t, 64> sig;
-            for (int i = 0; i < 64; ++i)
+            for (size_t i = 0; i < 64; ++i)
                 sig[i] = static_cast<uint8_t>(sig_bytes[i]);
 
             // Build canonical payload
@@ -1434,6 +1829,13 @@ namespace keylight {
 struct HttpResponse {
     int         status = 0;
     std::string body;
+
+    // Response headers, names LOWERCASED so lookup is case-insensitive
+    // without a custom comparator. Appended last on purpose: existing
+    // aggregate initialization `{status, body}` keeps compiling, and a
+    // custom Transport that does not populate this simply loses
+    // Retry-After and falls back to plain exponential backoff.
+    std::map<std::string, std::string> headers;
 };
 
 // ---------------------------------------------------------------------------
@@ -1460,130 +1862,314 @@ public:
 } // namespace keylight
 
 // ──────────────────────────────────────────────────────────────────────────
-// include/keylight/store.hpp
+// include/keylight/chacha20poly1305.hpp
 // ──────────────────────────────────────────────────────────────────────────
+
+// keylight/chacha20poly1305.hpp — RFC 8439 AEAD_CHACHA20_POLY1305, vendored.
+//
+// Used to encrypt the local license store with a key bound to this machine.
+// Vendored rather than depended upon: this SDK is header-only with no external
+// dependencies, and it already vendors SHA-256 and Ed25519 for the same reason.
+//
+// Conformance is pinned to the RFC 8439 test vectors in
+// tests/test_chacha20poly1305.cpp. Those vectors are the specification.
 
 
 namespace keylight {
+namespace detail {
 
-// ---------------------------------------------------------------------------
-// LicenseStore — abstract cache seam for persisting the verified lease blob
-// ---------------------------------------------------------------------------
-class LicenseStore {
-public:
-    virtual ~LicenseStore() = default;
+inline uint32_t cc_rotl32(uint32_t x, int n) {
+    return (x << n) | (x >> (32 - n));
+}
 
-    // Returns the stored lease blob, or an ok Result with an empty string if
-    // no lease has been saved yet. A missing file is NOT an error.
-    virtual Result<std::string> load() = 0;
+inline uint32_t cc_load32_le(const uint8_t* p) {
+    return  static_cast<uint32_t>(p[0])
+         | (static_cast<uint32_t>(p[1]) << 8)
+         | (static_cast<uint32_t>(p[2]) << 16)
+         | (static_cast<uint32_t>(p[3]) << 24);
+}
 
-    // Persists the lease blob. Implementations should write atomically so
-    // a crash during save never leaves a half-written file behind.
-    virtual Result<void> save(const std::string& data) = 0;
+inline void cc_store32_le(uint8_t* p, uint32_t v) {
+    p[0] = static_cast<uint8_t>(v);
+    p[1] = static_cast<uint8_t>(v >> 8);
+    p[2] = static_cast<uint8_t>(v >> 16);
+    p[3] = static_cast<uint8_t>(v >> 24);
+}
 
-    // Removes the stored lease. Removing a file that does not exist is NOT
-    // an error.
-    virtual Result<void> clear() = 0;
-};
+inline void cc_store64_le(uint8_t* p, uint64_t v) {
+    for (int i = 0; i < 8; ++i) p[i] = static_cast<uint8_t>(v >> (8 * i));
+}
 
-// ---------------------------------------------------------------------------
-// FileStore — default on-disk implementation
+inline void cc_quarter_round(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) {
+    a += b; d ^= a; d = cc_rotl32(d, 16);
+    c += d; b ^= c; b = cc_rotl32(b, 12);
+    a += b; d ^= a; d = cc_rotl32(d, 8);
+    c += d; b ^= c; b = cc_rotl32(b, 7);
+}
+
+// One 64-byte ChaCha20 block (RFC 8439 section 2.3).
+inline void chacha20_block(const uint8_t key[32], uint32_t counter,
+                           const uint8_t nonce[12], uint8_t out[64]) {
+    static const uint8_t kSigma[16] = {
+        'e','x','p','a','n','d',' ','3','2','-','b','y','t','e',' ','k'
+    };
+
+    uint32_t s[16];
+    for (int i = 0; i < 4; ++i)  s[i]      = cc_load32_le(kSigma + 4 * i);
+    for (int i = 0; i < 8; ++i)  s[4 + i]  = cc_load32_le(key + 4 * i);
+    s[12] = counter;
+    for (int i = 0; i < 3; ++i)  s[13 + i] = cc_load32_le(nonce + 4 * i);
+
+    uint32_t x[16];
+    std::memcpy(x, s, sizeof(x));
+    for (int i = 0; i < 10; ++i) {          // 20 rounds = 10 double rounds
+        cc_quarter_round(x[0], x[4], x[8],  x[12]);
+        cc_quarter_round(x[1], x[5], x[9],  x[13]);
+        cc_quarter_round(x[2], x[6], x[10], x[14]);
+        cc_quarter_round(x[3], x[7], x[11], x[15]);
+        cc_quarter_round(x[0], x[5], x[10], x[15]);
+        cc_quarter_round(x[1], x[6], x[11], x[12]);
+        cc_quarter_round(x[2], x[7], x[8],  x[13]);
+        cc_quarter_round(x[3], x[4], x[9],  x[14]);
+    }
+    for (int i = 0; i < 16; ++i) cc_store32_le(out + 4 * i, x[i] + s[i]);
+}
+
+// XOR `len` bytes with the keystream starting at `counter`. In-place safe
+// (`in` and `out` may alias).
+inline void chacha20_xor(const uint8_t key[32], uint32_t counter,
+                         const uint8_t nonce[12],
+                         const uint8_t* in, size_t len, uint8_t* out) {
+    uint8_t block[64];
+    size_t  off = 0;
+    while (off < len) {
+        chacha20_block(key, counter, nonce, block);
+        const size_t n = (len - off) < 64 ? (len - off) : 64;
+        for (size_t i = 0; i < n; ++i) out[off + i] = in[off + i] ^ block[i];
+        off += n;
+        ++counter;
+    }
+}
+
+// Poly1305 one-time authenticator (RFC 8439 section 2.5).
 //
-// save() writes atomically: data → temp file → std::filesystem::rename.
-// Parent directories are created on first save.
-// All filesystem_errors are caught and mapped to Result::err(ErrorCode::Io).
-// ---------------------------------------------------------------------------
-class FileStore : public LicenseStore {
+// 32-bit radix-2^26 limb representation: five 26-bit limbs hold the 130-bit
+// accumulator so every partial product fits in a uint64_t without needing
+// 128-bit arithmetic, which MSVC does not offer portably.
+class Poly1305 {
 public:
-    explicit FileStore(std::string path) : path_(std::move(path)) {}
+    void init(const uint8_t key[32]) {
+        // r is clamped per the RFC: specific bits are cleared so the
+        // multiplication cannot overflow the limb representation.
+        r_[0] = (cc_load32_le(key +  0)     ) & 0x3ffffff;
+        r_[1] = (cc_load32_le(key +  3) >> 2) & 0x3ffff03;
+        r_[2] = (cc_load32_le(key +  6) >> 4) & 0x3ffc0ff;
+        r_[3] = (cc_load32_le(key +  9) >> 6) & 0x3f03fff;
+        r_[4] = (cc_load32_le(key + 12) >> 8) & 0x00fffff;
 
-    Result<std::string> load() override {
-        namespace fs = std::filesystem;
-        try {
-            if (!fs::exists(path_)) {
-                return Result<std::string>::ok(std::string{});
-            }
-            std::ifstream f(path_, std::ios::binary);
-            if (!f) {
-                return Result<std::string>::err(
-                    {ErrorCode::Io, "FileStore: cannot open " + path_});
-            }
-            std::string data(
-                (std::istreambuf_iterator<char>(f)),
-                std::istreambuf_iterator<char>());
-            return Result<std::string>::ok(std::move(data));
-        } catch (const std::filesystem::filesystem_error& e) {
-            return Result<std::string>::err({ErrorCode::Io, e.what()});
-        }
+        for (int i = 0; i < 5; ++i) h_[i] = 0;
+        for (int i = 0; i < 4; ++i) pad_[i] = cc_load32_le(key + 16 + 4 * i);
+
+        leftover_ = 0;
+        final_    = false;
     }
 
-    Result<void> save(const std::string& data) override {
-        namespace fs = std::filesystem;
-        try {
-            fs::path target(path_);
-
-            // Create parent directories if they don't exist
-            if (target.has_parent_path()) {
-                fs::create_directories(target.parent_path());
-            }
-
-            // Write to a sibling temp file, then rename atomically
-            fs::path tmp = target;
-            tmp += ".tmp";
-
-            {
-                std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-                if (!f) {
-                    return Result<void>::err(
-                        {ErrorCode::Io, "FileStore: cannot write " + tmp.string()});
-                }
-                f.write(data.data(), static_cast<std::streamsize>(data.size()));
-                if (!f) {
-                    return Result<void>::err(
-                        {ErrorCode::Io, "FileStore: write failed for " + tmp.string()});
-                }
-            } // flush + close before rename
-
-            fs::rename(tmp, target);
-            return Result<void>::ok();
-        } catch (const std::filesystem::filesystem_error& e) {
-            return Result<void>::err({ErrorCode::Io, e.what()});
+    void update(const uint8_t* m, size_t bytes) {
+        if (leftover_) {
+            size_t want = 16 - leftover_;
+            if (want > bytes) want = bytes;
+            for (size_t i = 0; i < want; ++i) buffer_[leftover_ + i] = m[i];
+            bytes     -= want;
+            m         += want;
+            leftover_ += want;
+            if (leftover_ < 16) return;
+            blocks(buffer_, 16);
+            leftover_ = 0;
         }
+        if (bytes >= 16) {
+            const size_t want = bytes & ~static_cast<size_t>(15);
+            blocks(m, want);
+            m     += want;
+            bytes -= want;
+        }
+        for (size_t i = 0; i < bytes; ++i) buffer_[leftover_ + i] = m[i];
+        leftover_ += bytes;
     }
 
-    Result<void> clear() override {
-        namespace fs = std::filesystem;
-        try {
-            std::error_code ec;
-            fs::remove(path_, ec);
-            // Ignore ec: removing a non-existent file is not an error
-            return Result<void>::ok();
-        } catch (const std::filesystem::filesystem_error& e) {
-            return Result<void>::err({ErrorCode::Io, e.what()});
+    void finish(uint8_t mac[16]) {
+        if (leftover_) {
+            size_t i = leftover_;
+            buffer_[i++] = 1;
+            for (; i < 16; ++i) buffer_[i] = 0;
+            final_ = true;
+            blocks(buffer_, 16);
         }
+
+        uint32_t h0 = h_[0], h1 = h_[1], h2 = h_[2], h3 = h_[3], h4 = h_[4];
+        uint32_t c;
+        c = h1 >> 26; h1 &= 0x3ffffff;
+        h2 += c; c = h2 >> 26; h2 &= 0x3ffffff;
+        h3 += c; c = h3 >> 26; h3 &= 0x3ffffff;
+        h4 += c; c = h4 >> 26; h4 &= 0x3ffffff;
+        h0 += c * 5; c = h0 >> 26; h0 &= 0x3ffffff;
+        h1 += c;
+
+        // Compute h + -p and select it in constant time if h >= p.
+        uint32_t g0 = h0 + 5;             c = g0 >> 26; g0 &= 0x3ffffff;
+        uint32_t g1 = h1 + c;             c = g1 >> 26; g1 &= 0x3ffffff;
+        uint32_t g2 = h2 + c;             c = g2 >> 26; g2 &= 0x3ffffff;
+        uint32_t g3 = h3 + c;             c = g3 >> 26; g3 &= 0x3ffffff;
+        uint32_t g4 = h4 + c - (1u << 26);
+
+        uint32_t mask = (g4 >> 31) - 1;   // all ones when g4 did not borrow
+        g0 &= mask; g1 &= mask; g2 &= mask; g3 &= mask; g4 &= mask;
+        mask = ~mask;
+        h0 = (h0 & mask) | g0;
+        h1 = (h1 & mask) | g1;
+        h2 = (h2 & mask) | g2;
+        h3 = (h3 & mask) | g3;
+        h4 = (h4 & mask) | g4;
+
+        // Collapse the 26-bit limbs back to four 32-bit words.
+        h0 = (h0      ) | (h1 << 26);
+        h1 = (h1 >>  6) | (h2 << 20);
+        h2 = (h2 >> 12) | (h3 << 14);
+        h3 = (h3 >> 18) | (h4 <<  8);
+
+        uint64_t f;
+        f = static_cast<uint64_t>(h0) + pad_[0];              h0 = static_cast<uint32_t>(f);
+        f = static_cast<uint64_t>(h1) + pad_[1] + (f >> 32);  h1 = static_cast<uint32_t>(f);
+        f = static_cast<uint64_t>(h2) + pad_[2] + (f >> 32);  h2 = static_cast<uint32_t>(f);
+        f = static_cast<uint64_t>(h3) + pad_[3] + (f >> 32);  h3 = static_cast<uint32_t>(f);
+
+        cc_store32_le(mac +  0, h0);
+        cc_store32_le(mac +  4, h1);
+        cc_store32_le(mac +  8, h2);
+        cc_store32_le(mac + 12, h3);
     }
 
 private:
-    std::string path_;
+    void blocks(const uint8_t* m, size_t bytes) {
+        const uint32_t hibit = final_ ? 0 : (1u << 24);
+        const uint32_t r0 = r_[0], r1 = r_[1], r2 = r_[2], r3 = r_[3], r4 = r_[4];
+        const uint32_t s1 = r1 * 5, s2 = r2 * 5, s3 = r3 * 5, s4 = r4 * 5;
+        uint32_t h0 = h_[0], h1 = h_[1], h2 = h_[2], h3 = h_[3], h4 = h_[4];
+
+        while (bytes >= 16) {
+            h0 += (cc_load32_le(m +  0)     ) & 0x3ffffff;
+            h1 += (cc_load32_le(m +  3) >> 2) & 0x3ffffff;
+            h2 += (cc_load32_le(m +  6) >> 4) & 0x3ffffff;
+            h3 += (cc_load32_le(m +  9) >> 6) & 0x3ffffff;
+            h4 += (cc_load32_le(m + 12) >> 8) | hibit;
+
+            uint64_t d0 = static_cast<uint64_t>(h0)*r0 + static_cast<uint64_t>(h1)*s4
+                        + static_cast<uint64_t>(h2)*s3 + static_cast<uint64_t>(h3)*s2
+                        + static_cast<uint64_t>(h4)*s1;
+            uint64_t d1 = static_cast<uint64_t>(h0)*r1 + static_cast<uint64_t>(h1)*r0
+                        + static_cast<uint64_t>(h2)*s4 + static_cast<uint64_t>(h3)*s3
+                        + static_cast<uint64_t>(h4)*s2;
+            uint64_t d2 = static_cast<uint64_t>(h0)*r2 + static_cast<uint64_t>(h1)*r1
+                        + static_cast<uint64_t>(h2)*r0 + static_cast<uint64_t>(h3)*s4
+                        + static_cast<uint64_t>(h4)*s3;
+            uint64_t d3 = static_cast<uint64_t>(h0)*r3 + static_cast<uint64_t>(h1)*r2
+                        + static_cast<uint64_t>(h2)*r1 + static_cast<uint64_t>(h3)*r0
+                        + static_cast<uint64_t>(h4)*s4;
+            uint64_t d4 = static_cast<uint64_t>(h0)*r4 + static_cast<uint64_t>(h1)*r3
+                        + static_cast<uint64_t>(h2)*r2 + static_cast<uint64_t>(h3)*r1
+                        + static_cast<uint64_t>(h4)*r0;
+
+            uint32_t c;
+            c = static_cast<uint32_t>(d0 >> 26); h0 = static_cast<uint32_t>(d0) & 0x3ffffff;
+            d1 += c; c = static_cast<uint32_t>(d1 >> 26); h1 = static_cast<uint32_t>(d1) & 0x3ffffff;
+            d2 += c; c = static_cast<uint32_t>(d2 >> 26); h2 = static_cast<uint32_t>(d2) & 0x3ffffff;
+            d3 += c; c = static_cast<uint32_t>(d3 >> 26); h3 = static_cast<uint32_t>(d3) & 0x3ffffff;
+            d4 += c; c = static_cast<uint32_t>(d4 >> 26); h4 = static_cast<uint32_t>(d4) & 0x3ffffff;
+            h0 += c * 5; c = h0 >> 26; h0 &= 0x3ffffff;
+            h1 += c;
+
+            m     += 16;
+            bytes -= 16;
+        }
+
+        h_[0] = h0; h_[1] = h1; h_[2] = h2; h_[3] = h3; h_[4] = h4;
+    }
+
+    uint32_t r_[5]{};
+    uint32_t h_[5]{};
+    uint32_t pad_[4]{};
+    size_t   leftover_ = 0;
+    uint8_t  buffer_[16]{};
+    bool     final_    = false;
 };
 
-// ---------------------------------------------------------------------------
-// default_store_path — sensible per-tenant/per-product path
+// AEAD_CHACHA20_POLY1305 (RFC 8439 section 2.8), with no associated data —
+// the store has none, and an unused AAD parameter is a footgun.
 //
-// POSIX: $HOME/.keylight/<tenantId>-<productId>.lease
-// Fallback: /tmp/.keylight/<tenantId>-<productId>.lease
-// ---------------------------------------------------------------------------
-inline std::string default_store_path(const Config& cfg) {
-    namespace fs = std::filesystem;
+// `ct` must have room for `pt_len` bytes. `pt` and `ct` may alias.
+inline void aead_seal(const uint8_t key[32], const uint8_t nonce[12],
+                      const uint8_t* pt, size_t pt_len,
+                      uint8_t* ct, uint8_t tag[16]) {
+    // Block 0 of the keystream is the one-time Poly1305 key; the message
+    // starts at block 1.
+    uint8_t poly_key[64];
+    chacha20_block(key, 0, nonce, poly_key);
 
-    const char* home = std::getenv("HOME");
-    fs::path base = home ? fs::path(home) / ".keylight"
-                         : fs::temp_directory_path() / ".keylight";
+    if (pt_len > 0) chacha20_xor(key, 1, nonce, pt, pt_len, ct);
 
-    std::string filename = cfg.tenantId + "-" + cfg.productId + ".lease";
-    return (base / filename).string();
+    Poly1305 p;
+    p.init(poly_key);
+
+    static const uint8_t kZeros[16] = {0};
+    if (pt_len > 0) {
+        p.update(ct, pt_len);
+        const size_t rem = pt_len % 16;
+        if (rem) p.update(kZeros, 16 - rem);
+    }
+
+    uint8_t lens[16];
+    cc_store64_le(lens,     0);          // AAD length
+    cc_store64_le(lens + 8, static_cast<uint64_t>(pt_len));
+    p.update(lens, 16);
+    p.finish(tag);
 }
 
+// Returns false on tag mismatch. `pt` is only written when the tag verifies,
+// so a caller can never accidentally consume unauthenticated plaintext.
+inline bool aead_open(const uint8_t key[32], const uint8_t nonce[12],
+                      const uint8_t* ct, size_t ct_len,
+                      const uint8_t tag[16], uint8_t* pt) {
+    uint8_t poly_key[64];
+    chacha20_block(key, 0, nonce, poly_key);
+
+    Poly1305 p;
+    p.init(poly_key);
+
+    static const uint8_t kZeros[16] = {0};
+    if (ct_len > 0) {
+        p.update(ct, ct_len);
+        const size_t rem = ct_len % 16;
+        if (rem) p.update(kZeros, 16 - rem);
+    }
+
+    uint8_t lens[16];
+    cc_store64_le(lens,     0);
+    cc_store64_le(lens + 8, static_cast<uint64_t>(ct_len));
+    p.update(lens, 16);
+
+    uint8_t expected[16];
+    p.finish(expected);
+
+    // Constant-time compare: an early return would leak how many leading tag
+    // bytes an attacker guessed correctly.
+    uint8_t diff = 0;
+    for (int i = 0; i < 16; ++i) diff |= static_cast<uint8_t>(expected[i] ^ tag[i]);
+    if (diff != 0) return false;
+
+    if (ct_len > 0) chacha20_xor(key, 1, nonce, ct, ct_len, pt);
+    return true;
+}
+
+} // namespace detail
 } // namespace keylight
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -1914,6 +2500,416 @@ inline std::string uuid_v4() {
 } // namespace keylight
 
 // ──────────────────────────────────────────────────────────────────────────
+// include/keylight/store.hpp
+// ──────────────────────────────────────────────────────────────────────────
+
+
+namespace keylight {
+
+// ---------------------------------------------------------------------------
+// LicenseStore — abstract cache seam for persisting the verified lease blob
+// ---------------------------------------------------------------------------
+class LicenseStore {
+public:
+    virtual ~LicenseStore() = default;
+
+    // Returns the stored lease blob, or an ok Result with an empty string if
+    // no lease has been saved yet. A missing file is NOT an error.
+    virtual Result<std::string> load() = 0;
+
+    // Persists the lease blob. Implementations should write atomically so
+    // a crash during save never leaves a half-written file behind.
+    virtual Result<void> save(const std::string& data) = 0;
+
+    // Removes the stored lease. Removing a file that does not exist is NOT
+    // an error.
+    virtual Result<void> clear() = 0;
+};
+
+// ---------------------------------------------------------------------------
+// FileStore — default on-disk implementation
+//
+// save() writes atomically: data → temp file → std::filesystem::rename.
+// Parent directories are created on first save.
+// All filesystem_errors are caught and mapped to Result::err(ErrorCode::Io).
+// ---------------------------------------------------------------------------
+class FileStore : public LicenseStore {
+public:
+    explicit FileStore(std::string path) : path_(std::move(path)) {}
+
+    Result<std::string> load() override {
+        namespace fs = std::filesystem;
+        try {
+            if (!fs::exists(path_)) {
+                return Result<std::string>::ok(std::string{});
+            }
+            std::ifstream f(path_, std::ios::binary);
+            if (!f) {
+                return Result<std::string>::err(
+                    {ErrorCode::Io, "FileStore: cannot open " + path_});
+            }
+            std::string data(
+                (std::istreambuf_iterator<char>(f)),
+                std::istreambuf_iterator<char>());
+            return Result<std::string>::ok(std::move(data));
+        } catch (const std::filesystem::filesystem_error& e) {
+            return Result<std::string>::err({ErrorCode::Io, e.what()});
+        }
+    }
+
+    Result<void> save(const std::string& data) override {
+        namespace fs = std::filesystem;
+        try {
+            fs::path target(path_);
+
+            // Create parent directories if they don't exist
+            if (target.has_parent_path()) {
+                fs::create_directories(target.parent_path());
+            }
+
+            // Write to a sibling temp file, then rename atomically
+            fs::path tmp = target;
+            tmp += ".tmp";
+
+            {
+                std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+                if (!f) {
+                    return Result<void>::err(
+                        {ErrorCode::Io, "FileStore: cannot write " + tmp.string()});
+                }
+                f.write(data.data(), static_cast<std::streamsize>(data.size()));
+                if (!f) {
+                    return Result<void>::err(
+                        {ErrorCode::Io, "FileStore: write failed for " + tmp.string()});
+                }
+            } // flush + close before rename
+
+            fs::rename(tmp, target);
+            return Result<void>::ok();
+        } catch (const std::filesystem::filesystem_error& e) {
+            return Result<void>::err({ErrorCode::Io, e.what()});
+        }
+    }
+
+    Result<void> clear() override {
+        namespace fs = std::filesystem;
+        try {
+            std::error_code ec;
+            fs::remove(path_, ec);
+            // Ignore ec: removing a non-existent file is not an error
+            return Result<void>::ok();
+        } catch (const std::filesystem::filesystem_error& e) {
+            return Result<void>::err({ErrorCode::Io, e.what()});
+        }
+    }
+
+private:
+    std::string path_;
+};
+
+// ---------------------------------------------------------------------------
+// default_store_path — sensible per-tenant/per-product path
+//
+// POSIX: $HOME/.keylight/<tenantId>-<productId>.bin
+// Fallback: /tmp/.keylight/<tenantId>-<productId>.bin
+//
+// The extension changed with the encrypted format, so a 0.2.0 store never
+// collides with the plaintext file it migrated from — and so pointing a plain
+// FileStore at this path cannot silently overwrite a pre-0.2.0 store.
+// ---------------------------------------------------------------------------
+inline std::string default_store_path(const Config& cfg) {
+    namespace fs = std::filesystem;
+
+    const char* home = std::getenv("HOME");
+    fs::path base = home ? fs::path(home) / ".keylight"
+                         : fs::temp_directory_path() / ".keylight";
+
+    std::string filename = cfg.tenantId + "-" + cfg.productId + ".bin";
+    return (base / filename).string();
+}
+
+// The pre-0.2.0 plaintext store location. Kept only so 0.2.0 can import it
+// once; nothing writes here any more. Pass it as EncryptedFileStore's third
+// argument to enable that import.
+inline std::string legacy_plaintext_path(const Config& cfg) {
+    namespace fs = std::filesystem;
+
+    const char* home = std::getenv("HOME");
+    fs::path base = home ? fs::path(home) / ".keylight"
+                         : fs::temp_directory_path() / ".keylight";
+
+    return (base / (cfg.tenantId + "-" + cfg.productId + ".lease")).string();
+}
+
+namespace detail {
+
+/// Store-encryption key, bound to this machine.
+///
+/// A plaintext store is a portable license: copy the file and the lease, the
+/// trial start and the instance id all travel with it. Binding the key to the
+/// machine makes anything this SDK writes useless if copied.
+///
+/// Mirrors keylight-rust, which derives its ChaCha20-Poly1305 key with BLAKE3
+/// under the same domain string. SHA-256 is used here because this SDK already
+/// vendors it. The digest is taken over raw bytes, not over a hex rendering.
+inline std::array<uint8_t, 32> derive_store_key(const std::string& machine_id) {
+    const std::string material = "keylight-store-v1" + machine_id;
+    return sha256_bytes(reinterpret_cast<const uint8_t*>(material.data()),
+                        material.size());
+}
+
+/// The machine id used for store binding, or a constant when the platform
+/// exposes none.
+///
+/// read_hardware_id() returns nullopt on a machine with no stable identifier —
+/// a Linux image with neither /etc/machine-id nor the dbus fallback is the
+/// realistic case. The empty string is then hashed like any other id, which
+/// means every such machine derives the SAME key.
+///
+/// That is a deliberate trade, not an oversight:
+///   - Tamper protection is unaffected. The blob is still authenticated
+///     everywhere, so editing trialStart in a text editor still fails.
+///   - Machine binding degrades only where the OS gave us nothing to bind to.
+///     Blobs stay portable among such machines, and remain non-portable to or
+///     from any machine that does have an id.
+///   - Nobody is locked out. The alternatives — refusing to persist, or
+///     inventing a random id — either force a reactivation on every launch
+///     (burning a seat each time) or add a sidecar file whose loss does the
+///     same.
+///
+/// Distinct from machine_hash(), which must NEVER substitute a value when the
+/// id is absent: that one exists to dedupe a device server-side, and a
+/// made-up value corrupts the count. Here the id is only key material.
+inline std::string store_binding_id() {
+    if (auto id = read_hardware_id()) return *id;
+    return std::string{};
+}
+
+} // namespace detail
+
+// ---------------------------------------------------------------------------
+// EncryptedFileStore — machine-bound, authenticated on-disk store.
+//
+// Layout: nonce(12) || ciphertext || tag(16)
+//
+// Anything that fails to decrypt reads as "no data" rather than an error: a
+// truncated file from a crash, a file copied from another machine, and a
+// file from a previous machine id are all indistinguishable to us and all
+// mean the same thing operationally — there is no usable cached state.
+//
+// Note the operational consequence: if this machine's id CHANGES (a hardware
+// swap, an OS reinstall, a regenerated /etc/machine-id), the existing store
+// stops opening and the app sees a first run. That costs the user a
+// reactivation, and is the intended cost of the store not being portable.
+// ---------------------------------------------------------------------------
+class EncryptedFileStore : public LicenseStore {
+public:
+    // `legacy_path`, when set, is a pre-0.2.0 plaintext store to import once.
+    EncryptedFileStore(std::string path, std::string machine_id,
+                       std::string legacy_path = std::string())
+        : path_(std::move(path)),
+          legacy_path_(std::move(legacy_path)),
+          key_(detail::derive_store_key(machine_id)) {}
+
+    explicit EncryptedFileStore(std::string path)
+        : EncryptedFileStore(std::move(path), detail::store_binding_id()) {}
+
+    /// The migrating default: bind to this machine, and import a pre-0.2.0
+    /// plaintext store once if one is there.
+    ///
+    /// This exists so an integrator never has to reach into `detail::` for the
+    /// machine id. The three-argument constructor takes an explicit id because
+    /// tests need to pin it; ordinary callers want this.
+    static EncryptedFileStore migrating(std::string path,
+                                        std::string legacy_path) {
+        return EncryptedFileStore(std::move(path), detail::store_binding_id(),
+                                  std::move(legacy_path));
+    }
+
+    Result<std::string> load() override {
+        namespace fs = std::filesystem;
+        try {
+            // One-time migration from the pre-0.2.0 plaintext store.
+            //
+            // Everything is imported, trial start included. Gating any of it
+            // buys nothing: deleting a store mints a fresh trial whether or
+            // not it was encrypted, and a lease copied from a pre-0.2.0
+            // install is no more useful than a shared license key. What this
+            // DOES buy is that the supply dries up — once an install upgrades,
+            // its plaintext file is gone and never regenerated.
+            //
+            // See spec section 4.3: seat sharing is a protocol gap, closed by
+            // binding an instance to machine_hash server-side, not here.
+            if (!legacy_path_.empty() && !fs::exists(path_) && fs::exists(legacy_path_)) {
+                std::ifstream lf(legacy_path_, std::ios::binary);
+                if (lf) {
+                    const std::string legacy((std::istreambuf_iterator<char>(lf)),
+                                              std::istreambuf_iterator<char>());
+                    lf.close();
+                    if (!legacy.empty()) {
+                        // Only unlink once the encrypted copy is safely on
+                        // disk — a crash between the two must not lose state.
+                        if (save(legacy).is_ok()) {
+                            std::error_code ec;
+                            fs::remove(legacy_path_, ec);
+                        }
+                        return Result<std::string>::ok(legacy);
+                    }
+                }
+            }
+
+            if (!fs::exists(path_)) return Result<std::string>::ok(std::string{});
+
+            std::ifstream f(path_, std::ios::binary);
+            if (!f) return Result<std::string>::ok(std::string{});
+
+            const std::string blob((std::istreambuf_iterator<char>(f)),
+                                    std::istreambuf_iterator<char>());
+            if (blob.size() < 12 + 16) return Result<std::string>::ok(std::string{});
+
+            const uint8_t* p       = reinterpret_cast<const uint8_t*>(blob.data());
+            const size_t   ct_len  = blob.size() - 12 - 16;
+            const uint8_t* nonce   = p;
+            const uint8_t* ct      = p + 12;
+            const uint8_t* tag     = p + 12 + ct_len;
+
+            std::string out(ct_len, '\0');
+            const bool ok = detail::aead_open(
+                key_.data(), nonce, ct, ct_len, tag,
+                ct_len ? reinterpret_cast<uint8_t*>(&out[0]) : nullptr);
+            if (!ok) return Result<std::string>::ok(std::string{});
+
+            return Result<std::string>::ok(std::move(out));
+        } catch (const std::filesystem::filesystem_error&) {
+            return Result<std::string>::ok(std::string{});
+        }
+    }
+
+    Result<void> save(const std::string& data) override {
+        namespace fs = std::filesystem;
+        try {
+            fs::path target(path_);
+            if (target.has_parent_path()) fs::create_directories(target.parent_path());
+
+            // A repeated nonce under one key breaks Poly1305 outright, so this
+            // is drawn fresh for every write, never derived from the content.
+            uint8_t nonce[12];
+            {
+                static thread_local std::mt19937_64 rng{std::random_device{}()};
+                for (int i = 0; i < 12; i += 8) {
+                    uint64_t v = rng();
+                    for (int j = 0; j < 8 && i + j < 12; ++j) {
+                        nonce[i + j] = static_cast<uint8_t>(v >> (8 * j));
+                    }
+                }
+            }
+
+            std::string ct(data.size(), '\0');
+            uint8_t     tag[16];
+            detail::aead_seal(
+                key_.data(), nonce,
+                data.empty() ? nullptr : reinterpret_cast<const uint8_t*>(data.data()),
+                data.size(),
+                data.empty() ? nullptr : reinterpret_cast<uint8_t*>(&ct[0]),
+                tag);
+
+            std::string blob;
+            blob.reserve(12 + ct.size() + 16);
+            blob.append(reinterpret_cast<const char*>(nonce), 12);
+            blob.append(ct);
+            blob.append(reinterpret_cast<const char*>(tag), 16);
+
+            fs::path tmp = target; tmp += ".tmp";
+            {
+                std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+                if (!f) {
+                    return Result<void>::err(
+                        {ErrorCode::Io, "EncryptedFileStore: cannot write " + tmp.string()});
+                }
+                f.write(blob.data(), static_cast<std::streamsize>(blob.size()));
+                if (!f) {
+                    return Result<void>::err(
+                        {ErrorCode::Io, "EncryptedFileStore: write failed for " + tmp.string()});
+                }
+            }
+            fs::rename(tmp, target);
+            return Result<void>::ok();
+        } catch (const std::filesystem::filesystem_error& e) {
+            return Result<void>::err({ErrorCode::Io, e.what()});
+        }
+    }
+
+    Result<void> clear() override {
+        std::error_code ec;
+        std::filesystem::remove(path_, ec);
+        return Result<void>::ok();
+    }
+
+private:
+    std::string                path_;
+    std::string                legacy_path_;
+    std::array<uint8_t, 32>    key_;
+};
+
+} // namespace keylight
+
+// ──────────────────────────────────────────────────────────────────────────
+// include/keylight/config_payload.hpp
+// ──────────────────────────────────────────────────────────────────────────
+
+// keylight/config_payload.hpp — canonical signing payload for GET /config.
+//
+// WHY THIS EXISTS
+//
+// The v3 lease is Ed25519-signed, so pointing an app at a fake server mints no
+// licence. `GET /config` carried no signature, which left the same trick able
+// to mint an unlimited TRIAL: redirect the API host with a hosts entry or a
+// local proxy and answer with {"trial_duration_days": 3650}. No binary
+// patching, no reverse engineering. Signing the config closes that.
+//
+// It does NOT defeat a patched binary — that binary can drop the check like
+// any other. It raises the cheapest attack from editing a hosts file to
+// patching and re-signing an app. Stopping the patched case needs the server
+// to refuse (a server-side trial ledger keyed to machine_hash), not this.
+//
+// FORMAT — this is a cross-SDK protocol contract
+//
+//   cfg1|{kid}|{tenantId}|{productId}|{issuedAt}|{expiresAt}|{trialDays}|{freeTier}
+//
+// Pipe-delimited and fixed-order, exactly like lease.hpp's v3 payload, so
+// there is no JSON canonicalisation for five SDKs to disagree about.
+// `freeTier` renders as the literal `true` or `false`.
+//
+// tenantId and productId are inside the signature deliberately. Without them a
+// config legitimately signed for one product replays against another under the
+// same tenant keyset — including a product whose trial is meant to be zero.
+//
+// Changing these bytes is a protocol break: the worker and the Rust, Swift, JS
+// and C# SDKs must all produce and accept the same string, or they will
+// disagree about the same tenant. The literal expectations in
+// tests/test_client.cpp are the guard.
+
+
+namespace keylight {
+
+inline std::string config_canonical_payload(const std::string& kid,
+                                            const std::string& tenantId,
+                                            const std::string& productId,
+                                            int64_t            issuedAt,
+                                            int64_t            expiresAt,
+                                            int                trialDurationDays,
+                                            bool               freeTierEnabled)
+{
+    return "cfg1|" + kid + "|" + tenantId + "|" + productId
+         + "|" + std::to_string(issuedAt)
+         + "|" + std::to_string(expiresAt)
+         + "|" + std::to_string(trialDurationDays)
+         + "|" + (freeTierEnabled ? "true" : "false");
+}
+
+} // namespace keylight
+
+// ──────────────────────────────────────────────────────────────────────────
 // include/keylight/client.hpp
 // ──────────────────────────────────────────────────────────────────────────
 
@@ -1927,26 +2923,35 @@ inline std::string uuid_v4() {
 // Validate:     POST /{tenantId}/{productId}/validate
 // Deactivate:   POST /{tenantId}/{productId}/deactivate
 //
-// Thread-safety: state() reads a std::atomic<State> — audio-thread safe.
+// Thread-safety: state() reads std::atomics and the injected clock, and takes
+//                no lock — audio-thread safe. See the NOW-FUNCTION CONTRACT
+//                below for what that requires of the clock.
 //                hasEntitlement / cachedLicenseExpiresAt / listener list are
 //                guarded by a mutex.
+//
+// NOW-FUNCTION CONTRACT
+// ─────────────────────
+// Client takes an optional `now_fn` (a std::function<int64_t()>) so tests and
+// integrators can supply the clock. state() calls it — to run the clock-
+// rollback guard — and state() is `noexcept` and documented audio-thread safe.
+// A caller-supplied `now_fn` MUST therefore be:
+//   - non-throwing        — an exception escaping a noexcept function is
+//                           std::terminate, and here that would happen on the
+//                           audio thread;
+//   - non-blocking        — no mutex, no I/O, no syscall that can wait;
+//   - allocation-free     — no heap traffic on the audio thread.
+// It must also be non-empty: invoking an empty std::function throws
+// std::bad_function_call, which is the same std::terminate.
+// The shipped default, std::time(nullptr), satisfies all of this. If your
+// clock cannot, do not call state() from an audio callback — mirror it into
+// your own std::atomic from a background thread instead (this is exactly what
+// the JUCE adapter does).
 
 
 
 namespace keylight {
 
-// ---------------------------------------------------------------------------
-// State — high-level license state (C++ subset of Rust/C# states)
-// ---------------------------------------------------------------------------
-enum class State {
-    Licensed,   // trusted, unexpired active lease
-    Trial,      // no license; within trial window
-    Expired,    // trusted lease expired, or license status "expired"/"fallback"
-    Invalid,    // no trusted lease, no active trial
-    FreeTier,   // no license and no trial, but the product offers a free tier.
-                // Appended last on purpose: renumbering the values above would
-                // break any integrator that persisted a State as an integer.
-};
+// `State` now lives in lifecycle.hpp, which this header includes.
 
 // ---------------------------------------------------------------------------
 // TrialStatus — local, offline-first trial (mirrors keylight-rust TrialStatus)
@@ -1995,6 +3000,25 @@ inline const char* current_platform() {
 #else
     return "unknown";
 #endif
+}
+
+// 128 bits of hex for the X-Keylight-Request-Id correlation header. Not a
+// security token — it exists so an app log line and a worker log line can be
+// matched up during support, so a per-thread PRNG is sufficient.
+inline std::string random_request_id() {
+    static thread_local std::mt19937_64 rng{std::random_device{}()};
+    static const char* kHex = "0123456789abcdef";
+
+    std::string out;
+    out.reserve(32);
+    for (int i = 0; i < 4; ++i) {
+        uint64_t chunk = rng();
+        for (int j = 0; j < 8; ++j) {
+            out += kHex[chunk & 0xF];
+            chunk >>= 4;
+        }
+    }
+    return out;
 }
 } // namespace detail
 
@@ -2052,6 +3076,15 @@ private:
 class Client {
 public:
     // Production constructor — clock defaults to real wall clock.
+    // The real sleep used for retry backoff unless a caller injects its own.
+    // A static factory rather than a default argument so every delegating
+    // constructor names the same thing.
+    static std::function<void(uint64_t)> default_sleep_fn_() {
+        return [](uint64_t ms) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        };
+    }
+
     Client(Config cfg, Transport& transport, LicenseStore& store)
         : Client(std::move(cfg), transport, store,
                  []{ return static_cast<int64_t>(std::time(nullptr)); },
@@ -2078,22 +3111,109 @@ public:
            LicenseStore&                               store,
            std::function<int64_t()>                    now_fn,
            std::function<std::optional<std::string>()> hardware_id_fn)
+        : Client(std::move(cfg), transport, store, std::move(now_fn),
+                 std::move(hardware_id_fn), default_sleep_fn_())
+    {}
+
+    // Testable constructor — inject a deterministic clock AND the retry sleep,
+    // so backoff is asserted without spending it.
+    //
+    // This takes the same five positions as the overload above, differing only
+    // in the last parameter's signature. That is not ambiguous, and does not
+    // become so: std::function's converting constructor is SFINAE-constrained
+    // on being callable with the given signature, so a `[]{...}` nullary lambda
+    // only ever matches hardware_id_fn and a `[](uint64_t){...}` one only ever
+    // matches sleep_fn. Adding a third five-argument overload whose last
+    // parameter accepted either shape WOULD make all of them ambiguous.
+    Client(Config                        cfg,
+           Transport&                    transport,
+           LicenseStore&                 store,
+           std::function<int64_t()>      now_fn,
+           std::function<void(uint64_t)> sleep_fn)
+        : Client(std::move(cfg), transport, store, std::move(now_fn),
+                 []{ return detail::read_hardware_id(); }, std::move(sleep_fn))
+    {}
+
+    // Designated constructor — every other one delegates here.
+    Client(Config                                      cfg,
+           Transport&                                  transport,
+           LicenseStore&                               store,
+           std::function<int64_t()>                    now_fn,
+           std::function<std::optional<std::string>()> hardware_id_fn,
+           std::function<void(uint64_t)>               sleep_fn)
         : cfg_(std::move(cfg))
         , transport_(transport)
         , store_(store)
         , now_fn_(std::move(now_fn))
         , hardware_id_fn_(std::move(hardware_id_fn))
+        , sleep_fn_(std::move(sleep_fn))
         , verifier_(cfg_.trustedKeys)
         , state_(State::Invalid)
     {
         // Prime state from persisted store (if any) on construction.
         refresh_state_from_store_();
+        // Seed the event dedupe with what we booted with. Nobody can have
+        // subscribed yet, so this is not a suppressed event -- it stops the
+        // first notify_() poll from reporting the initial state as a change.
+        last_reported_.store(state());
     }
 
     // Destructor: stops and joins any running auto-validation thread so the
     // thread cannot outlive the Client (no detached threads, no std::terminate).
+    //
+    // It does NOT fence an event delivery already in flight. The thread
+    // draining the event queue need not be the auto-validation worker — any
+    // thread that calls refreshIfNeeded()/validate() can be holding the
+    // delivery baton — so destroying a Client while another thread is inside
+    // notify_() is a use-after-free. Own the Client for as long as any thread
+    // can still call into it; the LISTENER CONTRACT's "do not destroy from a
+    // callback" is the special case, not the whole rule.
     ~Client() {
-        stopAutoValidation();
+        // Both threads, not just the auto-validation worker. A leaked
+        // heartbeat outliving the Client is a use-after-free in a host.
+        stop_heartbeat_();
+
+        Reaper to_join;
+        {
+            std::lock_guard<std::mutex> lock(av_mutex_);
+            ++av_epoch_;              // retire every worker, current or not
+            av_cv_.notify_all();
+            to_join.workers.reserve(av_retired_.size() + 1);
+            if (av_current_.thread.joinable()) {
+                to_join.workers.push_back(std::move(av_current_));
+                av_current_ = AvWorker{};
+            }
+            for (auto& w : av_retired_) to_join.workers.push_back(std::move(w));
+            av_retired_.clear();
+        }
+        // The only place a LIVE worker is joined. (start/stop also join, but
+        // only workers that already published `done` — bounded by thread
+        // teardown, never by the network or a listener.) Outside the lock,
+        // because a worker mid-refresh needs av_mutex_ to notice the epoch
+        // moved.
+        //
+        // Destroying a Client from its own worker thread — i.e. from a
+        // state-change listener — self-joins and terminates. That is
+        // forbidden by the LISTENER CONTRACT and left loud on purpose: the
+        // alternative is a silent use-after-free, since the thread returns
+        // into av_loop_ and touches av_mutex_ after this destructor is done.
+        //
+        // COST. Usually zero: the epoch bump and notify_all() above happen
+        // BEFORE this join, so a worker parked in its interval wait wakes,
+        // fails the epoch check and exits without another cycle. On the
+        // default 30-minute interval it is parked essentially all the time.
+        //
+        // It blocks only when the worker is mid-cycle, and then by up to one
+        // round trip — plus, if that worker holds the delivery baton, every
+        // listener for every event still queued.
+        //
+        // That upper bound is UNBOUNDED in principle, because listeners are
+        // the integrator's code and nothing caps how long one may take. A
+        // JUCE ~Licensing() runs on the message thread, so a slow listener
+        // stalls a plugin teardown for as long as it likes. The LISTENER
+        // CONTRACT bars re-entering destruction and throwing, and asks for
+        // short listeners for exactly this reason — but asking is all it can
+        // do; nothing here enforces a bound.
     }
 
     // ── Sync API ──────────────────────────────────────────────────────────
@@ -2103,22 +3223,28 @@ public:
     /// State::Invalid is returned (no exception thrown).
     Result<State> activate(const std::string& key) {
         // Build activate request body
+        // A real hostname, not a constant: this string is what the customer
+        // sees in their device list. "device" survives only as the fallback
+        // when the platform read fails.
+        std::string instance_name = detail::detect_machine_name();
+        if (instance_name.empty()) instance_name = "device";
+
         std::vector<std::pair<std::string, std::string>> fields{
             {"license_key",   json_str(key)},
-            {"instance_name", json_str("device")},
+            {"instance_name", json_str(instance_name)},
         };
         append_attribution_fields_(fields, /*include_instance_id=*/true);
         std::string body = build_json_(std::move(fields), true /*telemetry*/);
 
         std::string url = api_url_("activate");
-        auto hr = transport_.request("POST", url, json_headers_(), body);
+        auto hr = request_with_retry_("POST", url, json_headers_(), body);
         if (!hr.is_ok()) {
             return Result<State>::err(hr.error());
         }
         const auto& resp = hr.value();
         if (resp.status != 200) {
             return Result<State>::err({ErrorCode::Http,
-                "activate HTTP " + std::to_string(resp.status)});
+                http_error_message_(resp.body, "activate", resp.status)});
         }
 
         // Parse activate response
@@ -2131,7 +3257,7 @@ public:
         bool activated = j["activated"].as_bool();
         if (!activated) {
             // Server declined — keep existing state
-            return Result<State>::ok(state_.load());
+            return report_(state_.load());
         }
 
         // Parse optional lease (present when the object has sub-keys)
@@ -2177,11 +3303,16 @@ public:
 
         new_state = resolve_with_trial_(new_state);
         set_state_(new_state);
-        return Result<State>::ok(new_state);
+        return report_(new_state);
     }
 
     /// Validate the stored license online.  Returns the resulting State.
     Result<State> validate() {
+        // Poll the clock guard, for the same reason refreshIfNeeded() does:
+        // a host that polls validate() on its own timer would otherwise get
+        // the guard in state() and never in its callback.
+        notify_();
+
         // Need license_key and instance_id from cache (Worker requires both)
         std::string license_key  = load_license_key_();
         std::string instance_id  = load_instance_id_();
@@ -2197,10 +3328,10 @@ public:
         std::string body = build_json_(std::move(fields), true /*telemetry*/);
 
         std::string url = api_url_("validate");
-        auto hr = transport_.request("POST", url, json_headers_(), body);
+        auto hr = request_with_retry_("POST", url, json_headers_(), body);
         if (!hr.is_ok()) {
             // Network failure: keep existing state
-            return Result<State>::ok(state_.load());
+            return report_(state_.load());
         }
         const auto& resp = hr.value();
         if (resp.status != 200) {
@@ -2211,17 +3342,22 @@ public:
             if (resp.status == 422) {
                 auto rejected = handle_validate_rejection_(resp.body, now_fn_());
                 if (rejected.has_value()) {
-                    return Result<State>::ok(*rejected);
+                    return report_(*rejected);
                 }
             }
-            return Result<State>::ok(state_.load());
+            return report_(state_.load());
         }
 
         auto jr = Json::parse(resp.body);
         if (!jr.is_ok()) {
-            return Result<State>::ok(state_.load());
+            return report_(state_.load());
         }
         const Json& j = jr.value();
+
+        // The server's product settings ride on responses to calls that are
+        // already being made, so a licensed install learns them without an
+        // extra round trip.
+        apply_config_fields_(j);
 
         // Parse optional lease
         std::optional<Lease> lease;
@@ -2251,7 +3387,7 @@ public:
                     iid = cached_instance_id_;
                 }
             }
-            persist_({lease_json, expires_at, iid});
+            persist_({lease_json, expires_at, iid, std::nullopt});
             save_last_validated_online_(now_fn_());
         }
 
@@ -2259,20 +3395,34 @@ public:
         // trial instead of dropping a trialling user to Invalid.
         State new_state = resolve_with_trial_(resolve_from_lease_(lease));
         set_state_(new_state);
-        return Result<State>::ok(new_state);
+        return report_(new_state);
     }
 
-    /// Deactivate this device.  Clears the store regardless of network outcome.
+    /// Deactivate this device.  Clears the local cache regardless of the
+    /// network outcome, but no longer hides a server rejection: a 4xx here
+    /// means the seat is still consumed, and only the caller can decide to
+    /// retry.
     Result<void> deactivate() {
         std::string instance_id = load_instance_id_();
+        std::string license_key = load_license_key_();
 
+        std::optional<Error> server_error;
         if (!instance_id.empty()) {
+            // The worker requires BOTH fields (DeactivateBodySchema); sending
+            // instance_id alone is rejected by zod and frees nothing.
             std::string body = build_json_({
+                {"license_key", json_str(license_key)},
                 {"instance_id", json_str(instance_id)},
             }, false);
             std::string url = api_url_("deactivate");
-            // Best-effort: ignore network errors (mirror Rust/C# behaviour)
-            transport_.request("POST", url, json_headers_(), body);
+            auto hr = request_with_retry_("POST", url, json_headers_(), body);
+            if (!hr.is_ok()) {
+                server_error = hr.error();
+            } else if (hr.value().status != 200) {
+                server_error = Error{ErrorCode::Http,
+                    http_error_message_(hr.value().body, "deactivate",
+                                        hr.value().status)};
+            }
         }
 
         // Clear the paid-licensing half of the cache. The trial start survives:
@@ -2286,6 +3436,7 @@ public:
             cached_instance_id_            = std::nullopt;
             cached_license_key_            = std::nullopt;
             cached_last_validated_online_  = 0;
+            last_validated_online_atomic_.store(0);
             keep_trial                     = cached_trial_start_.has_value();
         }
 
@@ -2305,6 +3456,10 @@ public:
 
         // No paid license left: the persisted trial (if any) decides the state.
         set_state_(resolve_with_trial_(State::Invalid));
+
+        if (server_error.has_value()) {
+            return Result<void>::err(*server_error);
+        }
         return Result<void>::ok();
     }
 
@@ -2315,6 +3470,68 @@ public:
     /// calling this again (or by deactivating a paid license and re-calling).
     /// No-op when trials are disabled (Config::trialDurationDays <= 0).
     /// Performs store I/O — never call this from an audio thread.
+    /// Fetch the product's server-owned settings (trial length, free tier).
+    ///
+    /// Trial length used to be a per-SDK Config default — Rust shipped 14 days,
+    /// this SDK shipped 0 — with no server record at all, so a tenant could
+    /// neither see nor change it without an app release. The server owns it now
+    /// and Config is only the pre-first-contact seed.
+    ///
+    /// A failure is non-fatal: the last cached values (or the seed) stay in
+    /// force. A network blip must never silently switch trials off.
+    ///
+    /// NOT called automatically. checkOnLaunch() is I/O-free for an unlicensed
+    /// device by design — the settings normally arrive on the validate and
+    /// keyless responses instead. Call this only if you want an explicit
+    /// refresh and accept the network round-trip.
+    Result<void> fetchConfig() {
+        auto hr = request_with_retry_("GET", api_url_("config"), json_headers_(), "");
+        if (!hr.is_ok()) return Result<void>::err(hr.error());
+        if (hr.value().status != 200) {
+            return Result<void>::err({ErrorCode::Http,
+                http_error_message_(hr.value().body, "config", hr.value().status)});
+        }
+
+        auto jr = Json::parse(hr.value().body);
+        if (!jr.is_ok()) {
+            return Result<void>::err({ErrorCode::BadResponse, "config: undecodable body"});
+        }
+        const Json& j = jr.value();
+
+        const int   trial_days = static_cast<int>(j["trial_duration_days"].as_int());
+        const bool  free_tier  = j["free_tier_enabled"].as_bool();
+
+        // Authenticate before caching. Nothing below writes to the cache until
+        // this returns ok, so a rejected config leaves the last good value —
+        // or the Config seed — in force rather than adopting what a fake
+        // server claimed. Reported as an error too, because the caller asked
+        // for a refresh and a forged config is worth surfacing.
+        auto vr = verify_config_(j, trial_days, free_tier);
+        if (!vr.is_ok()) return vr;
+
+        // One parser for all three carriers.
+        apply_config_fields_(j);
+
+        State s = resolve_current_state_();
+        set_state_(s);
+        return Result<void>::ok();
+    }
+
+    /// Trial length actually in force: cached server value, else the Config
+    /// seed, else 0 (trials off).
+    int effectiveTrialDurationDays() const {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        if (cached_server_trial_days_.has_value()) return *cached_server_trial_days_;
+        return cfg_.trialDurationDays;
+    }
+
+    /// Free tier as the server sees it, falling back to the Config seed.
+    bool effectiveFreeTierEnabled() const {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        if (cached_server_free_tier_.has_value()) return *cached_server_free_tier_;
+        return cfg_.freeTierEnabled;
+    }
+
     /// Anonymous, per-install identifier for keyless/free-tier reporting.
     /// Minted on first use and persisted; never derived from a licence or from
     /// hardware.  Returns an empty string only when the store write fails.
@@ -2375,7 +3592,7 @@ public:
             fields.push_back({"machine_hash", json_str(*hash)});
         }
 
-        auto hr = transport_.request("POST", api_url_("keyless"),
+        auto hr = request_with_retry_("POST", api_url_("keyless"),
                                      json_headers_(),
                                      build_json_(std::move(fields), true));
         // Arm the debounce ONLY on a real 200.  A failed beacon must not
@@ -2383,6 +3600,14 @@ public:
         if (!hr.is_ok() || hr.value().status != 200) {
             return;
         }
+
+        // The beacon reply is how an UNLICENSED install learns the server's
+        // settings — validate covers the licensed ones. The body used to be
+        // discarded entirely.
+        if (auto jr = Json::parse(hr.value().body); jr.is_ok()) {
+            apply_config_fields_(jr.value());
+        }
+
         {
             std::lock_guard<std::mutex> lock(cache_mutex_);
             cached_keyless_last_state_   = wire;
@@ -2392,11 +3617,12 @@ public:
     }
 
     Result<State> startTrial() {
-        if (cfg_.trialDurationDays <= 0) {
-            // Trials disabled — nothing is persisted and no state changes.
-            return Result<State>::ok(state_.load());
-        }
-
+        // The stamp is written even when the effective duration is currently
+        // 0. The duration is a server-owned setting that can arrive AFTER
+        // first launch, and bailing out here left no clock for it to measure —
+        // a dashboard-set trial then did nothing at all. The stamp is honored
+        // as-is forever after: enabling trials later does not retroactively
+        // grant one to an install that already started.
         bool started = false;
         {
             std::lock_guard<std::mutex> lock(cache_mutex_);
@@ -2414,14 +3640,17 @@ public:
 
         State new_state = resolve_current_state_();
         set_state_(new_state);
-        return Result<State>::ok(new_state);
+        return report_(new_state);
     }
 
     /// Current local trial status. Never performs I/O beyond reading the
     /// in-memory cache primed from the store.
     TrialStatus checkTrial() const {
-        if (cfg_.trialDurationDays <= 0) {
-            return TrialStatus::NotStarted;
+        // Read the duration BEFORE taking cache_mutex_ — the accessor takes it
+        // too, and it is not recursive.
+        const int duration = effectiveTrialDurationDays();
+        if (duration <= 0) {
+            return TrialStatus::NotStarted;   // trials off
         }
         std::optional<int64_t> start;
         {
@@ -2431,14 +3660,15 @@ public:
         if (!start.has_value()) {
             return TrialStatus::NotStarted;
         }
-        return days_left_from_(*start) > 0 ? TrialStatus::Active
-                                           : TrialStatus::Expired;
+        return days_left_from_(*start, duration) > 0 ? TrialStatus::Active
+                                                     : TrialStatus::Expired;
     }
 
     /// Whole days remaining in the local trial; 0 when disabled, not started,
     /// or elapsed. Matches keylight-rust's `days_left` (seconds / 86400).
     int trialDaysLeft() const {
-        if (cfg_.trialDurationDays <= 0) {
+        const int duration = effectiveTrialDurationDays();
+        if (duration <= 0) {
             return 0;
         }
         std::optional<int64_t> start;
@@ -2449,7 +3679,7 @@ public:
         if (!start.has_value()) {
             return 0;
         }
-        int64_t left = days_left_from_(*start);
+        int64_t left = days_left_from_(*start, duration);
         return left > 0 ? static_cast<int>(left) : 0;
     }
 
@@ -2477,44 +3707,101 @@ public:
     /// cfg_.autoValidationIntervalMs.  Never started implicitly — the host
     /// application must call this explicitly.
     ///
-    /// Idempotent: calling startAutoValidation() while a thread is already
-    /// running is a no-op (the existing thread continues).
+    /// Idempotent: a second call while a worker is running is a no-op.
+    /// Restartable: stop-then-start works from any thread, including from a
+    /// state-change listener delivered on the worker thread itself.
+    ///
+    /// LIFECYCLE MODEL — read this before changing anything here.
+    ///
+    /// Workers are retired by EPOCH, and start/stop never join a LIVE one. A
+    /// worker captures av_epoch_ when it is spawned and exits the first time
+    /// it sees a different one; stop simply bumps the epoch and wakes it.
+    /// Neither function ever releases av_mutex_ mid-body, so there is no
+    /// window for a concurrent caller to act on a half-changed state.
+    ///
+    /// Both DO join already-exited workers, through the Reaper below — that is
+    /// how retired threads get cleaned up. Those joins are bounded by thread
+    /// teardown: such a worker has already left av_loop_, so the join can never
+    /// wait on the network or on a listener. No caller blocks on work another
+    /// thread has yet to do.
+    ///
+    /// That is the entire point. The previous model had start and stop join
+    /// the worker, which meant releasing av_mutex_ mid-body, which needed a
+    /// transition flag to cover the gap, which needed "am I the worker?"
+    /// special cases so a listener calling back in did not block on that flag.
+    /// Four rounds of review found a hang in each layer. Joining was the root
+    /// cause; this removes it rather than guarding it.
+    ///
+    /// THE COST, stated plainly: stopAutoValidation() no longer guarantees the
+    /// worker has EXITED when it returns — only that it will not run another
+    /// cycle. A worker already inside refreshIfNeeded() finishes that call
+    /// first. ~Client() is what joins, so the thread can never outlive the
+    /// Client.
     void startAutoValidation() {
-        std::lock_guard<std::mutex> lock(av_mutex_);
-        if (av_thread_.joinable()) return; // already running — no-op
-
-        av_stop_ = false;
-        av_thread_ = std::thread([this] {
-            auto interval = std::chrono::milliseconds(cfg_.autoValidationIntervalMs);
-            std::unique_lock<std::mutex> lk(av_mutex_);
-            while (!av_stop_) {
-                // Interruptible wait: wakes immediately on stopAutoValidation().
-                av_cv_.wait_for(lk, interval, [this]{ return av_stop_; });
-                if (av_stop_) break;
-                // Release the mutex while calling refreshIfNeeded so it can
-                // acquire cache_mutex_ / listeners_mutex_ without deadlock.
-                lk.unlock();
-                refreshIfNeeded();
-                lk.lock();
-            }
-        });
-    }
-
-    /// Signal the background thread to stop and join it.
-    /// Idempotent: safe to call when no thread is running.
-    /// Returns promptly — the thread wakes up via the condition variable
-    /// instead of blocking for the full interval.
-    void stopAutoValidation() {
-        std::thread to_join;
+        // Reaper, not a bare vector: it holds JOINABLE threads, and destroying
+        // a joinable std::thread is std::terminate. Anything that throws below
+        // — make_shared, or the std::thread constructor on EAGAIN, which a DAW
+        // hosting many plugin instances near RLIMIT_NPROC can really hit —
+        // would otherwise abort the host uncatchably from inside a licensing
+        // SDK. This is the job the deleted TransitionGuard used to do.
+        Reaper reap;
         {
             std::lock_guard<std::mutex> lock(av_mutex_);
-            if (!av_thread_.joinable()) return; // not running — no-op
-            av_stop_ = true;
-            av_cv_.notify_all();
-            to_join = std::move(av_thread_); // move out before unlocking
+            reap.workers = take_exited_();
+
+            // A joinable current worker means one is running the current
+            // epoch. Retired workers live in av_retired_, so this cannot be
+            // confused by a finished-but-unjoined thread.
+            if (!av_current_.thread.joinable()) {
+                const uint64_t epoch = ++av_epoch_;
+                auto done = std::make_shared<std::atomic<bool>>(false);
+                av_current_.done   = done;
+                av_current_.thread = std::thread([this, epoch, done] {
+                    av_loop_(epoch);
+                    // Last act: publish that the loop is over, so a later
+                    // reaper can join without blocking on a round trip.
+                    done->store(true);
+                });
+            }
         }
-        // Join outside the lock so the worker can re-acquire av_mutex_ to exit.
-        if (to_join.joinable()) to_join.join();
+        // ~Reaper joins outside the lock. Every worker it holds has already
+        // left av_loop_, so join() is bounded by thread teardown — it cannot
+        // wait on the network and it cannot wait on a listener.
+    }
+
+    /// Retire the auto-validation worker. Safe from any thread, including
+    /// from a state-change listener delivered on the worker thread itself.
+    /// Idempotent: safe when nothing is running.
+    ///
+    /// Returns immediately. It does NOT wait for the worker it retires — see
+    /// the lifecycle model on startAutoValidation(). That worker will not begin
+    /// another cycle, but one already inside refreshIfNeeded() finishes that
+    /// call first, so a tick or a state-change event can still land shortly
+    /// after this returns. ~Client() is what joins it, so no worker outlives
+    /// the Client.
+    ///
+    /// (It does join any PREVIOUSLY retired worker that has already finished —
+    /// bounded by thread teardown. See startAutoValidation().)
+    void stopAutoValidation() {
+        Reaper reap;   // joins on unwind — see startAutoValidation()
+        {
+            std::lock_guard<std::mutex> lock(av_mutex_);
+            reap.workers = take_exited_();
+
+            if (av_current_.thread.joinable()) {
+                // Reserve BEFORE the epoch bump. push_back reallocates
+                // whenever take_exited_() reaped nothing, and a bad_alloc
+                // there would leave the epoch retired with the worker still
+                // in av_current_ and joinable — so startAutoValidation()
+                // would no-op forever and auto-validation would be silently
+                // dead for the life of the process.
+                av_retired_.reserve(av_retired_.size() + 1);
+                ++av_epoch_;              // retires the current worker
+                av_cv_.notify_all();      // wake it out of its interval wait
+                av_retired_.push_back(std::move(av_current_));
+                av_current_ = AvWorker{};
+            }
+        }
     }
 
     // ── Launch / refresh API ──────────────────────────────────────────────
@@ -2533,7 +3820,10 @@ public:
     Result<State> checkOnLaunch() {
         // The cache is already primed on construction via refresh_state_from_store_().
         if (has_stored_license_()) {
-            return validate_and_reconcile_();
+            // Report what state() reports. Offline, the grace window would
+            // otherwise hand back Licensed against a clock that has moved
+            // backward — the launch path and the paywall must not disagree.
+            return report_(validate_and_reconcile_());
         }
         // No paid license: resolve the persisted local trial offline. This
         // never *starts* a trial — a DAW scanning or instantiating a plugin
@@ -2541,7 +3831,7 @@ public:
         // that, and only when the user asks for it.
         State new_state = resolve_current_state_();
         set_state_(new_state);
-        return Result<State>::ok(new_state);
+        return report_(new_state);
     }
 
     /// Apply the timer model: refresh debounce 5min, stale 6h, near-expiry 24h.
@@ -2551,6 +3841,12 @@ public:
     /// This in-session cadence is unchanged by the always-validate-on-launch
     /// fix: it still governs long-running hosts between launches.
     Result<State> refreshIfNeeded() {
+        // Poll the clock guard first. Every return below this line can
+        // short-circuit without touching state_, and a clock that moved
+        // changes no raw state — so without this, a rollback would reach
+        // state() and never reach a single subscriber.
+        notify_();
+
         if (!has_stored_license_()) {
             // No paid license — nothing to revalidate online, but the local
             // trial may have elapsed since the last resolve. keylight-rust and
@@ -2562,7 +3858,7 @@ public:
             // reaches subscribers. Still purely local — no network call.
             State new_state = resolve_current_state_();
             set_state_(new_state);
-            return Result<State>::ok(new_state);
+            return report_(new_state);
         }
 
         int64_t now          = now_fn_();
@@ -2571,7 +3867,7 @@ public:
 
         // Debounce: skip if validated within the last 5 minutes
         if (has_lvo && (now - last_lvo) < REFRESH_DEBOUNCE) {
-            return Result<State>::ok(state_.load());
+            return report_(state_.load());
         }
 
         // Near-expiry check: refresh if lease expires within 24h
@@ -2589,10 +3885,10 @@ public:
             || near_expiry;
 
         if (!do_refresh) {
-            return Result<State>::ok(state_.load());
+            return report_(state_.load());
         }
 
-        return validate_and_reconcile_();
+        return report_(validate_and_reconcile_());
     }
 
     // ── Events API ────────────────────────────────────────────────────────
@@ -2601,15 +3897,83 @@ public:
     /// event: currently only "change" is defined (fires on every state transition).
     /// Returns a Subscription RAII handle; when the handle is destroyed or
     /// unsubscribe() is called, the callback is removed.
-    /// Callbacks are dispatched on the calling thread; UI/audio hosts must
-    /// marshal to their own thread if required.
-    Subscription on(const std::string& /*event*/,
+    /// Callbacks are dispatched on whichever thread happens to be draining the
+    /// event queue, which is NOT necessarily the thread that caused the
+    /// transition. UI/audio hosts must marshal to their own thread.
+    /// Recognized lifecycle names ("renewed", "cancelled", "expired",
+    /// "restored") register a filtered lifecycle listener that fires only on
+    /// that event, invoking the callback with the state at that moment.
+    /// "change" and any UNRECOGNIZED name fall through to subscribe(), which
+    /// preserves the behaviour every existing caller relies on.
+    Subscription on(const std::string& event,
                     std::function<void(State)> cb)
     {
-        return subscribe(std::move(cb));
+        std::optional<LifecycleEvent> want;
+        if      (event == "renewed")   want = LifecycleEvent::Renewed;
+        else if (event == "cancelled") want = LifecycleEvent::Cancelled;
+        else if (event == "expired")   want = LifecycleEvent::Expired;
+        else if (event == "restored")  want = LifecycleEvent::Restored;
+
+        if (!want.has_value()) return subscribe(std::move(cb));
+
+        const LifecycleEvent target = *want;
+        return onLifecycle([this, target, cb](LifecycleEvent ev) {
+            if (ev == target) cb(state());
+        });
+    }
+
+    /// Register a callback for lifecycle events (renewal, cancellation,
+    /// expiry, restoration). Separate from subscribe(), which fires on every
+    /// state transition: a lifecycle event is the subset worth telling a
+    /// customer about, and a notification driven off every transition is noise.
+    ///
+    /// Same contract as subscribe(): delivered with no SDK lock held, a
+    /// throwing callback costs no other listener its event, and you must not
+    /// destroy the Client from inside one.
+    Subscription onLifecycle(std::function<void(LifecycleEvent)> cb) {
+        std::lock_guard<std::mutex> lock(listeners_mutex_);
+        uint64_t id = ++next_listener_id_;
+        lifecycle_listeners_.push_back({id, std::move(cb)});
+        return Subscription(this, id);
     }
 
     /// Subscribe to all state transitions. Returns a Subscription RAII handle.
+    ///
+    /// The callback receives what state() would return, so an event-driven
+    /// paywall and a query-driven one cannot disagree.
+    ///
+    /// LISTENER CONTRACT:
+    ///   - No lock is held while your callback runs, so it may call back into
+    ///     this Client (validate(), refreshIfNeeded(), …) and may take your
+    ///     own locks. A re-entrant call queues its event rather than
+    ///     recursing; it may be delivered by a different thread.
+    ///   - Unsubscribing from inside your own callback is supported.
+    ///   - Do NOT destroy this Client from a callback. ~Client() joins the
+    ///     auto-validation thread, and a listener delivered on that thread
+    ///     cannot join itself. stopAutoValidation() handles that case (it
+    ///     signals and returns); the destructor cannot.
+    ///   - Events are delivered in order, but not synchronously: the call
+    ///     that caused a transition may return before the event has been
+    ///     delivered by whichever thread holds the delivery baton.
+    ///   - KEEP IT SHORT if teardown latency matters. ~Client() joins the
+    ///     auto-validation worker, and if that worker is delivering it must
+    ///     finish your callback for every queued event first — so a slow
+    ///     listener stalls destruction for as long as it likes. Nothing here
+    ///     caps it, and a JUCE ~Licensing() runs on the message thread.
+    ///
+    ///   - A listener MUST NOT throw. An exception cannot be reported from
+    ///     here — delivery runs on whatever thread moved the state — so it is
+    ///     caught and swallowed, and the remaining listeners still get the
+    ///     event.
+    ///   - unsubscribe() does not fence a delivery already in flight on
+    ///     another thread. Keep whatever your listener captures alive across
+    ///     that window (the JUCE adapter uses a shared alive_ flag).
+    ///
+    /// The callback runs on whichever thread is draining the queue. That is
+    /// usually the thread that caused the transition, but under concurrency it
+    /// can be another one — a thread already delivering picks up your event
+    /// rather than handing it back. Never the audio thread. Marshal to your UI
+    /// thread yourself.
     Subscription subscribe(std::function<void(State)> cb) {
         std::lock_guard<std::mutex> lock(listeners_mutex_);
         uint64_t id = ++next_listener_id_;
@@ -2619,13 +3983,28 @@ public:
 
     // ── Query API ─────────────────────────────────────────────────────────
 
-    /// Current state — reads atomic; audio-thread safe.
+    /// Current state — reads atomics only; audio-thread safe, never blocks.
+    ///
+    /// A clock rolled back beyond tolerance since the last recorded server
+    /// contact invalidates any offline reasoning we could do, so this fails
+    /// closed rather than trusting a lease against a moved clock.
+    ///
+    /// This method is `noexcept` and documented audio-thread safe, and it
+    /// calls the caller-supplied `now_fn_`. See the NOW-FUNCTION CONTRACT at
+    /// the top of this header: a `now_fn` that throws terminates the process,
+    /// and one that locks or allocates breaks the audio-thread guarantee.
     State state() const noexcept {
+        if (clock_untrusted_()) return State::Invalid;
         return state_.load();
     }
 
     /// True iff the cached, verified lease contains the named entitlement.
+    ///
+    /// Applies the same clock-rollback guard as state(). A feature gate that
+    /// kept answering true while state() answered Invalid would fail OPEN —
+    /// the paywall and the gate must agree.
     bool hasEntitlement(const std::string& feature) const {
+        if (clock_untrusted_()) return false;
         std::lock_guard<std::mutex> lock(cache_mutex_);
         if (!cached_lease_.has_value()) return false;
         const auto& l = *cached_lease_;
@@ -2644,17 +4023,241 @@ public:
         return cached_expires_at_;
     }
 
+    /// The cached lease, if one is stored. Returned AS-IS and deliberately not
+    /// re-verified: this is for showing a user what is on their machine, not
+    /// for deciding what to unlock. Callers that need to know whether it is
+    /// still trusted must use state() or hasEntitlement(), which verify.
+    /// Making this verify would quietly turn a display accessor into a
+    /// licensing decision.
+    std::optional<Lease> cachedLease() const {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        return cached_lease_;
+    }
+
+    /// True when a license key is stored — i.e. this install has been
+    /// activated at some point. Cheaper and more honest than inferring it
+    /// from state(), which also reflects trial and free tier.
+    bool hasStoredLicense() const {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        return cached_license_key_.has_value() && !cached_license_key_->empty();
+    }
+
+    /// The cached license key, for pre-filling a UI field or building an
+    /// upgrade link. An empty stored value reads as nullopt, so callers get
+    /// one "nothing here" answer rather than two.
+    std::optional<std::string> cachedLicenseKey() const {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        if (cached_license_key_.has_value() && cached_license_key_->empty()) {
+            return std::nullopt;
+        }
+        return cached_license_key_;
+    }
+
+    /// Poll the server after a customer-initiated upgrade so new entitlements
+    /// appear in the running app without waiting for the normal cadence.
+    ///
+    /// Bounded on purpose: payment-webhook lag means the tier is not updated
+    /// server-side the instant the customer pays, but an unbounded poll would
+    /// hang a UI. If the change never lands inside the window the normal
+    /// foreground/launch cadence applies it later.
+    ///
+    /// A seat-only upgrade (more devices, identical entitlements) is not
+    /// "observed" here — there is nothing to unlock in the running app, and the
+    /// higher device limit is enforced server-side at activation.
+    ///
+    /// Blocking for up to timeoutMs. Use refreshAfterUpgradeAsync from a UI.
+    bool refreshAfterUpgrade(int timeoutMs = 30000, int pollIntervalMs = 2000) {
+        if (!hasStoredLicense()) return false;
+
+        std::vector<std::string> before_entitlements;
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            if (cached_lease_.has_value()) before_entitlements = cached_lease_->entitlements;
+        }
+        std::sort(before_entitlements.begin(), before_entitlements.end());
+        const State before_state = state_.load();
+
+        // Never sleep zero or negative: a caller-supplied non-positive interval
+        // would spin the API.
+        const uint64_t interval = pollIntervalMs > 0
+            ? static_cast<uint64_t>(pollIntervalMs) : 100;
+        const int64_t  deadline = now_fn_() + (timeoutMs > 0 ? timeoutMs / 1000 : 0);
+
+        for (;;) {
+            (void)validate();
+
+            std::vector<std::string> after_entitlements;
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                if (cached_lease_.has_value()) after_entitlements = cached_lease_->entitlements;
+            }
+            std::sort(after_entitlements.begin(), after_entitlements.end());
+
+            if (after_entitlements != before_entitlements || state_.load() != before_state) {
+                return true;
+            }
+            if (now_fn_() >= deadline) return false;
+            sleep_fn_(interval);
+        }
+    }
+
+    std::future<bool> refreshAfterUpgradeAsync(int timeoutMs      = 30000,
+                                               int pollIntervalMs = 2000) {
+        return std::async(std::launch::async, [this, timeoutMs, pollIntervalMs] {
+            return refreshAfterUpgrade(timeoutMs, pollIntervalMs);
+        });
+    }
+
+    /// Force a re-validation on active use (app foregrounded, popover opened),
+    /// debounced to 60s. Call this whenever the user brings the app forward so
+    /// a dashboard revoke takes effect within minutes instead of waiting for a
+    /// relaunch.
+    ///
+    /// A definitive server rejection downgrades immediately; a transient
+    /// failure never downgrades a live session — validate() already draws that
+    /// line, so this only owns the debounce. Returns true when a validate ran.
+    ///
+    /// Blocking: this performs a network round trip when it does not debounce.
+    /// Never call it from an audio thread.
+    bool activeRevalidate() {
+        if (!hasStoredLicense()) return false;
+
+        const int64_t now = now_fn_();
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            if (last_active_revalidate_at_ != 0 &&
+                now - last_active_revalidate_at_ < 60) {
+                return false;
+            }
+            last_active_revalidate_at_ = now;
+        }
+        (void)validate();
+        return true;
+    }
+
+    /// Normalize a license key the way the API does: strip whitespace and
+    /// hyphens, uppercase. Mirrors the worker's normalizeKey, so a key typed
+    /// with the wrong spacing still resolves to the same license.
+    static std::string normalizeKey(const std::string& key) {
+        std::string out;
+        out.reserve(key.size());
+        for (char c : key) {
+            unsigned char u = static_cast<unsigned char>(c);
+            if (c == '-' || std::isspace(u)) continue;
+            out += static_cast<char>(std::toupper(u));
+        }
+        return out;
+    }
+
+    /// Hosted upgrade page for the cached license.
+    ///
+    /// The customer portal's license id path segment IS the normalized key, so
+    /// this needs no server round-trip. The page requires a signed-in portal
+    /// session, so an unauthenticated customer lands on the sign-in wall — that
+    /// is the intended flow; the standalone unauthenticated upgrade form was
+    /// retired.
+    std::optional<std::string> upgradeUrl() const {
+        auto key = cachedLicenseKey();
+        if (!key.has_value()) return std::nullopt;
+        return "https://portal.keylight.dev/t/" + cfg_.tenantId +
+               "/license/" + normalizeKey(*key) + "/upgrade";
+    }
+
+    /// Cheap client-side shape check, so an obvious typo is caught before it
+    /// costs a network round-trip and a rate-limit token. Never a substitute
+    /// for server validation — it knows nothing about whether the key exists.
+    ///
+    /// The emptiness test runs on the NORMALIZED string, so a key of nothing
+    /// but separators ("---") is rejected rather than passing as plausible.
+    ///
+    /// With no keyPrefix configured this only rejects the empty string:
+    /// rejecting everything would break every integrator who never set it.
+    bool isValidKeyFormat(const std::string& key) const {
+        const std::string normalized = normalizeKey(key);
+        if (normalized.empty()) return false;
+        if (cfg_.keyPrefix.empty()) return true;
+
+        const std::string prefix = normalizeKey(cfg_.keyPrefix);
+        return normalized.size() >= prefix.size() &&
+               normalized.compare(0, prefix.size(), prefix) == 0;
+    }
+
 private:
+    // ── Clock trust ───────────────────────────────────────────────────────
+
+    // state() promises the audio thread "atomics only, no lock". On a target
+    // where these are mutex-backed that promise is silently false, and the
+    // failure mode is a priority-inverted audio dropout, not a test failure.
+    static_assert(std::atomic<int64_t>::is_always_lock_free,
+                  "keylight::Client::state() is documented audio-thread safe; "
+                  "std::atomic<int64_t> is not lock-free on this target");
+    static_assert(std::atomic<State>::is_always_lock_free,
+                  "keylight::Client::state() is documented audio-thread safe; "
+                  "std::atomic<State> is not lock-free on this target");
+
+    /// True when the system clock has moved backward, beyond tolerance, since
+    /// the last recorded server contact. Every state read point consults this
+    /// so they cannot disagree: state(), hasEntitlement() and — through
+    /// report_() — every State a public method hands back all fail closed
+    /// together.
+    ///
+    /// Reads the ATOMIC anchor mirror, never the mutex-guarded field, so it
+    /// stays usable from noexcept, lock-free, audio-thread-safe state().
+    /// An anchor of 0 means "never validated online" — there is nothing to
+    /// compare against, and the offline bound in refresh_state_from_store_()
+    /// already fails that case closed.
+    bool clock_untrusted_() const noexcept {
+        const int64_t anchor = last_validated_online_atomic_.load();
+        return anchor != 0 && clock_rolled_back(anchor, now_fn_());
+    }
+
+    /// Every public entry point hands its State back through here, so no
+    /// caller can be told something state() would contradict. Without it the
+    /// guard covers only the paywall: refreshIfNeeded() is what long-running
+    /// hosts poll between launches, and it would keep reporting Licensed from
+    /// the debounce and staleness short-circuits — no server contact, cached
+    /// state, moved clock — while state() answered Invalid.
+    ///
+    /// A successful round-trip re-anchors the clock before returning, so on
+    /// the online paths this is a no-op; it bites exactly on the offline and
+    /// short-circuit returns, which is where it must.
+    ///
+    /// Errors pass through untouched: an error is not a state claim, and
+    /// rewriting it to Invalid would lose the failure the caller needs.
+    Result<State> report_(State s) const {
+        if (clock_untrusted_()) return Result<State>::ok(State::Invalid);
+        return Result<State>::ok(s);
+    }
+
+    Result<State> report_(Result<State> r) const {
+        if (r.is_ok() && clock_untrusted_()) {
+            return Result<State>::ok(State::Invalid);
+        }
+        return r;
+    }
+
     // ── Dependencies ──────────────────────────────────────────────────────
     Config                   cfg_;
     Transport&               transport_;
     LicenseStore&            store_;
     std::function<int64_t()> now_fn_;
     std::function<std::optional<std::string>()> hardware_id_fn_;
+
+    // Injected so retry backoff is tested without sleeping. Defaults to a real
+    // sleep; tests record the requested delays instead.
+    std::function<void(uint64_t)> sleep_fn_;
     Verifier                 verifier_;
 
     // ── State ─────────────────────────────────────────────────────────────
     std::atomic<State>       state_;
+    // Last value handed to subscribers. Distinct from state_ because the
+    // clock guard can change what we report without state_ changing at all,
+    // and because two raw states can report as the same guarded one.
+    std::atomic<State>       last_reported_{State::Invalid};
+    // Atomic mirror of cached_last_validated_online_, so the clock guard can
+    // run inside noexcept, lock-free state(). The mutex-protected field stays
+    // the source of truth for persistence; this is written alongside it.
+    std::atomic<int64_t>     last_validated_online_atomic_{0};
 
     // Mutex-guarded cache of the decoded lease + extras
     mutable std::mutex               cache_mutex_;
@@ -2670,25 +4273,96 @@ private:
     std::optional<std::string>       cached_hardware_id_;
     std::optional<std::string>       cached_keyless_last_state_;
     int64_t                          cached_last_keyless_ping_at_ = 0;
+    // Server-owned product settings. nullopt until the first config lands;
+    // Config's own fields are only the pre-first-contact seed.
+    std::optional<int>               cached_server_trial_days_;
+    std::optional<bool>              cached_server_free_tier_;
+    // Debounce for activeRevalidate(). Deliberately NOT persisted: the window
+    // is per-session, so a relaunch always revalidates. Persisting it would
+    // let a user dodge a revoke by restarting inside the window.
+    int64_t                          last_active_revalidate_at_ = 0;
 
     // ── Event listeners ───────────────────────────────────────────────────
     struct Listener {
         uint64_t                   id;
         std::function<void(State)> cb;
     };
-    mutable std::mutex        listeners_mutex_;
-    std::vector<Listener>     listeners_;
-    uint64_t                  next_listener_id_ = 0;
+    struct LifecycleListener {
+        uint64_t                            id;
+        std::function<void(LifecycleEvent)> cb;
+    };
+    mutable std::mutex             listeners_mutex_;
+    std::vector<Listener>          listeners_;
+    std::vector<LifecycleListener> lifecycle_listeners_;
+    uint64_t                       next_listener_id_ = 0;
+
+    // Last expiry observed by set_state_, for deciding "moved later". Not
+    // persisted: a renewal is a transition seen within one session.
+    std::optional<int64_t>         last_seen_expiry_;
+    // Guards the event ORDER (pending_ + delivering_ + the dedupe), never the
+    // delivery itself — see notify_(). Never nested with listeners_mutex_,
+    // cache_mutex_ or av_mutex_ — each is taken and released on its own — and
+    // never held across a callback, so it cannot join an application's lock
+    // cycle.
+    std::mutex                notify_mutex_;
+    std::vector<State>        pending_;              // events in delivery order
+    bool                      delivering_ = false;   // the delivery baton
 
     // ── Background auto-validation ────────────────────────────────────────
-    // av_mutex_ guards av_stop_ and av_thread_.
-    // The worker holds a unique_lock<av_mutex_> for its wait/flag check,
-    // then RELEASES it before calling refreshIfNeeded() (which acquires
-    // cache_mutex_ / listeners_mutex_) to avoid deadlock.
-    std::mutex              av_mutex_;
+    // av_mutex_ guards every field below. Neither startAutoValidation() nor
+    // stopAutoValidation() releases it mid-body, so there is no half-changed
+    // state for a concurrent caller to observe.
+    //
+    // The worker holds a unique_lock<av_mutex_> for its epoch check and
+    // interval wait, then RELEASES it before calling refreshIfNeeded() (which
+    // acquires cache_mutex_ / notify_mutex_ / listeners_mutex_) to avoid
+    // deadlock and to keep start/stop responsive during a round trip.
+    mutable std::mutex      av_mutex_;
     std::condition_variable av_cv_;
-    bool                    av_stop_  = false;
-    std::thread             av_thread_;
+
+    // Monotone. A worker captures this at spawn and exits when it changes.
+    // Bumping it is how stopAutoValidation() and ~Client() retire a worker
+    // without joining.
+    uint64_t                av_epoch_ = 0;
+
+    // A spawned worker. `done` is set by the thread as its very last act, so a
+    // reaper can distinguish "already left av_loop_" (join returns at once)
+    // from "still inside a round trip" (join would block on the network).
+    struct AvWorker {
+        std::thread                        thread;
+        std::shared_ptr<std::atomic<bool>> done;
+    };
+
+    // Holds workers on their way to a join, and joins them however the scope
+    // exits. A bare vector of joinable std::threads is a std::terminate
+    // waiting for an exception.
+    struct Reaper {
+        std::vector<AvWorker> workers;
+        ~Reaper() {
+            for (auto& w : workers) if (w.thread.joinable()) w.thread.join();
+        }
+    };
+
+    // ── Keyless heartbeat ─────────────────────────────────────────────────
+    // Deliberately mirrors the av_* machinery above: same interruptible
+    // wait_for, same idempotent start, same move-the-thread-out-of-the-lock
+    // before joining. A second threading discipline in one file is how the
+    // first one's hard-won rules get quietly violated.
+    mutable std::mutex      kh_mutex_;
+    std::condition_variable kh_cv_;
+    bool                    kh_stop_ = false;
+    std::thread             kh_thread_;
+
+    // The worker running the CURRENT epoch. A joinable thread here is the
+    // definition of "auto-validation is running".
+    AvWorker                av_current_;
+    // Retired workers, awaiting a reap. Entries are moved out by take_exited_()
+    // on the next start or stop once they have finished, and ~Client() joins
+    // whatever is left. Not bounded by a constant — the bound is (in-flight
+    // refresh duration / stop-start period), so a program that cycles faster
+    // than its round trips holds more. Never unbounded growth: a worker that
+    // has finished is reaped by the very next start or stop.
+    std::vector<AvWorker>   av_retired_;
 
     // ── Private helpers ───────────────────────────────────────────────────
 
@@ -2710,7 +4384,203 @@ private:
         if (!cfg_.sdkKey.empty()) {
             headers["X-Keylight-SDK-Key"] = cfg_.sdkKey;
         }
+        headers["X-Keylight-Request-Id"] = detail::random_request_id();
         return headers;
+    }
+
+    /// Whether a JSON object actually carries a key. Presence matters for the
+    /// config fields because 0 and false are legitimate values, so the
+    /// "0 means absent" shortcut used for timestamps would misread them.
+    static bool json_has_(const Json& j, const char* key) {
+        const auto ks = j.keys();
+        return std::find(ks.begin(), ks.end(), key) != ks.end();
+    }
+
+    /// Read the server-owned product settings out of any response that carries
+    /// them — the dedicated /config route, a validate body, or a beacon reply.
+    ///
+    /// ABSENT FIELDS ARE LEFT ALONE, never treated as zero: an older worker,
+    /// or a route that does not include them, must not wipe a value we already
+    /// learned.
+    ///
+    /// AUTHENTICATION IS THE SAME WHEREVER THEY RIDE. A signed envelope is
+    /// verified; an unsigned one is accepted only when requireSignedConfig is
+    /// false. Applying these fields unsigned here while /config verified them
+    /// would defeat that check completely — a fake server would simply deliver
+    /// the long trial on a validate body instead of on /config.
+    void apply_config_fields_(const Json& j) {
+        const bool has_trial = json_has_(j, "trial_duration_days");
+        const bool has_ft    = json_has_(j, "free_tier_enabled");
+        if (!has_trial && !has_ft) return;
+
+        const bool signed_envelope =
+            !j["kid"].as_string().empty() && !j["signature"].as_string().empty();
+
+        if (signed_envelope) {
+            // A signed envelope covers BOTH fields, so a partial one is
+            // malformed rather than something to verify against a guess.
+            if (!has_trial || !has_ft) return;
+            const int  trial = static_cast<int>(j["trial_duration_days"].as_int());
+            const bool ft    = j["free_tier_enabled"].as_bool();
+            if (!verify_config_(j, trial, ft).is_ok()) return;
+        } else if (cfg_.requireSignedConfig) {
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            if (has_trial) {
+                cached_server_trial_days_ =
+                    static_cast<int>(j["trial_duration_days"].as_int());
+            }
+            if (has_ft) {
+                cached_server_free_tier_ = j["free_tier_enabled"].as_bool();
+            }
+        }
+        (void)save_cache_();
+    }
+
+    /// Authenticate a GET /config body. See config_payload.hpp for why this
+    /// exists and, just as importantly, what it does not buy.
+    ///
+    /// Returns an error rather than silently ignoring a bad config: the caller
+    /// asked for a refresh and deserves to know it was refused, and a forged
+    /// config is worth surfacing. The failure is non-fatal either way, because
+    /// fetchConfig() never touches the cache unless this returns ok.
+    Result<void> verify_config_(const Json&  j,
+                                int          trial_days,
+                                bool         free_tier) const
+    {
+        const std::string kid = j["kid"].as_string();
+        const std::string sig = j["signature"].as_string();
+
+        if (kid.empty() || sig.empty()) {
+            // No signature at all. A signature that is PRESENT is always
+            // checked below; this branch only decides the rollout question.
+            if (cfg_.requireSignedConfig) {
+                return Result<void>::err({ErrorCode::BadResponse,
+                    "config: unsigned response rejected (requireSignedConfig)"});
+            }
+            return Result<void>::ok();
+        }
+
+        auto key_it = cfg_.trustedKeys.find(kid);
+        if (key_it == cfg_.trustedKeys.end()) {
+            return Result<void>::err({ErrorCode::BadResponse,
+                "config: unknown signing key '" + kid + "'"});
+        }
+
+        const int64_t issued_at  = j["issued_at"].as_int();
+        const int64_t expires_at = j["expires_at"].as_int();
+
+        // Freshness bounds the WIRE, not the cache. This is what stops an old,
+        // genuinely-signed config that granted a longer trial from being
+        // replayed forever. A cached config deliberately outlives its window —
+        // see effectiveTrialDurationDays(); it was verified once and sits in
+        // the machine-bound store, and expiring it would cut an offline user's
+        // trial short to punish an attack they are not committing.
+        const int64_t now  = now_fn_();
+        const int64_t skew = 300;
+        if (expires_at != 0 && now > expires_at + skew) {
+            return Result<void>::err({ErrorCode::BadResponse,
+                "config: signed response has expired"});
+        }
+        if (issued_at != 0 && now + skew < issued_at) {
+            return Result<void>::err({ErrorCode::BadResponse,
+                "config: signed response is not yet valid"});
+        }
+
+        // tenantId/productId come from OUR config, not the body — that is what
+        // makes a config signed for another product fail here instead of
+        // validating against its own claim.
+        const std::string payload = config_canonical_payload(
+            kid, cfg_.tenantId, cfg_.productId, issued_at, expires_at,
+            trial_days, free_tier);
+
+        const std::string pk_bytes  = b64_decode_flexible(key_it->second);
+        const std::string sig_bytes = b64_decode_flexible(sig);
+        if (pk_bytes.size() != 32 || sig_bytes.size() != 64) {
+            return Result<void>::err({ErrorCode::BadResponse,
+                "config: malformed key or signature"});
+        }
+
+        std::array<uint8_t, 32> pubkey;
+        for (size_t i = 0; i < 32; ++i) pubkey[i] = static_cast<uint8_t>(pk_bytes[i]);
+        std::array<uint8_t, 64> sigbuf;
+        for (size_t i = 0; i < 64; ++i) sigbuf[i] = static_cast<uint8_t>(sig_bytes[i]);
+
+        const bool ok = ed25519_verify(
+            reinterpret_cast<const uint8_t*>(payload.data()), payload.size(),
+            sigbuf, pubkey);
+        if (!ok) {
+            return Result<void>::err({ErrorCode::BadResponse,
+                "config: signature does not verify"});
+        }
+        return Result<void>::ok();
+    }
+
+    // Every outbound request goes through here. A transient failure (408, 429,
+    // 5xx, or a transport-level error) is retried up to RETRY_MAX_ATTEMPTS with
+    // exponential backoff, honoring Retry-After on a 429. A definitive
+    // rejection is returned immediately — retrying "License key not found"
+    // only wastes the user's time and the tenant's quota.
+    //
+    // Blocking: this can now park the calling thread for the sum of the
+    // backoffs before it returns. Every caller was already a blocking network
+    // call on a background thread, so the thread affinity rules do not change,
+    // but the worst-case duration does.
+    Result<HttpResponse> request_with_retry_(
+        const std::string&                        method,
+        const std::string&                        url,
+        const std::map<std::string, std::string>& headers,
+        const std::string&                        body)
+    {
+        Result<HttpResponse> last = Result<HttpResponse>::err(
+            {ErrorCode::Network, "no attempt made"});
+
+        for (uint32_t attempt = 1; attempt <= RETRY_MAX_ATTEMPTS; ++attempt) {
+            last = transport_.request(method, url, headers, body);
+
+            // A transport-level failure has no status; treat it as a 503 for
+            // policy purposes so a flaky network gets the same backoff.
+            const int status = last.is_ok() ? last.value().status : 503;
+            if (last.is_ok() && !status_retryable(status)) {
+                return last;
+            }
+
+            std::optional<uint64_t> retry_after;
+            if (last.is_ok()) {
+                auto it = last.value().headers.find("retry-after");
+                if (it != last.value().headers.end()) {
+                    retry_after = parse_retry_after(it->second);
+                }
+            }
+
+            const RetryDecision d = retry_decide(status, attempt, retry_after);
+            if (!d.retry) break;
+            sleep_fn_(d.delay_ms);
+        }
+        return last;
+    }
+
+    // The worker's human-readable rejection reason, e.g. "License key not
+    // found" or "Activation limit reached". This is the string an integrator's
+    // UI shows the customer, so a status line is the fallback, not the default.
+    // `message` is accepted alongside `error` because the two are used
+    // interchangeably across worker routes.
+    static std::string http_error_message_(const std::string& body,
+                                           const std::string& action,
+                                           int                status)
+    {
+        const std::string fallback = action + " HTTP " + std::to_string(status);
+        if (body.empty()) return fallback;
+
+        auto jr = Json::parse(body);
+        if (!jr.is_ok()) return fallback;
+
+        std::string msg = jr.value()["error"].as_string();
+        if (msg.empty()) msg = jr.value()["message"].as_string();
+        return msg.empty() ? fallback : msg;
     }
 
     // Tiny JSON string escaping (no control chars expected in these values)
@@ -2742,6 +4612,20 @@ private:
             // the same canonical macos/windows/linux tokens, so the server used
             // to label every C++ device "Rust". Identify ourselves explicitly.
             fields.push_back({"sdk",         json_str(KEYLIGHT_SDK_ID)});
+            // The trial length this BUILD was compiled with — not the
+            // effective one. Purely diagnostic, and the server must never gate
+            // on it: a patched client sends whatever its author wants, so
+            // comparing it against the server's value proves nothing about the
+            // client. That is what the signed config and the server-side trial
+            // ledger are for.
+            //
+            // It earns its place on ordinary mistakes instead, which are far
+            // more common than attacks: a tenant sets 14 in the dashboard,
+            // ships a build compiled with 30, and the dashboard can say so
+            // instead of the difference surfacing as a week of support
+            // tickets.
+            fields.push_back({"sdk_trial_duration_days",
+                              std::to_string(cfg_.trialDurationDays)});
             if (!cfg_.appVersion.empty()) {
                 fields.push_back({"app_version", json_str(cfg_.appVersion)});
             }
@@ -2755,6 +4639,18 @@ private:
             const char* mem = detail::memory_bucket(detail::detect_physical_memory_bytes());
             if (mem[0] != '\0') {
                 fields.push_back({"memory", json_str(mem)});
+            }
+            // Phase-3 device dimensions. Both are omitted entirely when the
+            // platform cannot report them — never a placeholder. device_class
+            // is deliberately absent: the server derives it, and inventing one
+            // here would fight that.
+            std::string osv = detail::detect_os_version();
+            if (!osv.empty()) {
+                fields.push_back({"os_version", json_str(osv)});
+            }
+            const char* arch = detail::current_arch();
+            if (arch[0] != '\0') {
+                fields.push_back({"arch", json_str(arch)});
             }
         }
 
@@ -2832,7 +4728,7 @@ private:
                         int64_t v = j["license_expires_at"].as_int();
                         if (v != 0) expires_at = v;
                     }
-                    persist_({lease_json, expires_at, iid});
+                    persist_({lease_json, expires_at, iid, std::nullopt});
                     save_last_validated_online_(now);
                 }
                 State new_state = resolve_with_trial_(resolve_from_lease_(lease));
@@ -2887,7 +4783,11 @@ private:
         if (l.status == "active") {
             return vr.expired ? State::Expired : State::Licensed;
         }
-        // "expired", "fallback", or anything else from a trusted lease → Expired
+        // Rust's resolve_state maps ("fallback", _) -> Limited BEFORE the
+        // expired arm. Keeping fallback on Expired locks the app over a
+        // server-side signing incident.
+        if (l.status == "fallback") return State::Limited;
+        // "expired", or anything else from a trusted lease → Expired
         return State::Expired;
     }
 
@@ -2940,7 +4840,10 @@ private:
             {
                 // Load lastValidatedOnline (written by save_last_validated_online_)
                 int64_t v = j["lastValidatedOnline"].as_int();
-                if (v != 0) cached_last_validated_online_ = v;
+                if (v != 0) {
+                    cached_last_validated_online_ = v;
+                    last_validated_online_atomic_.store(v);
+                }
             }
             {
                 // Load the local trial start written by startTrial().
@@ -2961,6 +4864,23 @@ private:
                 if (!kls.empty()) cached_keyless_last_state_ = kls;
                 cached_last_keyless_ping_at_ = j["lastKeylessPingAt"].as_int();
             }
+            {
+                // Server-owned config. Unlike the timestamps above, PRESENCE
+                // is what matters here: 0 is a legitimate server value meaning
+                // "trials off", so treating absent and zero alike would turn a
+                // never-fetched config into a deliberate no-trial setting.
+                const auto ks = j.keys();
+                const auto present = [&ks](const char* k) {
+                    return std::find(ks.begin(), ks.end(), k) != ks.end();
+                };
+                if (present("serverTrialDurationDays")) {
+                    cached_server_trial_days_ =
+                        static_cast<int>(j["serverTrialDurationDays"].as_int());
+                }
+                if (present("serverFreeTierEnabled")) {
+                    cached_server_free_tier_ = j["serverFreeTierEnabled"].as_bool();
+                }
+            }
         }
 
         State paid = State::Invalid;
@@ -2968,6 +4888,41 @@ private:
             auto vr = verifier_.verify(*lease, now_fn_());
             paid    = derive_state_from_verify_(*lease, vr);
         }
+
+        // Bound how long a cached lease may carry the app without server
+        // contact. The lease's own 7-day TTL is the ceiling; maxOfflineDays is
+        // the tenant's policy underneath it, and it was previously ignored on
+        // this path — so a tenant setting 2 still got 7.
+        //
+        // Fail closed when the anchor is missing: a lease with no record of
+        // ever having been validated online cannot be aged, and treating
+        // "unknown" as "recent" is exactly the gap an attacker deletes a field
+        // to create. Matches keylight-rust.
+        //
+        // Fail closed too when the anchor sits AHEAD of the clock beyond the
+        // rollback tolerance: `now - anchor` is negative there, so the
+        // `> max_age` test can never fire and the bound is silently disabled
+        // for as long as the anchor stays in the future — push the clock
+        // forward across one validate and the tenant's policy stops applying.
+        // Within the tolerance the anchor is trusted, for the same reason
+        // clock.hpp tolerates a small backward step: NTP corrections and
+        // suspend/resume routinely move the clock a little, and locking out a
+        // paying customer over a second of drift would be the worse bug.
+        if (paid != State::Invalid && cfg_.maxOfflineDays > 0) {
+            int64_t anchor;
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                anchor = cached_last_validated_online_;
+            }
+            const int64_t now = now_fn_();
+            const int64_t max_age =
+                static_cast<int64_t>(cfg_.maxOfflineDays) * 86400;
+            if (anchor == 0 || clock_rolled_back(anchor, now) ||
+                (now - anchor) > max_age) {
+                paid = State::Expired;
+            }
+        }
+
         // Paid licensing wins; the persisted local trial only fills the gap.
         state_.store(resolve_with_trial_(paid));
     }
@@ -2975,6 +4930,10 @@ private:
     static State derive_state_from_verify_(const Lease& l, const VerifyResult& vr) {
         if (!vr.is_trusted()) return State::Invalid;
         if (l.status == "active") return vr.expired ? State::Expired : State::Licensed;
+        // Mirrors resolve_from_lease_: a cached "fallback" lease must still
+        // resolve to Limited after an offline relaunch, not re-lock to
+        // Expired just because the store reload took a different path.
+        if (l.status == "fallback") return State::Limited;
         return State::Expired;
     }
 
@@ -2984,11 +4943,13 @@ private:
     /// Elapsed time is seconds / 86400 (matching keylight-rust check_trial),
     /// clamped at zero so a wall clock that moved backwards cannot extend the
     /// window past its configured length.
-    int64_t days_left_from_(int64_t start) const {
+    /// Takes the duration as a parameter rather than reading cfg_, so the
+    /// three call sites cannot drift apart once the value is server-owned.
+    int64_t days_left_from_(int64_t start, int duration_days) const {
         int64_t elapsed_secs = now_fn_() - start;
         if (elapsed_secs < 0) elapsed_secs = 0;
         int64_t days_elapsed = elapsed_secs / 86400;
-        return static_cast<int64_t>(cfg_.trialDurationDays) - days_elapsed;
+        return static_cast<int64_t>(duration_days) - days_elapsed;
     }
 
     // ── Device identity helpers ───────────────────────────────────────────
@@ -3070,11 +5031,11 @@ private:
                 // Free tier outranks an elapsed trial: keylight-rust's
                 // `_ if free_tier_enabled` arm sits AFTER the trial match, so a
                 // lapsed trial drops to the free tier rather than the paywall.
-                return cfg_.freeTierEnabled ? State::FreeTier : State::Expired;
+                return effectiveFreeTierEnabled() ? State::FreeTier : State::Expired;
             case TrialStatus::NotStarted:
                 break;
         }
-        return cfg_.freeTierEnabled ? State::FreeTier : State::Invalid;
+        return effectiveFreeTierEnabled() ? State::FreeTier : State::Invalid;
     }
 
     /// Re-resolve the current state offline. When any paid-licensing material
@@ -3096,7 +5057,9 @@ private:
     // ── Persist helpers ───────────────────────────────────────────────────
 
     struct PersistData {
-        // nullopt means "no lease string to write" (keep as-is)
+        // nullopt on ANY field means "the caller has nothing to say about this
+        // one" — persist_ keeps the cached value. It never means "clear it".
+        // Spell every field at the call site, including the nullopts.
         std::optional<std::string>       lease_json;
         std::optional<int64_t>           expires_at;
         std::optional<std::string>       instance_id;
@@ -3185,6 +5148,14 @@ private:
             append("\"lastKeylessPingAt\":" +
                    std::to_string(cached_last_keyless_ping_at_));
         }
+        if (cached_server_trial_days_.has_value()) {
+            append("\"serverTrialDurationDays\":" +
+                   std::to_string(*cached_server_trial_days_));
+        }
+        if (cached_server_free_tier_.has_value()) {
+            append(std::string("\"serverFreeTierEnabled\":") +
+                   (*cached_server_free_tier_ ? "true" : "false"));
+        }
 
         blob += "}";
         return blob;
@@ -3238,6 +5209,7 @@ private:
             std::lock_guard<std::mutex> lock(cache_mutex_);
             cached_last_validated_online_ = t;
         }
+        last_validated_online_atomic_.store(t);
         // Rewrite the blob from the cache (best-effort; failures are non-fatal).
         save_cache_();
     }
@@ -3266,13 +5238,12 @@ private:
         int64_t last_lvo = load_last_validated_online_();
 
         // Attempt network refresh via validate()
-        State before = state_.load();
-        auto hr = transport_.request("POST", api_url_("validate"),
+        auto hr = request_with_retry_("POST", api_url_("validate"),
                                      json_headers_(),
                                      build_validate_body_());
         if (!hr.is_ok()) {
             // Network failure — apply offline grace
-            return apply_offline_grace_(before, now, last_lvo);
+            return apply_offline_grace_(now, last_lvo);
         }
         const auto& resp = hr.value();
         if (resp.status != 200) {
@@ -3287,15 +5258,21 @@ private:
                     return Result<State>::ok(*rejected);
                 }
             }
-            return apply_offline_grace_(before, now, last_lvo);
+            return apply_offline_grace_(now, last_lvo);
         }
 
         // Parse and apply the validate response
         auto jr = Json::parse(resp.body);
         if (!jr.is_ok()) {
-            return apply_offline_grace_(before, now, last_lvo);
+            return apply_offline_grace_(now, last_lvo);
         }
         const Json& j = jr.value();
+
+        // The server's product settings ride on responses to calls that are
+        // already being made, so a licensed install learns them without an
+        // extra round trip. checkOnLaunch() stays I/O-free for an unlicensed
+        // device, which a DAW plugin scan depends on.
+        apply_config_fields_(j);
 
         std::optional<Lease> lease;
         auto lease_node = j["lease"];
@@ -3319,7 +5296,7 @@ private:
                 std::lock_guard<std::mutex> lock(cache_mutex_);
                 iid = cached_instance_id_;
             }
-            persist_({lease_json, expires_at, iid});
+            persist_({lease_json, expires_at, iid, std::nullopt});
             // Update last_validated_online timestamp
             save_last_validated_online_(now);
         }
@@ -3342,7 +5319,7 @@ private:
     ///            first, then expiry.  Absent cached_lease → Expired/Invalid.
     ///   - C#:    ResolveState "stale active lease: fall through to Expired"
     ///            — the offline-grace path must not override that.
-    Result<State> apply_offline_grace_(State before, int64_t now, int64_t last_lvo) {
+    Result<State> apply_offline_grace_(int64_t now, int64_t last_lvo) {
         // Check whether the cached lease has passed its own raw expiresAt.
         // Grace cannot rescue a genuinely expired lease.
         bool lease_raw_expired = false;
@@ -3392,22 +5369,354 @@ private:
         return Result<State>::ok(current);
     }
 
-    /// Set state_ and fire event listeners if the state changed.
-    void set_state_(State new_state) {
-        State old_state = state_.exchange(new_state);
-        if (old_state == new_state) return; // no transition — no event
+#ifdef KEYLIGHT_ENABLE_TEST_SEAMS
+public:
+    /// TEST SEAM — compiled only for this repo's own test target, never in a
+    /// shipped build. Number of retired workers awaiting a reap.
+    ///
+    /// It exists because without it take_exited_() has no coverage at all: a
+    /// reaper that silently stops working leaks a thread stack per stop/start
+    /// cycle, and every black-box symptom of that needs hundreds of cycles and
+    /// hundreds of megabytes to observe. A review found the previous
+    /// black-box attempt asserted literally nothing.
+    std::size_t retiredWorkerCount_ForTest() const {
+        std::lock_guard<std::mutex> lock(av_mutex_);
+        return av_retired_.size();
+    }
 
-        // Collect callbacks under the lock, fire outside it to avoid re-entrancy.
-        std::vector<std::function<void(State)>> cbs;
+    /// TEST SEAM — whether the keyless heartbeat thread is running. The
+    /// alternative is asserting on beacon traffic, which cannot distinguish
+    /// "never started" from "started and correctly debounced".
+    bool heartbeatRunningForTest() const {
+        std::lock_guard<std::mutex> lock(kh_mutex_);
+        return kh_thread_.joinable();
+    }
+private:
+#endif
+
+    /// The auto-validation worker. Runs until the epoch it was spawned with
+    /// is no longer current — which is how both stopAutoValidation() and
+    /// ~Client() retire it. stopAutoValidation() then returns without waiting
+    /// for it; ~Client() joins it.
+    void av_loop_(uint64_t epoch) {
+        // Clamp: wait_for() with a non-positive duration returns immediately,
+        // so a misconfigured interval turns the worker into a busy-spin that
+        // hammers refreshIfNeeded(). One millisecond is still absurd, but it
+        // is a rate rather than a spin.
+        const auto interval = std::chrono::milliseconds(
+            cfg_.autoValidationIntervalMs > 0 ? cfg_.autoValidationIntervalMs : 1);
+        std::unique_lock<std::mutex> lk(av_mutex_);
+        while (av_epoch_ == epoch) {
+            // Interruptible wait: wakes immediately when the epoch moves.
+            av_cv_.wait_for(lk, interval, [this, epoch]{ return av_epoch_ != epoch; });
+            if (av_epoch_ != epoch) break;
+            // Release the mutex while calling refreshIfNeeded so it can
+            // acquire cache_mutex_ / notify_mutex_ / listeners_mutex_ without
+            // deadlock, and so start/stop stay responsive during a round trip.
+            lk.unlock();
+            // Contain it, for the same reason a listener is contained: an
+            // exception escaping a thread's entry point is std::terminate, and
+            // aborting a DAW from a licensing SDK's background thread is not a
+            // failure mode we get to have. Nothing documents Transport or
+            // LicenseStore as non-throwing — only now_fn is — and the SDK's own
+            // JuceUrlTransport builds juce::String and std::string with no
+            // guard, so bad_alloc alone reaches here through our code.
+            //
+            // The catch belongs HERE and not around av_loop_: catching outside
+            // would leave av_current_.thread joinable with a dead thread behind
+            // it, and startAutoValidation() would then no-op forever.
+            try {
+                refreshIfNeeded();
+            } catch (...) {
+                // Swallowed. There is nowhere to report it from a background
+                // thread, and the next cycle retries.
+            }
+            lk.lock();
+        }
+    }
+
+    /// Move out every retired worker that has finished its loop. Caller holds
+    /// av_mutex_. Joining these outside the lock cannot block on anything a
+    /// user controls, which is why the flag exists rather than just joining.
+    std::vector<AvWorker> take_exited_() {
+        std::vector<AvWorker> exited, still_running;
+        // Reserve BEFORE moving anything: a bad_alloc partway through would
+        // leave joinable threads in a vector that is about to unwind.
+        exited.reserve(av_retired_.size());
+        still_running.reserve(av_retired_.size());
+        for (auto& w : av_retired_) {
+            if (w.done && w.done->load()) exited.push_back(std::move(w));
+            else                          still_running.push_back(std::move(w));
+        }
+        av_retired_ = std::move(still_running);
+        return exited;
+    }
+
+    /// Set the raw resolved state, then let notify_() decide whether that is
+    /// a change worth reporting. state_ stays the raw resolution — it is what
+    /// gets persisted reasoning and what the guard is applied *to*.
+    ///
+    /// Anything that changes state_ AFTER construction must go through here.
+    /// The bare state_.store() calls in refresh_state_from_store_() are safe
+    /// only because its sole caller is the constructor, where nobody can have
+    /// subscribed yet; a second caller would silently swallow a transition.
+    void set_state_(State new_state) {
+        const State   prev         = state_.load();
+        std::optional<int64_t> expiry;
         {
-            std::lock_guard<std::mutex> lock(listeners_mutex_);
-            cbs.reserve(listeners_.size());
-            for (const auto& l : listeners_) {
-                cbs.push_back(l.cb);
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            expiry = cached_expires_at_;
+        }
+        // nullopt -> value counts as "later": a first observed expiry on a
+        // live licence is a renewal, not an absence of one.
+        const bool moved_later =
+            expiry.has_value() &&
+            (!last_seen_expiry_.has_value() || *expiry > *last_seen_expiry_);
+        last_seen_expiry_ = expiry;
+
+        state_.store(new_state);
+        notify_();
+
+        if (auto ev = lifecycle_event(prev, new_state, moved_later)) {
+            notify_lifecycle_(*ev);
+        }
+
+        // First state resolution is where the heartbeat begins. Spawning it in
+        // the constructor would make a plugin scan — which builds and discards
+        // a Client per plugin — pay for a thread it never uses.
+        start_heartbeat_();
+    }
+
+    /// Which keyless state, if any, this license state should beacon as.
+    ///
+    /// An EXHAUSTIVE switch on purpose. With -Werror=switch a new State forces
+    /// this decision at compile time; an if-chain would drop it into a default
+    /// branch instead, and if that branch beacons then a LICENSED device gets
+    /// reported into the free-tier table and the dashboard's conversion
+    /// numbers are wrong with no error anywhere.
+    ///
+    /// Licensed and Limited both report nothing: the beacon counts KEYLESS
+    /// devices, and liveness for a paying customer already goes through
+    /// /validate.
+    static std::optional<KeylessState> beacon_state_for_(State s) {
+        switch (s) {
+            case State::Trial:    return KeylessState::Trial;
+            case State::FreeTier: return KeylessState::FreeTier;
+            case State::Expired:  return KeylessState::Expired;
+            case State::Invalid:  return std::nullopt;
+            case State::Licensed: return std::nullopt;
+            case State::Limited:  return std::nullopt;
+        }
+        return std::nullopt;
+    }
+
+    /// Start the heartbeat if it is enabled and not already running.
+    /// Idempotent. Called on state resolution, never from the constructor.
+    void start_heartbeat_() {
+        if (cfg_.keylessHeartbeatIntervalMs <= 0) return;   // disabled
+        std::lock_guard<std::mutex> lock(kh_mutex_);
+        if (kh_thread_.joinable()) return;                  // already running
+        kh_stop_ = false;
+        try {
+            kh_thread_ = std::thread([this] { kh_loop_(); });
+        } catch (const std::system_error&) {
+            // std::thread's constructor throws on EAGAIN, which a DAW hosting
+            // many plugin instances near RLIMIT_NPROC can genuinely hit. This
+            // runs from set_state_ — every activate, validate and startTrial —
+            // so letting it escape would turn thread exhaustion into a failed
+            // LICENCE CALL, or a terminate if it unwound through a noexcept
+            // frame. The beacon is best-effort telemetry; licensing is not.
+            //
+            // Degrade silently and stay degraded for this Client: the next
+            // state change retries, and if the machine is still out of threads
+            // it will fail the same harmless way.
+        }
+    }
+
+    /// Join the heartbeat. Moves the thread out from under the lock before
+    /// joining, because the worker re-acquires kh_mutex_ on its way out.
+    void stop_heartbeat_() {
+        std::thread victim;
+        {
+            std::lock_guard<std::mutex> lock(kh_mutex_);
+            kh_stop_ = true;
+            kh_cv_.notify_all();
+            victim = std::move(kh_thread_);
+        }
+        if (victim.joinable()) victim.join();
+    }
+
+    void kh_loop_() {
+        const auto interval = std::chrono::milliseconds(
+            cfg_.keylessHeartbeatIntervalMs > 0 ? cfg_.keylessHeartbeatIntervalMs : 1);
+        for (;;) {
+            {
+                // The first tick is at +interval, NEVER immediate. That is
+                // what keeps "on by default" compatible with checkOnLaunch()
+                // doing no I/O: a plugin scan lasts seconds, so the thread is
+                // born and joined without ever emitting. Do not add an
+                // immediate beacon "so the first launch is not missed" — it
+                // breaks the free-tier invariant and the no-I/O-during-scan
+                // guarantee in one move.
+                std::unique_lock<std::mutex> lock(kh_mutex_);
+                if (kh_cv_.wait_for(lock, interval, [this]{ return kh_stop_; })) {
+                    return;
+                }
+            }
+            // Outside the lock: reportKeylessState does network I/O and is
+            // itself debounced to one report per 24h per state.
+            if (auto ks = beacon_state_for_(state())) {
+                try { reportKeylessState(*ks); } catch (...) {}
             }
         }
-        for (const auto& cb : cbs) {
-            cb(new_state);
+    }
+
+    /// Dispatch a lifecycle event with NO lock held, matching the discipline
+    /// the state listeners follow: a callback may take the caller's own locks
+    /// and may call back into the Client.
+    void notify_lifecycle_(LifecycleEvent ev) {
+        std::vector<LifecycleListener> snapshot;
+        {
+            std::lock_guard<std::mutex> lock(listeners_mutex_);
+            snapshot = lifecycle_listeners_;
+        }
+        for (const auto& l : snapshot) {
+            // One throwing listener must not cost the others their event, and
+            // must not propagate out of the SDK call that delivered it.
+            try { l.cb(ev); } catch (...) {}
+        }
+    }
+
+    /// Fire listeners when what state() reports has changed since the last
+    /// event. This is the SDK's event channel; nothing else calls listeners.
+    ///
+    /// It reports the GUARDED state for the same reason every other read
+    /// point does. A transition resolved while the clock is untrusted would
+    /// otherwise deliver, say, Trial to a subscriber while state() answered
+    /// Invalid — the paywall driven by subscribe() and the one driven by
+    /// state() would disagree, which is the exact split the guard exists to
+    /// close.
+    ///
+    /// Deduping on the REPORTED value, not the raw one, is what gives the
+    /// guard an event of its own. A clock rolled back mid-session changes no
+    /// raw state, so a raw-value dedupe would never fire and a host that
+    /// caches the last event — JUCE's audio-thread snapshot does exactly
+    /// that — would sit on a stale Licensed for the rest of the session.
+    /// refreshIfNeeded() and validate() both poll this, and
+    /// startAutoValidation() ticks refreshIfNeeded(), so both the rollback and
+    /// the later correction reach subscribers without any new machinery.
+    /// THREAD SAFETY: the ORDER of events is fixed under notify_mutex_; the
+    /// DELIVERY of them happens with no lock held.
+    ///
+    /// Both halves are load-bearing, and each was a shipped bug at some point
+    /// in this branch:
+    ///
+    /// Publishing the dedupe and then delivering outside any lock lets two
+    /// notifiers interleave — both pass the dedupe, then deliver in whatever
+    /// order the scheduler picks, and because the dedupe is already satisfied
+    /// no later poll corrects it. The subscriber is left permanently
+    /// contradicting state(), including stale-Licensed on a rolled-back clock,
+    /// which is the very fail-open this guard exists to close.
+    ///
+    /// Holding the lock across the callbacks fixes that and buys a deadlock.
+    /// It puts an SDK-internal lock into the APPLICATION's lock-order graph:
+    /// a callback that takes the app's own model mutex — the most obvious
+    /// thing a state-change handler does — deadlocks against any thread that
+    /// holds that mutex across a Client call, and refreshIfNeeded() on
+    /// focus/resume is exactly that. No contract can rescue it, because the
+    /// rule would have to be "your callback must not touch any lock any
+    /// thread holds across any Client call", which nobody can audit.
+    ///
+    /// So: append to pending_ under the lock, atomically with the dedupe, and
+    /// let ONE thread hold the delivery baton and drain the queue with no lock
+    /// held. Order is total, no application lock can invert against ours, and
+    /// a callback may re-enter the Client freely — it just queues.
+    ///
+    /// Consequence to know: validate()/refreshIfNeeded() can return before an
+    /// event queued concurrently has been delivered by the thread holding the
+    /// baton. Delivery is ordered, not synchronous.
+    void notify_() {
+        {
+            std::lock_guard<std::mutex> lock(notify_mutex_);
+            const State reported = state();
+            if (last_reported_.load() == reported) return;
+            // Order is decided HERE, atomically with the dedupe. Everything
+            // after this point may run in any order on any thread.
+            //
+            // Push BEFORE consuming the dedupe: a bad_alloc from push_back
+            // must not leave last_reported_ claiming an event nobody queued,
+            // which would lose that transition permanently.
+            pending_.push_back(reported);
+            last_reported_.store(reported);
+            if (delivering_) return;   // another thread owns the baton
+            delivering_ = true;
+        }
+
+        // The baton is a plain bool, so unlike a lock_guard it does NOT release
+        // on unwind. Anything that throws past this point — a listener, or a
+        // bad_alloc from the copies below — would leave delivering_ stuck true
+        // and every later notify_() would take the "someone else is draining"
+        // exit. The channel would be dead for the life of the Client while
+        // state() kept moving: a caching subscriber like JUCE's audio-thread
+        // snapshot would hold its last value forever, which on a rolled-back
+        // clock is a permanent fail-open.
+        //
+        // It is ONLY the unwind net. The normal exit disarms it and hands the
+        // baton back atomically with the emptiness check that makes doing so
+        // safe — see the loop. Clearing delivering_ in a SECOND critical
+        // section would open a window where the queue is empty but the baton
+        // is still held: a notifier arriving there pushes, sees delivering_,
+        // and returns believing we will drain it, and we then return having
+        // already decided the queue was empty. That event is stranded, and
+        // because the dedupe consumed its value no later poll re-queues it.
+        struct BatonGuard {
+            Client* self;
+            bool    armed = true;
+            ~BatonGuard() {
+                if (!armed) return;
+                std::lock_guard<std::mutex> lock(self->notify_mutex_);
+                self->delivering_ = false;
+            }
+        } baton_guard{this};
+
+        for (;;) {
+            State ev;
+            {
+                std::lock_guard<std::mutex> lock(notify_mutex_);
+                if (pending_.empty()) {
+                    delivering_        = false;   // atomic with the check
+                    baton_guard.armed  = false;
+                    return;
+                }
+                ev = pending_.front();
+                pending_.erase(pending_.begin());
+            }
+
+            // Copy the callbacks out so a listener can unsubscribe from inside
+            // its own callback without invalidating the iteration. A bad_alloc
+            // here strands whatever is left in pending_ — the guard hands the
+            // baton back and nothing re-queues those events. OOM-only, and
+            // strictly better than the wedged channel it replaced.
+            std::vector<std::function<void(State)>> cbs;
+            {
+                std::lock_guard<std::mutex> lock(listeners_mutex_);
+                cbs.reserve(listeners_.size());
+                for (const auto& l : listeners_) {
+                    cbs.push_back(l.cb);
+                }
+            }
+            for (const auto& cb : cbs) {
+                // Contain each listener. One that throws must not cost the
+                // others their event, and must not propagate out of an SDK
+                // call the integrator made for an unrelated reason.
+                try {
+                    cb(ev);   // NO lock held here. This is the whole point.
+                } catch (...) {
+                    // Swallowed deliberately: see the LISTENER CONTRACT on
+                    // subscribe(). There is nowhere to report it — notify_()
+                    // runs on whatever thread moved the state.
+                }
+            }
         }
     }
 
@@ -3418,6 +5727,12 @@ private:
             std::remove_if(listeners_.begin(), listeners_.end(),
                            [id](const Listener& l){ return l.id == id; }),
             listeners_.end());
+        // Ids are drawn from one counter across both lists, so a Subscription
+        // does not need to know which kind it holds.
+        lifecycle_listeners_.erase(
+            std::remove_if(lifecycle_listeners_.begin(), lifecycle_listeners_.end(),
+                           [id](const LifecycleListener& l){ return l.id == id; }),
+            lifecycle_listeners_.end());
     }
 
     // Allow Subscription to call remove_listener_

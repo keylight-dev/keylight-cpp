@@ -1,12 +1,16 @@
 #pragma once
 #include "version.hpp"
 #include "result.hpp"
+#include "clock.hpp"
+#include "lifecycle.hpp"
+#include "retry.hpp"
 #include "config.hpp"
 #include "device_info.hpp"
 #include "lease.hpp"
 #include "verifier.hpp"
 #include "transport.hpp"
 // #include "transport/httplib.hpp" // opt-in: KEYLIGHT_BUILD_HTTPLIB_TRANSPORT
+#include "chacha20poly1305.hpp"
 #include "store.hpp"
 #include "client.hpp"
 #include "keyset.hpp"

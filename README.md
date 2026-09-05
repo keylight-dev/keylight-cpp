@@ -21,8 +21,8 @@ Licensing shouldn't mean bolting a heavyweight, phone-home-or-die SDK onto your 
   network round-trip to gate a feature, no lockout when the machine is offline.
 - **Tamper-resistant by design.** Entitlements live *inside* the signature; a forged or hand-edited
   lease can't pass verification without the tenant's private key.
-- **Audio-thread safe.** `state()` reads a `std::atomic` — safe to call from JUCE audio callbacks
-  or game-thread hot paths with no lock taken.
+- **Audio-thread safe.** `state()` reads atomics only — safe to call from JUCE audio callbacks
+  or game-thread hot paths with no lock taken and nothing allocated.
 - **One SDK family.** Verifies licenses identically to the Swift, Rust, JavaScript, and C# SDKs,
   proven by shared conformance vectors.
 - **Header-only core.** Drop in `keylight_single.hpp` or use CMake FetchContent — zero mandatory
@@ -43,7 +43,10 @@ Licensing shouldn't mean bolting a heavyweight, phone-home-or-die SDK onto your 
 - [License States](#license-states)
 - [Trials](#trials)
 - [Entitlements](#entitlements)
+- [Upgrade, revalidation and lifecycle](#upgrade-revalidation-and-lifecycle)
+- [Keyless heartbeat](#keyless-heartbeat)
 - [Offline & Security](#offline--security)
+  - [Local storage](#local-storage)
 - [Configuration Reference](#configuration-reference)
 - [Cross-SDK Conformance Vectors](#cross-sdk-conformance-vectors)
 - [Documentation](#documentation)
@@ -59,7 +62,7 @@ include(FetchContent)
 FetchContent_Declare(
   keylight
   GIT_REPOSITORY https://github.com/keylight-dev/keylight-cpp.git
-  GIT_TAG        v0.1.6
+  GIT_TAG        v0.2.0
 )
 FetchContent_MakeAvailable(keylight)
 
@@ -108,7 +111,7 @@ vcpkg install "keylight[httplib-transport]"
 ### Conan
 
 ```bash
-conan install keylight/0.1.6@
+conan install keylight/0.2.0@
 ```
 
 > Conan Center submission is planned for a future release.
@@ -138,8 +141,15 @@ int main() {
         cfg.trustedKeys = ks.value();
     }
 
-    // 3. Create a FileStore (persists the verified lease between launches).
-    keylight::FileStore store(keylight::default_store_path(cfg));
+    // 3. Create the store (persists the verified lease between launches).
+    //    EncryptedFileStore binds the blob to this machine, so it cannot be
+    //    edited in a text editor or usefully copied to another machine.
+    //    migrating() also imports a pre-0.2.0 plaintext store once and then
+    //    deletes it. For a new integration that never had one, plain
+    //    `EncryptedFileStore store(keylight::default_store_path(cfg));` is enough.
+    auto store = keylight::EncryptedFileStore::migrating(
+        keylight::default_store_path(cfg),
+        keylight::legacy_plaintext_path(cfg));
 
     // 4. Construct the Client — primes state from the persisted store immediately.
     keylight::Client client(cfg, transport, store);
@@ -160,7 +170,7 @@ int main() {
         // seat locked to this device
     }
 
-    // 7. Gate features on entitlements — reads std::atomic, audio-thread safe.
+    // 7. Gate features on entitlements — mutex-guarded, NOT audio-thread safe.
     if (client.hasEntitlement("pro")) {
         // unlock pro features
     }
@@ -177,7 +187,15 @@ int main() {
 > `refreshIfNeeded()` on meaningful events (window focus, purchase, resume). The state machine
 > applies a 5-minute debounce and refreshes automatically when the cached lease is stale or
 > within 24 hours of expiry. An optional background thread is available via
-> `client.startAutoValidation()` for daemon or headless applications.
+> `client.startAutoValidation()` for daemon or headless applications. Both it and
+> `stopAutoValidation()` are safe from any thread, including from a state-change
+> listener, and neither blocks. Note `stopAutoValidation()` retires the worker rather
+> than waiting for it: one more tick can land after it returns. `~Client()` is what
+> joins. It usually returns at once — it wakes the worker before joining, so a parked
+> one exits without another cycle — but if the worker is mid-cycle it waits for up to
+> a round trip, plus every queued listener callback if that worker is delivering.
+> Since listeners are your code, that upper bound is unbounded; destroy the client
+> somewhere that can afford to wait.
 
 ## Unreal Engine
 
@@ -211,8 +229,9 @@ A JUCE adapter lives in [`integrations/juce/`](integrations/juce/) and provides:
 
 Compiles against JUCE 7 and JUCE 8 with zero extra dependencies beyond `juce_core`.
 
-> **Manual build required.** No JUCE toolchain is available in CI. A developer with JUCE 7 or 8
-> installed must compile and smoke-test before shipping. See
+> **Compiled in CI** (`.github/workflows/juce.yml`) against JUCE 8.0.6 on Linux, macOS and
+> Windows, and JUCE 7.0.12 on Linux and Windows, with an offline smoke test of the
+> query API. A live plugin round-trip in a DAW is still manual. See
 > [`integrations/juce/README.md`](integrations/juce/README.md).
 
 ## License Lifecycle
@@ -232,7 +251,7 @@ Compiles against JUCE 7 and JUCE 8 with zero extra dependencies beyond `juce_cor
 |--------|-------------|
 | `activate(key) → Result<State>` | Activates a key on this device. Verifies the returned lease before persisting. |
 | `validate() → Result<State>` | Re-checks the stored license online. Network failures are non-fatal (grace window applies). |
-| `deactivate() → Result<void>` | Releases the seat and clears local license state, even if the network call fails. |
+| `deactivate() → Result<void>` | Releases the seat and clears local license state. The local cache is cleared either way, but a server rejection is returned as an error: the seat is still consumed and only you can decide to retry. |
 | `refreshIfNeeded() → Result<State>` | Validates only if due (debounce 5 min, stale 6 h, within 24 h of expiry). With no stored license it re-resolves the local trial offline. Safe to call often. |
 | `checkOnLaunch() → Result<State>` | Revalidates a stored license; otherwise resolves the persisted local trial offline. Never starts a trial. |
 | `startTrial() → Result<State>` | Explicitly begins the local trial (idempotent; never restarts one). No network call. |
@@ -242,25 +261,47 @@ Compiles against JUCE 7 and JUCE 8 with zero extra dependencies beyond `juce_cor
 ## License States
 
 `state()` resolves a single high-level status from the cached, Ed25519-verified lease (no network
-call). It reads a `std::atomic<State>` and is safe to call from any thread.
+call). It reads atomics only and is safe to call from any thread.
 
 | State | Meaning |
 |-------|---------|
 | `Licensed` | Current, signature-valid `active` lease. |
 | `Trial` | No license, but a local trial is active. |
-| `Expired` | Trusted lease expired, or lease status is `"fallback"` / `"expired"`. |
-| `Invalid` | No trusted lease, no active trial, and no free tier. |
+| `Limited` | Trusted lease with status `"fallback"`: the server could not mint a full lease, so run degraded rather than locked. |
+| `Expired` | Trusted lease expired, or lease status is `"expired"`. |
+| `Invalid` | No trusted lease, no active trial, and no free tier. Also what `state()` reports when the system clock has been rolled back more than an hour since the last server contact. |
 | `FreeTier` | No license and no active trial, but `freeTierEnabled` is set. Also where an **elapsed** trial and a `deactivate()` land. |
 
 ```cpp
 switch (client.state()) {
-    case keylight::State::Licensed: /* full access */    break;
-    case keylight::State::Trial:    /* show trial UI */  break;
+    case keylight::State::Licensed: /* full access */      break;
+    case keylight::State::Trial:    /* show trial UI */    break;
+    case keylight::State::Limited:  /* degraded, not locked */ break;
     case keylight::State::FreeTier: /* reduced features */ break;
     case keylight::State::Expired:
-    case keylight::State::Invalid:  /* prompt activate */ break;
+    case keylight::State::Invalid:  /* prompt activate */  break;
 }
 ```
+
+`state()` is `noexcept` and audio-thread safe, and it calls the clock function you pass to the
+`Client` constructor. If you supply your own, it must be non-throwing, non-blocking and
+allocation-free — an exception escaping it is `std::terminate`, on whichever thread called
+`state()`. The default (`std::time`) already satisfies this.
+
+Subscribers registered with `subscribe()` receive the same value `state()` would return, so a
+paywall driven by events and one driven by the query API cannot disagree. Events are delivered
+in order, with no SDK lock held — your callback may take your own locks and may call back into
+the `Client`; a re-entrant call queues its event rather than recursing, so it may be delivered
+by a different thread. Two things not to do: destroy the `Client` from a callback, and throw
+from one — an exception has nowhere to go, so it is caught and swallowed and the remaining
+listeners still get the event. Note also that `unsubscribe()` does not fence a delivery already
+in flight on another thread; keep whatever your callback captures alive across that window.
+
+The clock-rollback guard raises its own event in both directions — once when the rollback is
+detected, and again when the clock becomes honest. Because a moving clock changes no underlying
+state, that event comes from `refreshIfNeeded()` or `validate()`. Call `startAutoValidation()`
+(or one of those on focus/resume) in a long-running host, or a mid-session rollback will reach
+`state()` and never reach your callback.
 
 ## Trials
 
@@ -269,12 +310,18 @@ next to the lease; the window is then measured against the local clock with no
 API call at all. (The free-tier / keyless reporting feature is separate — trial
 validity never depends on it.)
 
+**Since 0.2.0 the trial LENGTH is a dashboard setting, not a compiled-in value.**
+`Config::trialDurationDays` is the seed used before this install has ever
+reached the server; once a server value arrives it wins. Resolution order is
+server → seed → 0. Read what is actually in force with
+`effectiveTrialDurationDays()`.
+
 ```cpp
 keylight::Config cfg;
 cfg.tenantId          = "your-tenant";
 cfg.productId         = "your-product";
 cfg.sdkKey            = "sdk_live_...";
-cfg.trialDurationDays = 14;      // 0 (the default) disables trials entirely
+cfg.trialDurationDays = 14;      // SEED only — the dashboard value wins
 
 keylight::Client client(cfg, transport, store);
 
@@ -290,21 +337,35 @@ client.checkOnLaunch();          // → State::Trial (or Expired once elapsed)
 
 Rules the state machine guarantees:
 
-- **`trialDurationDays <= 0` disables trials.** Nothing is persisted and
-  `checkTrial()` stays `NotStarted`.
+- **An effective duration of 0 means no trial is granted** — `checkTrial()`
+  stays `NotStarted` and `trialDaysLeft()` is 0.
+
+  It does **not** mean nothing is written. Since 0.2.0 `startTrial()` records
+  the start timestamp regardless, because a duration of 0 is indistinguishable
+  from "the dashboard value has not arrived yet", and refusing to stamp left no
+  clock for it to measure — which is what made a dashboard-set trial do nothing
+  at all. The stamp grants nothing on its own; it only fixes *when* the window
+  starts if a duration later arrives.
 - **`checkOnLaunch()` never starts a trial.** It only resolves one the user
   already started — important for JUCE plugins, since a DAW may scan or
   instantiate a plugin without the user ever asking for a trial.
 - **`startTrial()` is idempotent.** An existing start timestamp is never
-  overwritten, so an elapsed trial cannot be restarted.
-- **A running trial elapses on its own.** `state()` is an atomic read, so it
-  never recomputes; `checkOnLaunch()` and `refreshIfNeeded()` re-resolve the
+  overwritten, so an elapsed trial cannot be restarted — and enabling trials in
+  the dashboard later does not retroactively grant one to an install that
+  already started.
+- **A running trial elapses on its own.** `state()` reads a cached snapshot, so
+  it never recomputes; `checkOnLaunch()` and `refreshIfNeeded()` re-resolve the
   trial (offline, no request) and notify subscribers, and
   `startAutoValidation()` ticks the latter for long-running hosts.
 - **Paid licensing always wins.** Activating during a trial resolves
   `Licensed`; deactivating later returns to whatever the *original* trial has
   become (`Trial` if still running, `Expired` if it elapsed meanwhile,
   `Invalid` if there never was one). Deactivation does not reset the trial clock.
+
+- **`checkTrial()` and `trialDaysLeft()` do not apply the clock-rollback guard.**
+  They are local arithmetic over the persisted start timestamp, so on a rolled-back
+  clock `checkTrial()` can report `Active` while `state()` reports `Invalid`. Gate
+  access on `state()`; use these two for display.
 
 State priority: valid paid license → active local trial → elapsed local trial →
 `Invalid`.
@@ -379,9 +440,114 @@ against the tenant's trusted keyset, applying a **300-second clock-skew** tolera
   (`fetchKeyset`) or pinned at build time via `cfg.trustedKeys["kid"] = base64_pub`.
 - `hasEntitlement` and `state()` only read from the in-memory verified-lease cache — no
   network call, no disk I/O, safe from the audio thread.
-- The on-disk lease file is a JSON blob. **The security boundary is the Ed25519 signature**, not
-  at-rest encryption — a tampered or forged lease cannot pass verification without the tenant's
-  private key.
+- **The security boundary is the Ed25519 signature.** A tampered or forged lease cannot pass
+  verification without the tenant's private key. At-rest encryption (below) is a second layer,
+  not the boundary.
+
+### Local storage
+
+Since 0.2.0 the default store is **`EncryptedFileStore`**: ChaCha20-Poly1305
+(RFC 8439, vendored — no external dependency) under a key derived from this
+machine's stable id.
+
+```cpp
+auto store = keylight::EncryptedFileStore::migrating(
+    keylight::default_store_path(cfg),        // ~/.keylight/<tenant>-<product>.bin
+    keylight::legacy_plaintext_path(cfg));    // ~/.keylight/<tenant>-<product>.lease
+```
+
+`migrating()` imports a pre-0.2.0 plaintext store once on the first read, then
+deletes it — the plaintext file is unlinked only after the encrypted copy is
+written, so an interrupted upgrade cannot lose state. For a new integration
+that never had a plaintext store, `EncryptedFileStore store(path);` is enough.
+
+`FileStore` is still supported and unchanged, for integrators supplying their
+own storage.
+
+**What encryption buys, and what it does not.** It makes the blob tamper-evident
+— editing `trialStart` in a text editor no longer extends a trial, because any
+edit fails to authenticate and reads as "no data". It makes what this SDK writes
+non-portable: a store copied to another machine will not open.
+
+It does **not** stop seat sharing. A license key shared between machines still
+yields working installs, because the API authorizes a validate on
+`(license_key, instance_id)` without checking which machine is asking. Closing
+that is a server-side change, tracked separately.
+
+Two operational consequences worth knowing before you ship it:
+
+- If a machine's stable id **changes** — hardware swap, OS reinstall, a
+  regenerated `/etc/machine-id` — the existing store no longer opens and the app
+  sees a first run. The user pays one reactivation. That is the intended cost of
+  the store not being portable.
+- On a machine that exposes **no** stable id at all (a Linux image with neither
+  `/etc/machine-id` nor the dbus fallback), the key derives from a constant.
+  Tamper resistance still holds everywhere; machine binding degrades only there,
+  and nobody is locked out.
+
+## Upgrade, revalidation and lifecycle
+
+```cpp
+// Foregrounded the app? Re-check the licence. Debounced to 60s, so calling it
+// on every focus event is fine. Per-session: a relaunch always revalidates.
+client.activeRevalidate();
+
+// After an in-app purchase, poll until the new entitlements land rather than
+// making the user relaunch. Bounded — payment webhooks lag, UIs must not hang.
+client.refreshAfterUpgrade();              // blocking, up to 30s by default
+auto fut = client.refreshAfterUpgradeAsync();
+
+// A link to the customer portal for the stored licence.
+if (auto url = client.upgradeUrl()) openInBrowser(*url);
+
+// Catch an obvious typo before it costs a round trip. Shape only — it knows
+// nothing about whether the key exists. Driven by Config::keyPrefix.
+if (!client.isValidKeyFormat(typed)) showFormatHint();
+
+// What is stored, for display. cachedLease() does NOT re-verify — use state()
+// or hasEntitlement() to decide what to unlock.
+client.hasStoredLicense();
+client.cachedLicenseKey();
+client.cachedLease();
+```
+
+**Lifecycle events** are the subset of transitions worth telling a customer
+about, as opposed to `subscribe()`, which fires on every transition:
+
+```cpp
+auto sub = client.onLifecycle([](keylight::LifecycleEvent e) {
+    switch (e) {
+        case keylight::LifecycleEvent::Renewed:   /* thank them */        break;
+        case keylight::LifecycleEvent::Cancelled: /* offer to resubscribe */ break;
+        case keylight::LifecycleEvent::Expired:   /* paywall */           break;
+        case keylight::LifecycleEvent::Restored:  /* welcome back */      break;
+    }
+});
+```
+
+Same contract as `subscribe()`: delivered with no SDK lock held, a throwing
+callback costs no other listener its event, and you must not destroy the
+`Client` from inside one.
+
+## Keyless heartbeat
+
+A background beacon reports anonymous state (trial / free tier / expired) so the
+conversion funnel reflects devices that change between launches. On by default
+at six hours:
+
+```cpp
+cfg.keylessHeartbeatIntervalMs = 6 * 60 * 60 * 1000;   // default
+cfg.keylessHeartbeatIntervalMs = 0;                    // disable entirely
+```
+
+- **Beacon only.** It never revalidates a licence, and a `Licensed` or
+  `Limited` device never beacons at all — it counts *keyless* devices.
+- **The interval is not the traffic.** The beacon is debounced to one report per
+  24h per state; the interval only decides how promptly a *change* is noticed.
+- **Plugin scanning pays nothing.** The thread is spawned on first state
+  resolution rather than in the constructor, and its first tick is at
+  `+interval`, so a `Client` built and discarded during an AU/VST3 scan is born
+  and joined without ever emitting.
 
 ## Configuration Reference
 
@@ -399,7 +565,7 @@ Populate a `keylight::Config` struct:
 | `freeTierEnabled` | `bool` | `false` | Resolve `State::FreeTier` instead of `Invalid`/`Expired` when there is no license and no active trial. See [Free Tier](#free-tier). |
 | `apiBaseUrl` | `std::string` | `https://api.keylight.dev` | Keylight API base URL. |
 | `appVersion` | `std::string` | — | Reported in activation/validation telemetry. |
-| `autoValidationIntervalMs` | `int` | `1800000` | Background auto-validation interval (ms); used only when `startAutoValidation()` is called. |
+| `autoValidationIntervalMs` | `int` | `1800000` | Background auto-validation interval (ms); used only when `startAutoValidation()` is called. A non-positive value is clamped to 1 ms rather than busy-spinning. |
 
 ## Cross-SDK Conformance Vectors
 
