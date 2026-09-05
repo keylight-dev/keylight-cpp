@@ -13,6 +13,13 @@
 - `maxOfflineDays` is now applied when state is resolved at launch. It was
   previously ignored on that path, so a tenant configuring 2 days still got the
   lease's full 7-day TTL offline.
+- **The headers are warning-free under strict flags.** `client.hpp`,
+  `ed25519.hpp` and `verifier.hpp` emitted 11 warnings on Clang under
+  `-Wextra`-class settings (JUCE applies these by default via
+  `juce_recommended_warning_flags`), which meant an integrator building with
+  `-Werror` had to carve the SDK out of it. All behaviour-neutral: three
+  omitted `PersistData` field initialisers now spelled `std::nullopt`, seven
+  signed loop indices used to subscript containers, and one dead parameter.
 
 ### Added
 

@@ -469,14 +469,12 @@ DAW should still:
 1. Copy `KeylightJuce.h` into the plugin project and add the SDK include path.
 2. Add a `Licensing` member to the `AudioProcessor`, call `checkOnLaunch()`.
 3. Build (Projucer or JUCE CMake) for at least one target (VST3 or AU).
-4. Confirm: round-trip `activate → state()` returns `Licensed`, and
-   `hasFeature("pro")` returns `true` in `processBlock` without any
-   thread-safety warnings from TSan.
+4. Confirm: compiles with no warnings, round-trip `activate → state()`
+   returns `Licensed`, and `hasFeature("pro")` returns `true` in `processBlock`
+   without any thread-safety warnings from TSan.
 
-**Expect warnings, not silence.** Under `juce::juce_recommended_warning_flags`
-— which JUCE's own CMake applies by default — the SDK headers currently emit 11
-warnings on Clang: three `-Wmissing-field-initializers` and one
-`-Wunused-parameter` from `client.hpp`, and seven `-Wsign-conversion` from
-`ed25519.hpp` and `verifier.hpp`. They are pre-existing and benign, but they are
-real, so do not treat a clean build as the pass criterion. If your project
-builds with `-Werror`, scope it to exclude the SDK's include path.
+A clean build is a fair pass criterion: the SDK headers are warning-free under
+`juce::juce_recommended_warning_flags`, which JUCE's own CMake applies by
+default, so the adapter is safe to build with `-Werror`. That is verified on
+Clang by the CI cells; if another toolchain warns from inside `include/`, treat
+it as an SDK bug and report it.

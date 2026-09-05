@@ -1164,7 +1164,7 @@ static void kl_sha512_update(KlSha512Ctx& ctx, const kl_u8* data, size_t len) {
         int space = 128 - ctx.used;
         int take  = (len < (size_t)space) ? (int)len : space;
         for (int i = 0; i < take; ++i) ctx.buf[ctx.used + i] = data[i];
-        ctx.used += take; data += take; len -= take;
+        ctx.used += take; data += take; len -= static_cast<size_t>(take);
         if (ctx.used == 128) {
             kl_sha512_block(ctx.h, ctx.buf);
             ctx.total += 128; ctx.used = 0;
@@ -1499,8 +1499,8 @@ inline bool ed25519_verify(const uint8_t* msg, size_t msg_len,
     // h = SHA-512(R ‖ A ‖ M) mod L
     // where R = sig[0..31], A = pubkey[0..31].
     kl_u8 prefix[64];
-    for (int i = 0; i < 32; ++i) prefix[i]    = sig[i];
-    for (int i = 0; i < 32; ++i) prefix[32+i] = pubkey[i];
+    for (size_t i = 0; i < 32; ++i) prefix[i]    = sig[i];
+    for (size_t i = 0; i < 32; ++i) prefix[32+i] = pubkey[i];
 
     KlSha512Ctx sha_ctx;
     kl_sha512_init(sha_ctx);
@@ -1607,11 +1607,11 @@ public:
 
             // Build the typed arrays required by ed25519_verify
             std::array<uint8_t, 32> pubkey;
-            for (int i = 0; i < 32; ++i)
+            for (size_t i = 0; i < 32; ++i)
                 pubkey[i] = static_cast<uint8_t>(pk_bytes[i]);
 
             std::array<uint8_t, 64> sig;
-            for (int i = 0; i < 64; ++i)
+            for (size_t i = 0; i < 64; ++i)
                 sig[i] = static_cast<uint8_t>(sig_bytes[i]);
 
             // Build canonical payload
@@ -2575,7 +2575,7 @@ public:
                     iid = cached_instance_id_;
                 }
             }
-            persist_({lease_json, expires_at, iid});
+            persist_({lease_json, expires_at, iid, std::nullopt});
             save_last_validated_online_(now_fn_());
         }
 
@@ -3431,7 +3431,7 @@ private:
                         int64_t v = j["license_expires_at"].as_int();
                         if (v != 0) expires_at = v;
                     }
-                    persist_({lease_json, expires_at, iid});
+                    persist_({lease_json, expires_at, iid, std::nullopt});
                     save_last_validated_online_(now);
                 }
                 State new_state = resolve_with_trial_(resolve_from_lease_(lease));
@@ -3741,7 +3741,9 @@ private:
     // ── Persist helpers ───────────────────────────────────────────────────
 
     struct PersistData {
-        // nullopt means "no lease string to write" (keep as-is)
+        // nullopt on ANY field means "the caller has nothing to say about this
+        // one" — persist_ keeps the cached value. It never means "clear it".
+        // Spell every field at the call site, including the nullopts.
         std::optional<std::string>       lease_json;
         std::optional<int64_t>           expires_at;
         std::optional<std::string>       instance_id;
@@ -3912,13 +3914,12 @@ private:
         int64_t last_lvo = load_last_validated_online_();
 
         // Attempt network refresh via validate()
-        State before = state_.load();
         auto hr = transport_.request("POST", api_url_("validate"),
                                      json_headers_(),
                                      build_validate_body_());
         if (!hr.is_ok()) {
             // Network failure — apply offline grace
-            return apply_offline_grace_(before, now, last_lvo);
+            return apply_offline_grace_(now, last_lvo);
         }
         const auto& resp = hr.value();
         if (resp.status != 200) {
@@ -3933,13 +3934,13 @@ private:
                     return Result<State>::ok(*rejected);
                 }
             }
-            return apply_offline_grace_(before, now, last_lvo);
+            return apply_offline_grace_(now, last_lvo);
         }
 
         // Parse and apply the validate response
         auto jr = Json::parse(resp.body);
         if (!jr.is_ok()) {
-            return apply_offline_grace_(before, now, last_lvo);
+            return apply_offline_grace_(now, last_lvo);
         }
         const Json& j = jr.value();
 
@@ -3965,7 +3966,7 @@ private:
                 std::lock_guard<std::mutex> lock(cache_mutex_);
                 iid = cached_instance_id_;
             }
-            persist_({lease_json, expires_at, iid});
+            persist_({lease_json, expires_at, iid, std::nullopt});
             // Update last_validated_online timestamp
             save_last_validated_online_(now);
         }
@@ -3988,7 +3989,7 @@ private:
     ///            first, then expiry.  Absent cached_lease → Expired/Invalid.
     ///   - C#:    ResolveState "stale active lease: fall through to Expired"
     ///            — the offline-grace path must not override that.
-    Result<State> apply_offline_grace_(State before, int64_t now, int64_t last_lvo) {
+    Result<State> apply_offline_grace_(int64_t now, int64_t last_lvo) {
         // Check whether the cached lease has passed its own raw expiresAt.
         // Grace cannot rescue a genuinely expired lease.
         bool lease_raw_expired = false;

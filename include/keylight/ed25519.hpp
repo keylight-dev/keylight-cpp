@@ -117,7 +117,7 @@ static void kl_sha512_update(KlSha512Ctx& ctx, const kl_u8* data, size_t len) {
         int space = 128 - ctx.used;
         int take  = (len < (size_t)space) ? (int)len : space;
         for (int i = 0; i < take; ++i) ctx.buf[ctx.used + i] = data[i];
-        ctx.used += take; data += take; len -= take;
+        ctx.used += take; data += take; len -= static_cast<size_t>(take);
         if (ctx.used == 128) {
             kl_sha512_block(ctx.h, ctx.buf);
             ctx.total += 128; ctx.used = 0;
@@ -452,8 +452,8 @@ inline bool ed25519_verify(const uint8_t* msg, size_t msg_len,
     // h = SHA-512(R ‖ A ‖ M) mod L
     // where R = sig[0..31], A = pubkey[0..31].
     kl_u8 prefix[64];
-    for (int i = 0; i < 32; ++i) prefix[i]    = sig[i];
-    for (int i = 0; i < 32; ++i) prefix[32+i] = pubkey[i];
+    for (size_t i = 0; i < 32; ++i) prefix[i]    = sig[i];
+    for (size_t i = 0; i < 32; ++i) prefix[32+i] = pubkey[i];
 
     KlSha512Ctx sha_ctx;
     kl_sha512_init(sha_ctx);
