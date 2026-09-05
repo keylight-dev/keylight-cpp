@@ -3907,6 +3907,36 @@ public:
         return cached_expires_at_;
     }
 
+    /// The cached lease, if one is stored. Returned AS-IS and deliberately not
+    /// re-verified: this is for showing a user what is on their machine, not
+    /// for deciding what to unlock. Callers that need to know whether it is
+    /// still trusted must use state() or hasEntitlement(), which verify.
+    /// Making this verify would quietly turn a display accessor into a
+    /// licensing decision.
+    std::optional<Lease> cachedLease() const {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        return cached_lease_;
+    }
+
+    /// True when a license key is stored — i.e. this install has been
+    /// activated at some point. Cheaper and more honest than inferring it
+    /// from state(), which also reflects trial and free tier.
+    bool hasStoredLicense() const {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        return cached_license_key_.has_value() && !cached_license_key_->empty();
+    }
+
+    /// The cached license key, for pre-filling a UI field or building an
+    /// upgrade link. An empty stored value reads as nullopt, so callers get
+    /// one "nothing here" answer rather than two.
+    std::optional<std::string> cachedLicenseKey() const {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        if (cached_license_key_.has_value() && cached_license_key_->empty()) {
+            return std::nullopt;
+        }
+        return cached_license_key_;
+    }
+
 private:
     // ── Clock trust ───────────────────────────────────────────────────────
 

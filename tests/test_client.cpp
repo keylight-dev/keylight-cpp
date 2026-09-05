@@ -2596,3 +2596,45 @@ TEST_CASE("config_canonical_payload matches the documented format") {
                                    1781076246LL, 1781680000LL, 0, false)
           == "cfg1|kcfg|testco|testapp|1781076246|1781680000|0|false");
 }
+
+
+TEST_CASE("Client: cached lease accessors") {
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+
+    CHECK(client.hasStoredLicense() == false);
+    CHECK(client.cachedLease().has_value() == false);
+    CHECK(client.cachedLicenseKey().has_value() == false);
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    CHECK(client.hasStoredLicense() == true);
+    REQUIRE(client.cachedLease().has_value());
+    CHECK(client.cachedLease()->status == "active");
+    REQUIRE(client.cachedLicenseKey().has_value());
+    CHECK(*client.cachedLicenseKey() == "XXXX-YYYY-ZZZZ-0001");
+}
+
+TEST_CASE("Client: cachedLease is returned as-is, not re-verified") {
+    // The docstring promises the lease comes back unverified and that callers
+    // wanting trust should use state()/hasEntitlement(). Pin that, or someone
+    // will later "helpfully" make this verify and change its meaning.
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+    seed_store_with_valid_lease(store, VALID_ACTIVE_NOW);
+
+    // Far past the lease's own expiry: state() reports Expired, but the
+    // cached lease is still handed back for a UI to display.
+    const int64_t long_after = 1781681046LL + 60 * 86400;
+    Client client(cfg, transport, store, [&]{ return long_after; }, NO_SLEEP);
+
+    CHECK(client.state() != State::Licensed);
+    REQUIRE(client.cachedLease().has_value());
+    CHECK(client.cachedLease()->status == "active");
+}
