@@ -138,8 +138,15 @@ int main() {
         cfg.trustedKeys = ks.value();
     }
 
-    // 3. Create a FileStore (persists the verified lease between launches).
-    keylight::FileStore store(keylight::default_store_path(cfg));
+    // 3. Create the store (persists the verified lease between launches).
+    //    EncryptedFileStore binds the blob to this machine, so it cannot be
+    //    edited in a text editor or usefully copied to another machine.
+    //    migrating() also imports a pre-0.2.0 plaintext store once and then
+    //    deletes it. For a new integration that never had one, plain
+    //    `EncryptedFileStore store(keylight::default_store_path(cfg));` is enough.
+    auto store = keylight::EncryptedFileStore::migrating(
+        keylight::default_store_path(cfg),
+        keylight::legacy_plaintext_path(cfg));
 
     // 4. Construct the Client — primes state from the persisted store immediately.
     keylight::Client client(cfg, transport, store);

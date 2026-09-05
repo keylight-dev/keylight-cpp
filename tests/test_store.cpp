@@ -248,3 +248,133 @@ TEST_CASE("EncryptedFileStore: an absent machine id still encrypts, and binds to
 
     std::filesystem::remove(path);
 }
+
+
+// ---------------------------------------------------------------------------
+// One-time migration from the pre-0.2.0 plaintext store.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("EncryptedFileStore: imports a plaintext store on first read") {
+    const auto dir = std::filesystem::temp_directory_path();
+    const std::string enc = (dir / "kl-mig-enc.bin").string();
+    const std::string old = (dir / "kl-mig-old.lease").string();
+    std::filesystem::remove(enc);
+
+    const std::string legacy = R"({"trialStart":1781076246,"licenseKey":"XXXX-YYYY"})";
+    { std::ofstream f(old, std::ios::binary | std::ios::trunc); f << legacy; }
+
+    keylight::EncryptedFileStore store(enc, "machine-a", old);
+    auto loaded = store.load();
+    REQUIRE(loaded.is_ok());
+
+    // Everything is imported, trial start included. Dropping it would buy
+    // nothing: deleting any store mints a fresh trial, encrypted or not.
+    CHECK(loaded.value() == legacy);
+
+    // The plaintext file is removed so the install stops producing copies.
+    CHECK(std::filesystem::exists(old) == false);
+    CHECK(std::filesystem::exists(enc) == true);
+
+    std::filesystem::remove(enc);
+}
+
+TEST_CASE("EncryptedFileStore: an existing encrypted store wins over plaintext") {
+    const auto dir = std::filesystem::temp_directory_path();
+    const std::string enc = (dir / "kl-mig-precedence-enc.bin").string();
+    const std::string old = (dir / "kl-mig-precedence-old.lease").string();
+    std::filesystem::remove(enc);
+
+    { keylight::EncryptedFileStore seed(enc, "machine-a"); REQUIRE(seed.save("current").is_ok()); }
+    { std::ofstream f(old, std::ios::binary | std::ios::trunc); f << "stale"; }
+
+    keylight::EncryptedFileStore store(enc, "machine-a", old);
+    auto loaded = store.load();
+    REQUIRE(loaded.is_ok());
+    CHECK(loaded.value() == "current");
+    // The plaintext file is never even read, so it is left alone.
+    CHECK(std::filesystem::exists(old) == true);
+
+    std::filesystem::remove(enc);
+    std::filesystem::remove(old);
+}
+
+TEST_CASE("EncryptedFileStore: no plaintext file is a clean first run") {
+    const auto dir = std::filesystem::temp_directory_path();
+    const std::string enc = (dir / "kl-mig-none-enc.bin").string();
+    const std::string old = (dir / "kl-mig-none-old.lease").string();
+    std::filesystem::remove(enc);
+    std::filesystem::remove(old);
+
+    keylight::EncryptedFileStore store(enc, "machine-a", old);
+    auto loaded = store.load();
+    REQUIRE(loaded.is_ok());
+    CHECK(loaded.value().empty());
+}
+
+TEST_CASE("EncryptedFileStore: an empty plaintext file imports nothing") {
+    const auto dir = std::filesystem::temp_directory_path();
+    const std::string enc = (dir / "kl-mig-empty-enc.bin").string();
+    const std::string old = (dir / "kl-mig-empty-old.lease").string();
+    std::filesystem::remove(enc);
+    { std::ofstream f(old, std::ios::binary | std::ios::trunc); }
+
+    keylight::EncryptedFileStore store(enc, "machine-a", old);
+    auto loaded = store.load();
+    REQUIRE(loaded.is_ok());
+    CHECK(loaded.value().empty());
+    // Nothing was imported, so nothing is written and no encrypted file appears.
+    CHECK(std::filesystem::exists(enc) == false);
+
+    std::filesystem::remove(old);
+}
+
+TEST_CASE("legacy_plaintext_path still points at the pre-0.2.0 .lease file") {
+    Config cfg;
+    cfg.tenantId  = "tenant123";
+    cfg.productId = "prod456";
+
+    // default_store_path moved to .bin with the encrypted format; the legacy
+    // helper must keep naming the old file, or migration finds nothing.
+    CHECK(default_store_path(cfg).substr(default_store_path(cfg).size() - 4) == ".bin");
+    const std::string legacy = legacy_plaintext_path(cfg);
+    CHECK(legacy.substr(legacy.size() - 6) == ".lease");
+    CHECK(legacy.find("tenant123") != std::string::npos);
+    CHECK(legacy.find("prod456")   != std::string::npos);
+}
+
+TEST_CASE("EncryptedFileStore::migrating is the README's call, and it works") {
+    // The README tells integrators to use this exact form. Exercising it here
+    // is what stops the documented call from drifting away from the API — an
+    // unverified snippet is how the JUCE adapter shipped a non-compiling
+    // signature.
+    //
+    // Temp paths, not default_store_path(): migrating() DELETES the legacy
+    // file it imports, and no test may be able to remove something from the
+    // developer's real ~/.keylight.
+    const auto dir = std::filesystem::temp_directory_path();
+    const std::string enc      = (dir / "kl-mig-factory-enc.bin").string();
+    const std::string old_path = (dir / "kl-mig-factory-old.lease").string();
+    std::filesystem::remove(enc);
+
+    const std::string legacy = R"({"licenseKey":"XXXX-YYYY"})";
+    { std::ofstream f(old_path, std::ios::binary | std::ios::trunc); f << legacy; }
+
+    auto store = keylight::EncryptedFileStore::migrating(enc, old_path);
+    auto loaded = store.load();
+    REQUIRE(loaded.is_ok());
+
+    // Binds to the real machine id, so the import round-trips on this machine.
+    CHECK(loaded.value() == legacy);
+    CHECK(std::filesystem::exists(old_path) == false);
+
+    std::filesystem::remove(enc);
+}
+
+TEST_CASE("default_store_path and legacy_plaintext_path do not collide") {
+    // Migration reads one and writes the other. If they resolved to the same
+    // file, save() would truncate the source mid-import.
+    Config cfg;
+    cfg.tenantId  = "tenant123";
+    cfg.productId = "prod456";
+    CHECK(default_store_path(cfg) != legacy_plaintext_path(cfg));
+}

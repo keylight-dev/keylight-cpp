@@ -118,8 +118,12 @@ private:
 // ---------------------------------------------------------------------------
 // default_store_path — sensible per-tenant/per-product path
 //
-// POSIX: $HOME/.keylight/<tenantId>-<productId>.lease
-// Fallback: /tmp/.keylight/<tenantId>-<productId>.lease
+// POSIX: $HOME/.keylight/<tenantId>-<productId>.bin
+// Fallback: /tmp/.keylight/<tenantId>-<productId>.bin
+//
+// The extension changed with the encrypted format, so a 0.2.0 store never
+// collides with the plaintext file it migrated from — and so pointing a plain
+// FileStore at this path cannot silently overwrite a pre-0.2.0 store.
 // ---------------------------------------------------------------------------
 inline std::string default_store_path(const Config& cfg) {
     namespace fs = std::filesystem;
@@ -128,8 +132,21 @@ inline std::string default_store_path(const Config& cfg) {
     fs::path base = home ? fs::path(home) / ".keylight"
                          : fs::temp_directory_path() / ".keylight";
 
-    std::string filename = cfg.tenantId + "-" + cfg.productId + ".lease";
+    std::string filename = cfg.tenantId + "-" + cfg.productId + ".bin";
     return (base / filename).string();
+}
+
+// The pre-0.2.0 plaintext store location. Kept only so 0.2.0 can import it
+// once; nothing writes here any more. Pass it as EncryptedFileStore's third
+// argument to enable that import.
+inline std::string legacy_plaintext_path(const Config& cfg) {
+    namespace fs = std::filesystem;
+
+    const char* home = std::getenv("HOME");
+    fs::path base = home ? fs::path(home) / ".keylight"
+                         : fs::temp_directory_path() / ".keylight";
+
+    return (base / (cfg.tenantId + "-" + cfg.productId + ".lease")).string();
 }
 
 namespace detail {
@@ -195,15 +212,60 @@ inline std::string store_binding_id() {
 // ---------------------------------------------------------------------------
 class EncryptedFileStore : public LicenseStore {
 public:
-    EncryptedFileStore(std::string path, std::string machine_id)
-        : path_(std::move(path)), key_(detail::derive_store_key(machine_id)) {}
+    // `legacy_path`, when set, is a pre-0.2.0 plaintext store to import once.
+    EncryptedFileStore(std::string path, std::string machine_id,
+                       std::string legacy_path = std::string())
+        : path_(std::move(path)),
+          legacy_path_(std::move(legacy_path)),
+          key_(detail::derive_store_key(machine_id)) {}
 
     explicit EncryptedFileStore(std::string path)
         : EncryptedFileStore(std::move(path), detail::store_binding_id()) {}
 
+    /// The migrating default: bind to this machine, and import a pre-0.2.0
+    /// plaintext store once if one is there.
+    ///
+    /// This exists so an integrator never has to reach into `detail::` for the
+    /// machine id. The three-argument constructor takes an explicit id because
+    /// tests need to pin it; ordinary callers want this.
+    static EncryptedFileStore migrating(std::string path,
+                                        std::string legacy_path) {
+        return EncryptedFileStore(std::move(path), detail::store_binding_id(),
+                                  std::move(legacy_path));
+    }
+
     Result<std::string> load() override {
         namespace fs = std::filesystem;
         try {
+            // One-time migration from the pre-0.2.0 plaintext store.
+            //
+            // Everything is imported, trial start included. Gating any of it
+            // buys nothing: deleting a store mints a fresh trial whether or
+            // not it was encrypted, and a lease copied from a pre-0.2.0
+            // install is no more useful than a shared license key. What this
+            // DOES buy is that the supply dries up — once an install upgrades,
+            // its plaintext file is gone and never regenerated.
+            //
+            // See spec section 4.3: seat sharing is a protocol gap, closed by
+            // binding an instance to machine_hash server-side, not here.
+            if (!legacy_path_.empty() && !fs::exists(path_) && fs::exists(legacy_path_)) {
+                std::ifstream lf(legacy_path_, std::ios::binary);
+                if (lf) {
+                    const std::string legacy((std::istreambuf_iterator<char>(lf)),
+                                              std::istreambuf_iterator<char>());
+                    lf.close();
+                    if (!legacy.empty()) {
+                        // Only unlink once the encrypted copy is safely on
+                        // disk — a crash between the two must not lose state.
+                        if (save(legacy).is_ok()) {
+                            std::error_code ec;
+                            fs::remove(legacy_path_, ec);
+                        }
+                        return Result<std::string>::ok(legacy);
+                    }
+                }
+            }
+
             if (!fs::exists(path_)) return Result<std::string>::ok(std::string{});
 
             std::ifstream f(path_, std::ios::binary);
@@ -293,6 +355,7 @@ public:
 
 private:
     std::string                path_;
+    std::string                legacy_path_;
     std::array<uint8_t, 32>    key_;
 };
 
