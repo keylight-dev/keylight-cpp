@@ -3532,11 +3532,12 @@ public:
     }
 
     Result<State> startTrial() {
-        if (cfg_.trialDurationDays <= 0) {
-            // Trials disabled — nothing is persisted and no state changes.
-            return report_(state_.load());
-        }
-
+        // The stamp is written even when the effective duration is currently
+        // 0. The duration is a server-owned setting that can arrive AFTER
+        // first launch, and bailing out here left no clock for it to measure —
+        // a dashboard-set trial then did nothing at all. The stamp is honored
+        // as-is forever after: enabling trials later does not retroactively
+        // grant one to an install that already started.
         bool started = false;
         {
             std::lock_guard<std::mutex> lock(cache_mutex_);
@@ -3560,8 +3561,11 @@ public:
     /// Current local trial status. Never performs I/O beyond reading the
     /// in-memory cache primed from the store.
     TrialStatus checkTrial() const {
-        if (cfg_.trialDurationDays <= 0) {
-            return TrialStatus::NotStarted;
+        // Read the duration BEFORE taking cache_mutex_ — the accessor takes it
+        // too, and it is not recursive.
+        const int duration = effectiveTrialDurationDays();
+        if (duration <= 0) {
+            return TrialStatus::NotStarted;   // trials off
         }
         std::optional<int64_t> start;
         {
@@ -3571,14 +3575,15 @@ public:
         if (!start.has_value()) {
             return TrialStatus::NotStarted;
         }
-        return days_left_from_(*start) > 0 ? TrialStatus::Active
-                                           : TrialStatus::Expired;
+        return days_left_from_(*start, duration) > 0 ? TrialStatus::Active
+                                                     : TrialStatus::Expired;
     }
 
     /// Whole days remaining in the local trial; 0 when disabled, not started,
     /// or elapsed. Matches keylight-rust's `days_left` (seconds / 86400).
     int trialDaysLeft() const {
-        if (cfg_.trialDurationDays <= 0) {
+        const int duration = effectiveTrialDurationDays();
+        if (duration <= 0) {
             return 0;
         }
         std::optional<int64_t> start;
@@ -3589,7 +3594,7 @@ public:
         if (!start.has_value()) {
             return 0;
         }
-        int64_t left = days_left_from_(*start);
+        int64_t left = days_left_from_(*start, duration);
         return left > 0 ? static_cast<int>(left) : 0;
     }
 
@@ -4574,11 +4579,13 @@ private:
     /// Elapsed time is seconds / 86400 (matching keylight-rust check_trial),
     /// clamped at zero so a wall clock that moved backwards cannot extend the
     /// window past its configured length.
-    int64_t days_left_from_(int64_t start) const {
+    /// Takes the duration as a parameter rather than reading cfg_, so the
+    /// three call sites cannot drift apart once the value is server-owned.
+    int64_t days_left_from_(int64_t start, int duration_days) const {
         int64_t elapsed_secs = now_fn_() - start;
         if (elapsed_secs < 0) elapsed_secs = 0;
         int64_t days_elapsed = elapsed_secs / 86400;
-        return static_cast<int64_t>(cfg_.trialDurationDays) - days_elapsed;
+        return static_cast<int64_t>(duration_days) - days_elapsed;
     }
 
     // ── Device identity helpers ───────────────────────────────────────────
@@ -4660,11 +4667,11 @@ private:
                 // Free tier outranks an elapsed trial: keylight-rust's
                 // `_ if free_tier_enabled` arm sits AFTER the trial match, so a
                 // lapsed trial drops to the free tier rather than the paywall.
-                return cfg_.freeTierEnabled ? State::FreeTier : State::Expired;
+                return effectiveFreeTierEnabled() ? State::FreeTier : State::Expired;
             case TrialStatus::NotStarted:
                 break;
         }
-        return cfg_.freeTierEnabled ? State::FreeTier : State::Invalid;
+        return effectiveFreeTierEnabled() ? State::FreeTier : State::Invalid;
     }
 
     /// Re-resolve the current state offline. When any paid-licensing material

@@ -344,7 +344,19 @@ TEST_CASE("Instance id: startTrial mints one for conversion attribution") {
     CHECK(store.str_field("freeTierInstanceId").size() == 36);
 }
 
-TEST_CASE("Instance id: trials disabled means startTrial mints nothing") {
+TEST_CASE("Instance id: startTrial mints one even at a zero duration") {
+    // Inverted from the old contract, deliberately. A zero effective duration
+    // no longer means "trials are disabled" — it is indistinguishable from
+    // "the server config has not arrived yet", so startTrial() now stamps and
+    // mints unconditionally.
+    //
+    // Minting only when the duration is already non-zero was the alternative,
+    // and it loses attribution: an install that starts offline would stamp
+    // without an id, and nothing calls startTrial() a second time once the
+    // duration lands, so a trial that later converts would carry no id to
+    // attribute it by. The id is anonymous, per-install, and never derived
+    // from a licence or from hardware, so minting it early costs nothing that
+    // the trial→convert funnel does not pay for.
     auto cfg = make_config(0);
     RecordingTransport transport;
     MemStore           store;
@@ -352,7 +364,7 @@ TEST_CASE("Instance id: trials disabled means startTrial mints nothing") {
 
     Client client(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
     REQUIRE(client.startTrial().is_ok());
-    CHECK_FALSE(store.has_field("freeTierInstanceId"));
+    CHECK(store.has_field("freeTierInstanceId"));
 }
 
 TEST_CASE("Instance id: survives activate and validate") {
