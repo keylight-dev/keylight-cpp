@@ -44,6 +44,7 @@ Licensing shouldn't mean bolting a heavyweight, phone-home-or-die SDK onto your 
 - [Trials](#trials)
 - [Entitlements](#entitlements)
 - [Offline & Security](#offline--security)
+  - [Local storage](#local-storage)
 - [Configuration Reference](#configuration-reference)
 - [Cross-SDK Conformance Vectors](#cross-sdk-conformance-vectors)
 - [Documentation](#documentation)
@@ -422,9 +423,50 @@ against the tenant's trusted keyset, applying a **300-second clock-skew** tolera
   (`fetchKeyset`) or pinned at build time via `cfg.trustedKeys["kid"] = base64_pub`.
 - `hasEntitlement` and `state()` only read from the in-memory verified-lease cache — no
   network call, no disk I/O, safe from the audio thread.
-- The on-disk lease file is a JSON blob. **The security boundary is the Ed25519 signature**, not
-  at-rest encryption — a tampered or forged lease cannot pass verification without the tenant's
-  private key.
+- **The security boundary is the Ed25519 signature.** A tampered or forged lease cannot pass
+  verification without the tenant's private key. At-rest encryption (below) is a second layer,
+  not the boundary.
+
+### Local storage
+
+Since 0.2.0 the default store is **`EncryptedFileStore`**: ChaCha20-Poly1305
+(RFC 8439, vendored — no external dependency) under a key derived from this
+machine's stable id.
+
+```cpp
+auto store = keylight::EncryptedFileStore::migrating(
+    keylight::default_store_path(cfg),        // ~/.keylight/<tenant>-<product>.bin
+    keylight::legacy_plaintext_path(cfg));    // ~/.keylight/<tenant>-<product>.lease
+```
+
+`migrating()` imports a pre-0.2.0 plaintext store once on the first read, then
+deletes it — the plaintext file is unlinked only after the encrypted copy is
+written, so an interrupted upgrade cannot lose state. For a new integration
+that never had a plaintext store, `EncryptedFileStore store(path);` is enough.
+
+`FileStore` is still supported and unchanged, for integrators supplying their
+own storage.
+
+**What encryption buys, and what it does not.** It makes the blob tamper-evident
+— editing `trialStart` in a text editor no longer extends a trial, because any
+edit fails to authenticate and reads as "no data". It makes what this SDK writes
+non-portable: a store copied to another machine will not open.
+
+It does **not** stop seat sharing. A license key shared between machines still
+yields working installs, because the API authorizes a validate on
+`(license_key, instance_id)` without checking which machine is asking. Closing
+that is a server-side change, tracked separately.
+
+Two operational consequences worth knowing before you ship it:
+
+- If a machine's stable id **changes** — hardware swap, OS reinstall, a
+  regenerated `/etc/machine-id` — the existing store no longer opens and the app
+  sees a first run. The user pays one reactivation. That is the intended cost of
+  the store not being portable.
+- On a machine that exposes **no** stable id at all (a Linux image with neither
+  `/etc/machine-id` nor the dbus fallback), the key derives from a constant.
+  Tamper resistance still holds everywhere; machine binding degrades only there,
+  and nobody is locked out.
 
 ## Configuration Reference
 

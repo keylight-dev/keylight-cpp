@@ -39,6 +39,25 @@
   tolerance behind `last_seen`. It deliberately omits the forward-jump half of
   keylight-rust's `clock_manipulated()`, because going offline for a while is
   governed by `maxOfflineDays`, not by this guard.
+- **Transient HTTP failures are retried** — 408, 429, 5xx and network errors,
+  up to three attempts with exponential backoff from 500ms, honouring
+  `Retry-After` on a 429 (clamped to an hour, so a hostile value cannot park
+  the calling thread). A rate limit is no longer a flat activation failure for
+  the end user. Every other 4xx is treated as the server's final answer and is
+  not retried. Note the cost: a call that used to fail fast can now take the
+  sum of the backoffs before it returns.
+- `HttpResponse::headers`, with names lowercased. Appended last, so existing
+  `{status, body}` aggregate initialisation still compiles. A custom
+  `Transport` that does not populate it simply loses `Retry-After` and falls
+  back to plain exponential backoff.
+- **`EncryptedFileStore`** — ChaCha20-Poly1305 (RFC 8439, vendored) with a key
+  derived from this machine's stable id. A store copied to another machine no
+  longer opens. Anything undecryptable reads as "no data" rather than an error,
+  so a truncated file from a crash degrades instead of failing.
+- **`EncryptedFileStore::migrating(path, legacy_path)`** — the form integrators
+  want: binds to this machine and imports a pre-0.2.0 plaintext store once.
+- **`legacy_plaintext_path(cfg)`** — the pre-0.2.0 `.lease` location, to hand
+  to `migrating()`.
 
 ### Changed
 
@@ -131,6 +150,43 @@
   succeeding. The local cache is still cleared either way.
 - Errors from the API now carry the server's message ("License key not found",
   "Activation limit reached") instead of a bare `"activate HTTP 422"`.
+- **Breaking:** the default store path moved from
+  `~/.keylight/<tenant>-<product>.lease` to the same name with a `.bin`
+  extension. Existing plaintext stores are imported once on first read and then
+  deleted, so licensed users and users mid-trial keep their state and see
+  nothing. The import is unconditional — trial start included — and the
+  plaintext file is unlinked only after the encrypted copy is safely written.
+
+  This matters if you construct your own store. `default_store_path(cfg)` now
+  names a different file, so a plain `FileStore` pointed at it will not find a
+  pre-0.2.0 store; it will also not overwrite one. Use
+  `EncryptedFileStore::migrating(default_store_path(cfg), legacy_plaintext_path(cfg))`
+  — what the README now shows.
+- The default store path is no longer where the SDK's own docs pointed a
+  `FileStore`; `FileStore` remains supported for integrators supplying their
+  own storage, and is unchanged.
+
+### Security
+
+- **The local store is no longer plaintext.** Editing `trialStart` with a text
+  editor to extend a trial no longer works: the blob is authenticated, so any
+  edit fails to open and reads as "no data".
+- **What this does NOT do — stated plainly, because it is easy to overread.**
+  It does not stop seat sharing. A license key shared between machines still
+  yields working installs, because the API authorizes a validate on
+  `(license_key, instance_id)` without checking which machine is asking. What
+  encryption buys is tamper resistance, non-portability of what this SDK
+  writes, and a drying supply of harvestable plaintext files. Closing seat
+  sharing requires binding an instance to `machine_hash` server-side and is
+  tracked separately.
+- A machine whose stable id CHANGES — hardware swap, OS reinstall, regenerated
+  `/etc/machine-id` — cannot open its existing store and sees a first run,
+  costing the user one reactivation. That is the intended cost of the store not
+  being portable.
+- On a machine that exposes no stable id at all (a Linux image with neither
+  `/etc/machine-id` nor the dbus fallback), the key derives from a constant.
+  Tamper resistance still holds; machine binding degrades only there. Nobody is
+  locked out.
 
 ## [0.1.6] - 2026-09-03
 
