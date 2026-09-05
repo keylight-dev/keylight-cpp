@@ -1,12 +1,17 @@
 name: JUCE adapter
 
 # Proves integrations/juce/KeylightJuce.h compiles and links against a real
-# JUCE toolchain on every push — across Linux/macOS/Windows and both JUCE 7
-# and JUCE 8. Replaces the manual "compile it in a real plugin" verification.
-
+# JUCE toolchain — across Linux/macOS/Windows and both JUCE 7 and JUCE 8.
+# Replaces the manual "compile it in a real plugin" verification.
+#
+# Runs on pushes to ANY branch, not just main. This header cannot be compiled
+# from the repo's own CMake build (no JUCE dependency), so a change to it is
+# unverified until this workflow runs — and a main-only trigger meant that was
+# not until a PR existed. A signature change that failed all five cells reached
+# a branch head that way. The path filter keeps the cost to pushes that
+# actually touch the adapter or the SDK headers.
 on:
   push:
-    branches: ["main"]
     paths:
       - "integrations/juce/**"
       - "include/**"

@@ -45,7 +45,10 @@
   `const juce::String&`. Source-compatible — a literal or a `juce::String`
   both convert — but it fixes a heap allocation on the audio thread: binding
   `hasFeature("pro")` to a `const String&` materialised a temporary
-  `juce::String` on every `processBlock` call, in release builds too.
+  `juce::String` on every `processBlock` call, in release builds too. The
+  allocation is only removed at the default `JUCE_STRING_UTF_TYPE == 8`; at 16
+  or 32 `StringRef` holds a `juce::String` member and a literal allocates
+  again.
 - **JUCE:** `hasFeature()` is documented as returning `false` for every key
   other than `"pro"`. That was always the behaviour; the docstring claimed it
   cached the last subscribed feature. Cache additional entitlements yourself —

@@ -192,8 +192,10 @@ no worker outlives the client.
 
 **Usually it returns at once.** The destructor wakes the worker before it
 joins, so a worker parked in its interval wait exits without another cycle.
-Since 0.2.0 `stopAutoValidation()` does *not* wait for anything; whatever
-waiting is left happens in the destructor.
+Since 0.2.0 `stopAutoValidation()` does *not* wait for the worker it retires;
+whatever waiting is left happens in the destructor. (It does join any
+previously-retired worker that has already finished — bounded by thread
+teardown, never by the network.)
 
 It blocks only when the worker is mid-cycle: up to one network round trip, plus
 every listener callback for every queued event if that worker is delivering.

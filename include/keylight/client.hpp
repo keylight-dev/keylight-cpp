@@ -271,8 +271,11 @@ public:
             for (auto& w : av_retired_) to_join.workers.push_back(std::move(w));
             av_retired_.clear();
         }
-        // The only join in the lifecycle. Outside the lock, because a worker
-        // mid-refresh needs av_mutex_ to notice the epoch moved.
+        // The only place a LIVE worker is joined. (start/stop also join, but
+        // only workers that already published `done` — bounded by thread
+        // teardown, never by the network or a listener.) Outside the lock,
+        // because a worker mid-refresh needs av_mutex_ to notice the epoch
+        // moved.
         //
         // Destroying a Client from its own worker thread — i.e. from a
         // state-change listener — self-joins and terminates. That is
@@ -715,12 +718,17 @@ public:
     ///
     /// LIFECYCLE MODEL — read this before changing anything here.
     ///
-    /// Workers are retired by EPOCH, and start/stop NEVER join. A worker
-    /// captures av_epoch_ when it is spawned and exits the first time it sees
-    /// a different one; stop simply bumps the epoch and wakes it. Neither
-    /// function ever releases av_mutex_ mid-body, so there is no window for a
-    /// concurrent caller to act on a half-changed state, and no caller ever
-    /// blocks on another thread.
+    /// Workers are retired by EPOCH, and start/stop never join a LIVE one. A
+    /// worker captures av_epoch_ when it is spawned and exits the first time
+    /// it sees a different one; stop simply bumps the epoch and wakes it.
+    /// Neither function ever releases av_mutex_ mid-body, so there is no
+    /// window for a concurrent caller to act on a half-changed state.
+    ///
+    /// Both DO join already-exited workers, through the Reaper below — that is
+    /// how retired threads get cleaned up. Those joins are bounded by thread
+    /// teardown: such a worker has already left av_loop_, so the join can never
+    /// wait on the network or on a listener. No caller blocks on work another
+    /// thread has yet to do.
     ///
     /// That is the entire point. The previous model had start and stop join
     /// the worker, which meant releasing av_mutex_ mid-body, which needed a
@@ -770,11 +778,15 @@ public:
     /// from a state-change listener delivered on the worker thread itself.
     /// Idempotent: safe when nothing is running.
     ///
-    /// Returns immediately. It does NOT join — see the lifecycle model on
-    /// startAutoValidation(). The worker will not begin another cycle, but one
-    /// already inside refreshIfNeeded() finishes that call first, so a tick or
-    /// a state-change event can still land shortly after this returns.
-    /// ~Client() joins, so no worker outlives the Client.
+    /// Returns immediately. It does NOT wait for the worker it retires — see
+    /// the lifecycle model on startAutoValidation(). That worker will not begin
+    /// another cycle, but one already inside refreshIfNeeded() finishes that
+    /// call first, so a tick or a state-change event can still land shortly
+    /// after this returns. ~Client() is what joins it, so no worker outlives
+    /// the Client.
+    ///
+    /// (It does join any PREVIOUSLY retired worker that has already finished —
+    /// bounded by thread teardown. See startAutoValidation().)
     void stopAutoValidation() {
         Reaper reap;   // joins on unwind — see startAutoValidation()
         {
@@ -1937,7 +1949,8 @@ private:
 
     /// The auto-validation worker. Runs until the epoch it was spawned with
     /// is no longer current — which is how both stopAutoValidation() and
-    /// ~Client() retire it, without either of them joining.
+    /// ~Client() retire it. stopAutoValidation() then returns without waiting
+    /// for it; ~Client() joins it.
     void av_loop_(uint64_t epoch) {
         // Clamp: wait_for() with a non-positive duration returns immediately,
         // so a misconfigured interval turns the worker into a busy-spin that

@@ -600,13 +600,13 @@ public:
 
     /// Returns true iff the named entitlement/feature is currently enabled.
     ///
-    /// IMPORTANT: to remain audio-thread safe, this method uses a pre-cached
-    /// std::atomic<bool> per-entitlement.  The per-feature atomics are
-    /// refreshed from the message/background thread on every state change via
-    /// the SDK subscription.
+    /// IMPORTANT: to remain audio-thread safe this reads a pre-cached
+    /// std::atomic<bool>. There is exactly ONE such cache, for "pro", and it
+    /// is refreshed from the message/background thread on every state change
+    /// via the SDK subscription. There is no per-entitlement cache and no
+    /// per-feature refresh.
     ///
-    /// For the common "pro" entitlement: call hasFeature("pro") — reads
-    /// pro_enabled_ atomically.
+    /// So: call hasFeature("pro") — reads pro_enabled_ atomically.
     ///
     /// ANY OTHER KEY ALWAYS RETURNS FALSE. generic_entitlement_enabled_ is a
     /// placeholder that nothing ever writes; it is not a cache of "the feature
@@ -621,11 +621,25 @@ public:
     /// and the documented call site for this method is inside processBlock.
     /// StringRef wraps the pointer without copying, so the audio thread does
     /// no allocation. Do not "simplify" this signature back.
+    ///
+    /// PRECONDITION: that holds only at JUCE_STRING_UTF_TYPE == 8, the
+    /// default. At 16 or 32, StringRef carries a juce::String member and its
+    /// const char* constructor allocates — silently restoring exactly the
+    /// audio-thread allocation this signature exists to remove. If you change
+    /// that setting, cache the result yourself outside processBlock.
     bool hasFeature(juce::StringRef feature) const noexcept
     {
         // Fast path for the canonical "pro" entitlement — atomic bool.
         // This covers the vast majority of plugins that have a single pro tier.
-        if (feature == "pro")
+        //
+        // The juce::StringRef() is REQUIRED, not stylistic. `feature == "pro"`
+        // does not compile: StringRef declares operator==(const String&) AND
+        // operator==(StringRef), and both String(const char*) and
+        // StringRef(const char*) are non-explicit — so a char array has two
+        // equally-ranked user-defined conversions and the call is ambiguous.
+        // Naming StringRef makes it an exact match, which outranks every
+        // conversion candidate.
+        if (feature == juce::StringRef("pro"))
             return pro_enabled_.load(std::memory_order_relaxed);
 
         // Any other key: always false. See the note above — nothing writes
@@ -688,9 +702,12 @@ private:
     {
         bool pro = client_->hasEntitlement("pro");
         pro_enabled_.store(pro, std::memory_order_relaxed);
-        // generic_entitlement_enabled_ is not meaningful without a target feature;
-        // it defaults to false until callers explicitly populate it.
-        // (Advanced users: extend this pattern with their own atomics.)
+        // generic_entitlement_enabled_ is not meaningful without a target
+        // feature, and NOTHING writes it — not here, not anywhere. It is
+        // private, so no caller or subclass can populate it either. Every
+        // hasFeature() key other than "pro" is therefore permanently false.
+        // Integrators who need a second entitlement add their own atomic and
+        // refresh it from their own onStateChanged (see README).
     }
 
     // Join any running worker thread before launching a new one.

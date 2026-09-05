@@ -4,12 +4,17 @@ Adds Keylight license management to your JUCE VST/AU/AAX plugin with zero
 extra dependencies.  Networking goes through JUCE's own `juce::URL` and
 `juce::InputStream`; no OpenSSL, no cpp-httplib, nothing extra to vendor.
 
-> **Compile-verified in CI; live round-trip still manual.** Every push builds
-> this adapter against real JUCE (7.0.12 **and** 8.0.6) on Linux/macOS/Windows
-> via `.github/workflows/juce.yml`, and runs an offline smoke test of the
-> audio-thread-safe API. What CI does *not* yet cover: building a real VST/AU
-> plugin with it and a live `activate → Licensed` round-trip against the API
-> (see [Verification](#verification) below).
+> **Compile-verified in CI; live round-trip still manual.**
+> `.github/workflows/juce.yml` builds this adapter against real JUCE — 8.0.6 on
+> Linux, macOS and Windows, and 7.0.12 on Linux and Windows — and runs an
+> offline smoke test of the audio-thread-safe API. Five cells: JUCE 7 on macOS
+> is deliberately excluded (the workflow says why).
+>
+> It triggers on **every push and every pull request** that touches
+> `integrations/juce/`, `include/`, or the workflow file itself — on any
+> branch, not just `main`. A change that touches none of those runs no cells.
+> What CI does not cover at all: building a real VST/AU plugin and a live
+> `activate → Licensed` round-trip (see [Verification](#verification) below).
 
 ---
 
@@ -270,7 +275,7 @@ deleted, and there is nothing else.
 | Method / event | Thread | Blocks? |
 |---|---|---|
 | `state()` | **Any thread**, audio-thread safe | **No.** One relaxed atomic load |
-| `hasFeature(feature)` | **Any thread**, audio-thread safe | **No.** Takes `juce::StringRef`, so a literal allocates nothing; then one relaxed atomic load. Any key other than `"pro"` is always `false` — see below |
+| `hasFeature(feature)` | **Any thread**, audio-thread safe | **No**, at the default `JUCE_STRING_UTF_TYPE == 8`. Takes `juce::StringRef`, so a literal allocates nothing; then one relaxed atomic load. At UTF 16/32 a literal *does* allocate — see below. Any key other than `"pro"` is always `false` — see below |
 | `startAutoValidation()` / `stopAutoValidation()` | **Any thread** | **Effectively no.** Neither waits on a worker, a network call or a listener. Each does reap already-exited workers, so the only cost is thread teardown |
 | `onStateChanged` | Fires on **message thread** via `callAsync` | n/a — your callback's cost is yours |
 | Completion callbacks (`activate`, etc.) | Delivered on **message thread** via `callAsync` | n/a |
@@ -289,6 +294,12 @@ and `hasFeature()` being atomic mirrors.
 deliberate: binding a `"pro"` literal to a `const String&` would materialise a
 temporary `juce::String` and heap-allocate on the audio thread — in release
 builds too. `StringRef` wraps the pointer without copying.
+
+**That holds only at `JUCE_STRING_UTF_TYPE == 8`**, which is JUCE's default and
+what CI builds. At 16 or 32, `StringRef` carries a `juce::String stringCopy`
+member and its `const char*` constructor allocates into it — silently restoring
+the exact audio-thread allocation the signature exists to remove. If you change
+that setting, hoist the call out of `processBlock` and cache the result.
 
 **`hasFeature()` only answers for `"pro"`.** Any other key returns `false`
 unconditionally; the generic slot behind it is a placeholder nothing writes. To
@@ -364,12 +375,15 @@ it, and not only at teardown; see the two sections above.
 The audio thread (`processBlock`) must never block, allocate, or lock.
 `hasFeature("pro")` must therefore not touch any mutex or heap allocation.
 
-The adapter achieves this with two `std::atomic` fields inside `Licensing`:
+The adapter achieves this with `std::atomic` fields inside `Licensing`:
 
 ```
-std::atomic<keylight::State>  state_snapshot_
-std::atomic<bool>             pro_enabled_
+std::atomic<keylight::State>  state_snapshot_              // mirrors state()
+std::atomic<bool>             pro_enabled_                 // mirrors hasEntitlement("pro")
+std::atomic<bool>             generic_entitlement_enabled_ // always false; see hasFeature()
 ```
+
+The first two are maintained; the third is a placeholder nothing writes.
 
 These are updated by an SDK event subscription registered in the `Licensing`
 constructor.  Whenever the `keylight::Client` transitions state — after
@@ -437,9 +451,10 @@ Override by passing a `storePath` to the `Licensing` constructor.
 
 ## Verification
 
-> **Compiled in CI** (`.github/workflows/juce.yml`) against JUCE 7.0.12 and
-> 8.0.6 on Linux/macOS/Windows, with an offline smoke test of the query API
-> (`integrations/juce/citest/`). A live plugin round-trip is still manual.
+> **Compiled in CI** (`.github/workflows/juce.yml`) against JUCE 8.0.6 on
+> Linux, macOS and Windows, and 7.0.12 on Linux and Windows, with an offline
+> smoke test of the query API (`integrations/juce/citest/`). A live plugin
+> round-trip is still manual.
 
 The adapter code is written against the JUCE 7/8 public API
 (`juce::URL`, `juce::URL::InputStreamOptions`, `juce::File::getSpecialLocation`,
@@ -454,6 +469,14 @@ DAW should still:
 1. Copy `KeylightJuce.h` into the plugin project and add the SDK include path.
 2. Add a `Licensing` member to the `AudioProcessor`, call `checkOnLaunch()`.
 3. Build (Projucer or JUCE CMake) for at least one target (VST3 or AU).
-4. Confirm: compiles cleanly with no warnings, round-trip `activate → state()`
-   returns `Licensed`, `hasFeature("pro")` returns `true` in `processBlock`
-   without any thread-safety warnings from TSan.
+4. Confirm: round-trip `activate → state()` returns `Licensed`, and
+   `hasFeature("pro")` returns `true` in `processBlock` without any
+   thread-safety warnings from TSan.
+
+**Expect warnings, not silence.** Under `juce::juce_recommended_warning_flags`
+— which JUCE's own CMake applies by default — the SDK headers currently emit 11
+warnings on Clang: three `-Wmissing-field-initializers` and one
+`-Wunused-parameter` from `client.hpp`, and seven `-Wsign-conversion` from
+`ed25519.hpp` and `verifier.hpp`. They are pre-existing and benign, but they are
+real, so do not treat a clean build as the pass criterion. If your project
+builds with `-Werror`, scope it to exclude the SDK's include path.
