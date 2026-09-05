@@ -69,3 +69,44 @@ TEST_CASE("chacha20: RFC 8439 section 2.4.2 encryption") {
     chacha20_xor(key.data(), 1, nonce.data(), ct.data(), ct.size(), back.data());
     CHECK(std::string(back.begin(), back.end()) == pt);
 }
+
+TEST_CASE("poly1305: RFC 8439 section 2.5.2") {
+    auto key = from_hex(
+        "85d6be7857556d337f4452fe42d506a8"
+        "0103808afb0db2fd4abff6af4149f51b");
+    const std::string msg = "Cryptographic Forum Research Group";
+
+    Poly1305 p;
+    p.init(key.data());
+    p.update(reinterpret_cast<const uint8_t*>(msg.data()), msg.size());
+    uint8_t mac[16];
+    p.finish(mac);
+
+    CHECK(to_hex(mac, 16) == "a8061dc1305136c6c22b8baf0c0127a9");
+}
+
+TEST_CASE("poly1305: a split update matches a single update") {
+    // The buffering path (partial blocks across update() calls) is where a
+    // hand-rolled MAC usually goes wrong, and the AEAD below relies on it.
+    auto key = from_hex(
+        "85d6be7857556d337f4452fe42d506a8"
+        "0103808afb0db2fd4abff6af4149f51b");
+    const std::string msg = "Cryptographic Forum Research Group";
+
+    Poly1305 whole;
+    whole.init(key.data());
+    whole.update(reinterpret_cast<const uint8_t*>(msg.data()), msg.size());
+    uint8_t mac_whole[16];
+    whole.finish(mac_whole);
+
+    Poly1305 split;
+    split.init(key.data());
+    for (size_t i = 0; i < msg.size(); i += 7) {
+        const size_t n = (msg.size() - i) < 7 ? (msg.size() - i) : 7;
+        split.update(reinterpret_cast<const uint8_t*>(msg.data()) + i, n);
+    }
+    uint8_t mac_split[16];
+    split.finish(mac_split);
+
+    CHECK(to_hex(mac_whole, 16) == to_hex(mac_split, 16));
+}
