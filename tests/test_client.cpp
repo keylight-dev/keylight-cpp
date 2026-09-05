@@ -2771,3 +2771,86 @@ TEST_CASE("Client: the activeRevalidate debounce is per-session, not persisted")
     CHECK(relaunched.activeRevalidate() == true);
     CHECK(transport.calls_made == 1);
 }
+
+
+TEST_CASE("Client: refreshAfterUpgrade returns true when entitlements change") {
+    auto cfg = make_config();
+    ScriptedTransport transport;
+    MemoryStore       store;
+
+    transport.replies = {
+        {200, ACTIVATE_RESPONSE, {}},           // activate -> Licensed
+        {200, FALLBACK_VALIDATE_RESPONSE, {}},  // validate -> Limited
+    };
+
+    std::vector<uint64_t> slept;
+    Client client(cfg, transport, store,
+                  []{ return VALID_ACTIVE_NOW; },
+                  [&](uint64_t ms){ slept.push_back(ms); });
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    // refreshAfterUpgrade returns true on an entitlements change OR a state
+    // change; this drives the state edge, which needs no new fixture.
+    CHECK(client.refreshAfterUpgrade(30000, 2000) == true);
+    CHECK(client.state() == State::Limited);
+}
+
+TEST_CASE("Client: refreshAfterUpgrade gives up at the timeout") {
+    auto cfg = make_config();
+    ScriptedTransport transport;
+    MemoryStore       store;
+
+    // The server never reports a change — payment webhook lag that never
+    // resolves inside the window. The normal cadence applies it later.
+    transport.replies = {
+        {200, ACTIVATE_RESPONSE, {}},
+        {200, VALIDATE_RESPONSE, {}},
+    };
+
+    std::vector<uint64_t> slept;
+    int64_t now = VALID_ACTIVE_NOW;
+    // The injected sleep advances the test clock, or the deadline is never
+    // reached and this loops forever.
+    Client client(cfg, transport, store,
+                  [&]{ return now; },
+                  [&](uint64_t ms){ slept.push_back(ms);
+                                    now += static_cast<int64_t>(ms) / 1000; });
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    CHECK(client.refreshAfterUpgrade(5000, 1000) == false);
+    // Bounded: it polls, it does not spin.
+    CHECK(slept.size() <= 5);
+    CHECK(slept.size() >= 1);
+}
+
+TEST_CASE("Client: refreshAfterUpgrade does nothing without a stored license") {
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+
+    CHECK(client.refreshAfterUpgrade(1000, 100) == false);
+    CHECK(transport.calls_made == 0);
+}
+
+TEST_CASE("Client: refreshAfterUpgrade does not spin on a non-positive interval") {
+    // A caller passing 0 would otherwise poll the API as fast as the loop runs.
+    auto cfg = make_config();
+    ScriptedTransport transport;
+    MemoryStore       store;
+    transport.replies = {
+        {200, ACTIVATE_RESPONSE, {}},
+        {200, VALIDATE_RESPONSE, {}},
+    };
+
+    std::vector<uint64_t> slept;
+    int64_t now = VALID_ACTIVE_NOW;
+    Client client(cfg, transport, store,
+                  [&]{ return now; },
+                  [&](uint64_t ms){ slept.push_back(ms);
+                                    now += static_cast<int64_t>(ms) / 1000 + 1; });
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    CHECK(client.refreshAfterUpgrade(3000, 0) == false);
+    for (uint64_t ms : slept) CHECK(ms > 0);
+}

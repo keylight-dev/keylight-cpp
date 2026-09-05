@@ -3937,6 +3937,61 @@ public:
         return cached_license_key_;
     }
 
+    /// Poll the server after a customer-initiated upgrade so new entitlements
+    /// appear in the running app without waiting for the normal cadence.
+    ///
+    /// Bounded on purpose: payment-webhook lag means the tier is not updated
+    /// server-side the instant the customer pays, but an unbounded poll would
+    /// hang a UI. If the change never lands inside the window the normal
+    /// foreground/launch cadence applies it later.
+    ///
+    /// A seat-only upgrade (more devices, identical entitlements) is not
+    /// "observed" here — there is nothing to unlock in the running app, and the
+    /// higher device limit is enforced server-side at activation.
+    ///
+    /// Blocking for up to timeoutMs. Use refreshAfterUpgradeAsync from a UI.
+    bool refreshAfterUpgrade(int timeoutMs = 30000, int pollIntervalMs = 2000) {
+        if (!hasStoredLicense()) return false;
+
+        std::vector<std::string> before_entitlements;
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            if (cached_lease_.has_value()) before_entitlements = cached_lease_->entitlements;
+        }
+        std::sort(before_entitlements.begin(), before_entitlements.end());
+        const State before_state = state_.load();
+
+        // Never sleep zero or negative: a caller-supplied non-positive interval
+        // would spin the API.
+        const uint64_t interval = pollIntervalMs > 0
+            ? static_cast<uint64_t>(pollIntervalMs) : 100;
+        const int64_t  deadline = now_fn_() + (timeoutMs > 0 ? timeoutMs / 1000 : 0);
+
+        for (;;) {
+            (void)validate();
+
+            std::vector<std::string> after_entitlements;
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                if (cached_lease_.has_value()) after_entitlements = cached_lease_->entitlements;
+            }
+            std::sort(after_entitlements.begin(), after_entitlements.end());
+
+            if (after_entitlements != before_entitlements || state_.load() != before_state) {
+                return true;
+            }
+            if (now_fn_() >= deadline) return false;
+            sleep_fn_(interval);
+        }
+    }
+
+    std::future<bool> refreshAfterUpgradeAsync(int timeoutMs      = 30000,
+                                               int pollIntervalMs = 2000) {
+        return std::async(std::launch::async, [this, timeoutMs, pollIntervalMs] {
+            return refreshAfterUpgrade(timeoutMs, pollIntervalMs);
+        });
+    }
+
     /// Force a re-validation on active use (app foregrounded, popover opened),
     /// debounced to 60s. Call this whenever the user brings the app forward so
     /// a dashboard revoke takes effect within minutes instead of waiting for a
