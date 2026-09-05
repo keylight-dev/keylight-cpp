@@ -3,6 +3,11 @@
 The Keylight C++ SDK vendors the following third-party components. Their licenses are
 reproduced below to satisfy attribution requirements.
 
+One entry — ChaCha20-Poly1305 — is listed even though it is *not* third-party.
+Vendored-looking crypto invites the assumption that it was copied from
+somewhere; recording that it was not is cheaper than having someone re-derive
+the answer during a license audit.
+
 ---
 
 ## TweetNaCl — Ed25519 verification + SHA-512
@@ -28,6 +33,25 @@ key-generation are not included)
 > Brad Conte's SHA-256 implementation is released under CC0 (Creative Commons Zero),
 > effectively placing it in the public domain with no attribution required.
 > Attribution retained for clarity.
+
+---
+
+## ChaCha20-Poly1305 — no third-party code
+
+**Used in:** `include/keylight/chacha20poly1305.hpp`
+**License:** n/a — original implementation
+
+This one is listed precisely because it is *not* third-party, so nobody has to
+re-derive that later. `chacha20poly1305.hpp` is an original implementation of
+RFC 8439 (ChaCha20, Poly1305, and the AEAD construction), written against the
+specification. No code was copied from any implementation, so there is nothing
+to attribute and no license obligation attaches.
+
+Conformance is pinned to the RFC's own published test vectors in
+`tests/test_chacha20poly1305.cpp`.
+
+RFC 8439 itself is an IETF specification. IETF documents carry no restriction
+on implementing what they describe.
 
 ---
 

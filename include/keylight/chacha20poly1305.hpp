@@ -239,5 +239,72 @@ private:
     bool     final_    = false;
 };
 
+// AEAD_CHACHA20_POLY1305 (RFC 8439 section 2.8), with no associated data —
+// the store has none, and an unused AAD parameter is a footgun.
+//
+// `ct` must have room for `pt_len` bytes. `pt` and `ct` may alias.
+inline void aead_seal(const uint8_t key[32], const uint8_t nonce[12],
+                      const uint8_t* pt, size_t pt_len,
+                      uint8_t* ct, uint8_t tag[16]) {
+    // Block 0 of the keystream is the one-time Poly1305 key; the message
+    // starts at block 1.
+    uint8_t poly_key[64];
+    chacha20_block(key, 0, nonce, poly_key);
+
+    if (pt_len > 0) chacha20_xor(key, 1, nonce, pt, pt_len, ct);
+
+    Poly1305 p;
+    p.init(poly_key);
+
+    static const uint8_t kZeros[16] = {0};
+    if (pt_len > 0) {
+        p.update(ct, pt_len);
+        const size_t rem = pt_len % 16;
+        if (rem) p.update(kZeros, 16 - rem);
+    }
+
+    uint8_t lens[16];
+    cc_store64_le(lens,     0);          // AAD length
+    cc_store64_le(lens + 8, static_cast<uint64_t>(pt_len));
+    p.update(lens, 16);
+    p.finish(tag);
+}
+
+// Returns false on tag mismatch. `pt` is only written when the tag verifies,
+// so a caller can never accidentally consume unauthenticated plaintext.
+inline bool aead_open(const uint8_t key[32], const uint8_t nonce[12],
+                      const uint8_t* ct, size_t ct_len,
+                      const uint8_t tag[16], uint8_t* pt) {
+    uint8_t poly_key[64];
+    chacha20_block(key, 0, nonce, poly_key);
+
+    Poly1305 p;
+    p.init(poly_key);
+
+    static const uint8_t kZeros[16] = {0};
+    if (ct_len > 0) {
+        p.update(ct, ct_len);
+        const size_t rem = ct_len % 16;
+        if (rem) p.update(kZeros, 16 - rem);
+    }
+
+    uint8_t lens[16];
+    cc_store64_le(lens,     0);
+    cc_store64_le(lens + 8, static_cast<uint64_t>(ct_len));
+    p.update(lens, 16);
+
+    uint8_t expected[16];
+    p.finish(expected);
+
+    // Constant-time compare: an early return would leak how many leading tag
+    // bytes an attacker guessed correctly.
+    uint8_t diff = 0;
+    for (int i = 0; i < 16; ++i) diff |= static_cast<uint8_t>(expected[i] ^ tag[i]);
+    if (diff != 0) return false;
+
+    if (ct_len > 0) chacha20_xor(key, 1, nonce, ct, ct_len, pt);
+    return true;
+}
+
 } // namespace detail
 } // namespace keylight

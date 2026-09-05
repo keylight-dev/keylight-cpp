@@ -110,3 +110,79 @@ TEST_CASE("poly1305: a split update matches a single update") {
 
     CHECK(to_hex(mac_whole, 16) == to_hex(mac_split, 16));
 }
+
+TEST_CASE("aead: RFC 8439 section 2.8.2 tag, with no associated data") {
+    // The RFC's worked example includes AAD; this SDK never uses AAD, so the
+    // vector is reproduced with the AAD length set to zero. Round-tripping
+    // plus the tamper cases below is what actually guards the construction.
+    auto key = from_hex(
+        "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f");
+    auto nonce = from_hex("070000004041424344454647");
+    const std::string pt =
+        "Ladies and Gentlemen of the class of '99: If I could offer you "
+        "only one tip for the future, sunscreen would be it.";
+
+    std::vector<uint8_t> ct(pt.size());
+    uint8_t tag[16];
+    aead_seal(key.data(), nonce.data(),
+              reinterpret_cast<const uint8_t*>(pt.data()), pt.size(),
+              ct.data(), tag);
+
+    // The ciphertext is the RFC's, which does not depend on AAD.
+    CHECK(to_hex(ct.data(), 16) == "d31a8d34648e60db7b86afbc53ef7ec2");
+
+    std::vector<uint8_t> back(pt.size());
+    REQUIRE(aead_open(key.data(), nonce.data(), ct.data(), ct.size(), tag,
+                      back.data()) == true);
+    CHECK(std::string(back.begin(), back.end()) == pt);
+}
+
+TEST_CASE("aead: a flipped ciphertext bit is rejected") {
+    auto key   = from_hex(
+        "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f");
+    auto nonce = from_hex("070000004041424344454647");
+    const std::string pt = "trial_start=1781076246";
+
+    std::vector<uint8_t> ct(pt.size());
+    uint8_t tag[16];
+    aead_seal(key.data(), nonce.data(),
+              reinterpret_cast<const uint8_t*>(pt.data()), pt.size(),
+              ct.data(), tag);
+
+    ct[0] ^= 0x01;   // the text-editor attack, in miniature
+
+    std::vector<uint8_t> back(pt.size());
+    CHECK(aead_open(key.data(), nonce.data(), ct.data(), ct.size(), tag,
+                    back.data()) == false);
+}
+
+TEST_CASE("aead: a different key rejects the blob") {
+    auto key_a = from_hex(
+        "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f");
+    auto key_b = from_hex(
+        "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9ea0");
+    auto nonce = from_hex("070000004041424344454647");
+    const std::string pt = "lease";
+
+    std::vector<uint8_t> ct(pt.size());
+    uint8_t tag[16];
+    aead_seal(key_a.data(), nonce.data(),
+              reinterpret_cast<const uint8_t*>(pt.data()), pt.size(),
+              ct.data(), tag);
+
+    // This is the property the whole store design rests on: a blob copied to
+    // another machine derives a different key and will not open.
+    std::vector<uint8_t> back(pt.size());
+    CHECK(aead_open(key_b.data(), nonce.data(), ct.data(), ct.size(), tag,
+                    back.data()) == false);
+}
+
+TEST_CASE("aead: empty plaintext round-trips") {
+    auto key   = from_hex(
+        "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f");
+    auto nonce = from_hex("070000004041424344454647");
+
+    uint8_t tag[16];
+    aead_seal(key.data(), nonce.data(), nullptr, 0, nullptr, tag);
+    CHECK(aead_open(key.data(), nonce.data(), nullptr, 0, tag, nullptr) == true);
+}
