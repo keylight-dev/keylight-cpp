@@ -254,6 +254,80 @@ inline bool clock_rolled_back(int64_t last_seen, int64_t now) {
 } // namespace keylight
 
 // ──────────────────────────────────────────────────────────────────────────
+// include/keylight/lifecycle.hpp
+// ──────────────────────────────────────────────────────────────────────────
+
+// keylight/lifecycle.hpp — license state and lifecycle transitions.
+// lifecycle_event is ported from keylight-rust keylight/src/state.rs.
+//
+// The transition table is cross-SDK. Changing an arm here diverges C++ from
+// Rust and Swift silently, so it is pinned by tests rather than reasoned about
+// at each call site.
+//
+// `State` lives here rather than in client.hpp because two headers now need
+// it and it has no dependencies of its own. client.hpp includes this.
+
+
+namespace keylight {
+
+// ---------------------------------------------------------------------------
+// State — high-level license state (C++ subset of Rust/C# states)
+// ---------------------------------------------------------------------------
+enum class State {
+    Licensed,   // trusted, unexpired active lease
+    Trial,      // no license; within trial window
+    Expired,    // trusted lease expired, or license status "expired"
+    Invalid,    // no trusted lease, no active trial
+    FreeTier,   // no license and no trial, but the product offers a free tier.
+                // Appended last on purpose: renumbering the values above would
+                // break any integrator that persisted a State as an integer.
+    Limited,    // trusted lease with server status "fallback": the server could
+                // not mint a full lease, so the app runs degraded rather than
+                // locked. Appended last for the same reason as FreeTier —
+                // renumbering would break any integrator that persisted a
+                // State as an integer.
+};
+
+// ---------------------------------------------------------------------------
+// LifecycleEvent — the subset of transitions worth telling a customer about.
+//
+// Distinct from a state-change subscription, which fires on EVERY transition.
+// "Your licence renewed" is an event; "we re-resolved to the same state" is
+// not, and a customer-facing notification driven off the latter is noise.
+// ---------------------------------------------------------------------------
+enum class LifecycleEvent {
+    Renewed,    // still licensed, expiry moved later
+    Cancelled,  // was licensed, now expired or degraded
+    Expired,    // reached Expired from anything that was not already Expired
+    Restored,   // reached Licensed from a non-licensed state
+};
+
+// `expiry_moved_later` is true when the newly observed expiry is later than the
+// previous one, including the case where there was no previous expiry.
+inline std::optional<LifecycleEvent> lifecycle_event(State prev,
+                                                     State next,
+                                                     bool  expiry_moved_later) {
+    if (prev == State::Licensed && next == State::Licensed) {
+        if (expiry_moved_later) return LifecycleEvent::Renewed;
+        return std::nullopt;
+    }
+    if (prev == State::Licensed &&
+        (next == State::Expired || next == State::Limited)) {
+        return LifecycleEvent::Cancelled;
+    }
+    if (next == State::Licensed &&
+        (prev == State::Expired || prev == State::Limited || prev == State::Invalid)) {
+        return LifecycleEvent::Restored;
+    }
+    if (next == State::Expired && prev != State::Expired) {
+        return LifecycleEvent::Expired;
+    }
+    return std::nullopt;
+}
+
+} // namespace keylight
+
+// ──────────────────────────────────────────────────────────────────────────
 // include/keylight/retry.hpp
 // ──────────────────────────────────────────────────────────────────────────
 
@@ -2864,23 +2938,7 @@ inline std::string config_canonical_payload(const std::string& kid,
 
 namespace keylight {
 
-// ---------------------------------------------------------------------------
-// State — high-level license state (C++ subset of Rust/C# states)
-// ---------------------------------------------------------------------------
-enum class State {
-    Licensed,   // trusted, unexpired active lease
-    Trial,      // no license; within trial window
-    Expired,    // trusted lease expired, or license status "expired"
-    Invalid,    // no trusted lease, no active trial
-    FreeTier,   // no license and no trial, but the product offers a free tier.
-                // Appended last on purpose: renumbering the values above would
-                // break any integrator that persisted a State as an integer.
-    Limited,    // trusted lease with server status "fallback": the server could
-                // not mint a full lease, so the app runs degraded rather than
-                // locked. Appended last for the same reason as FreeTier —
-                // renumbering would break any integrator that persisted a
-                // State as an integer.
-};
+// `State` now lives in lifecycle.hpp, which this header includes.
 
 // ---------------------------------------------------------------------------
 // TrialStatus — local, offline-first trial (mirrors keylight-rust TrialStatus)
@@ -3815,10 +3873,41 @@ public:
     /// Callbacks are dispatched on whichever thread happens to be draining the
     /// event queue, which is NOT necessarily the thread that caused the
     /// transition. UI/audio hosts must marshal to their own thread.
-    Subscription on(const std::string& /*event*/,
+    /// Recognized lifecycle names ("renewed", "cancelled", "expired",
+    /// "restored") register a filtered lifecycle listener that fires only on
+    /// that event, invoking the callback with the state at that moment.
+    /// "change" and any UNRECOGNIZED name fall through to subscribe(), which
+    /// preserves the behaviour every existing caller relies on.
+    Subscription on(const std::string& event,
                     std::function<void(State)> cb)
     {
-        return subscribe(std::move(cb));
+        std::optional<LifecycleEvent> want;
+        if      (event == "renewed")   want = LifecycleEvent::Renewed;
+        else if (event == "cancelled") want = LifecycleEvent::Cancelled;
+        else if (event == "expired")   want = LifecycleEvent::Expired;
+        else if (event == "restored")  want = LifecycleEvent::Restored;
+
+        if (!want.has_value()) return subscribe(std::move(cb));
+
+        const LifecycleEvent target = *want;
+        return onLifecycle([this, target, cb](LifecycleEvent ev) {
+            if (ev == target) cb(state());
+        });
+    }
+
+    /// Register a callback for lifecycle events (renewal, cancellation,
+    /// expiry, restoration). Separate from subscribe(), which fires on every
+    /// state transition: a lifecycle event is the subset worth telling a
+    /// customer about, and a notification driven off every transition is noise.
+    ///
+    /// Same contract as subscribe(): delivered with no SDK lock held, a
+    /// throwing callback costs no other listener its event, and you must not
+    /// destroy the Client from inside one.
+    Subscription onLifecycle(std::function<void(LifecycleEvent)> cb) {
+        std::lock_guard<std::mutex> lock(listeners_mutex_);
+        uint64_t id = ++next_listener_id_;
+        lifecycle_listeners_.push_back({id, std::move(cb)});
+        return Subscription(this, id);
     }
 
     /// Subscribe to all state transitions. Returns a Subscription RAII handle.
@@ -4171,9 +4260,18 @@ private:
         uint64_t                   id;
         std::function<void(State)> cb;
     };
-    mutable std::mutex        listeners_mutex_;
-    std::vector<Listener>     listeners_;
-    uint64_t                  next_listener_id_ = 0;
+    struct LifecycleListener {
+        uint64_t                            id;
+        std::function<void(LifecycleEvent)> cb;
+    };
+    mutable std::mutex             listeners_mutex_;
+    std::vector<Listener>          listeners_;
+    std::vector<LifecycleListener> lifecycle_listeners_;
+    uint64_t                       next_listener_id_ = 0;
+
+    // Last expiry observed by set_state_, for deciding "moved later". Not
+    // persisted: a renewal is a transition seen within one session.
+    std::optional<int64_t>         last_seen_expiry_;
     // Guards the event ORDER (pending_ + delivering_ + the dedupe), never the
     // delivery itself — see notify_(). Never nested with listeners_mutex_,
     // cache_mutex_ or av_mutex_ — each is taken and released on its own — and
@@ -5246,8 +5344,41 @@ private:
     /// only because its sole caller is the constructor, where nobody can have
     /// subscribed yet; a second caller would silently swallow a transition.
     void set_state_(State new_state) {
+        const State   prev         = state_.load();
+        std::optional<int64_t> expiry;
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            expiry = cached_expires_at_;
+        }
+        // nullopt -> value counts as "later": a first observed expiry on a
+        // live licence is a renewal, not an absence of one.
+        const bool moved_later =
+            expiry.has_value() &&
+            (!last_seen_expiry_.has_value() || *expiry > *last_seen_expiry_);
+        last_seen_expiry_ = expiry;
+
         state_.store(new_state);
         notify_();
+
+        if (auto ev = lifecycle_event(prev, new_state, moved_later)) {
+            notify_lifecycle_(*ev);
+        }
+    }
+
+    /// Dispatch a lifecycle event with NO lock held, matching the discipline
+    /// the state listeners follow: a callback may take the caller's own locks
+    /// and may call back into the Client.
+    void notify_lifecycle_(LifecycleEvent ev) {
+        std::vector<LifecycleListener> snapshot;
+        {
+            std::lock_guard<std::mutex> lock(listeners_mutex_);
+            snapshot = lifecycle_listeners_;
+        }
+        for (const auto& l : snapshot) {
+            // One throwing listener must not cost the others their event, and
+            // must not propagate out of the SDK call that delivered it.
+            try { l.cb(ev); } catch (...) {}
+        }
     }
 
     /// Fire listeners when what state() reports has changed since the last
@@ -5390,6 +5521,12 @@ private:
             std::remove_if(listeners_.begin(), listeners_.end(),
                            [id](const Listener& l){ return l.id == id; }),
             listeners_.end());
+        // Ids are drawn from one counter across both lists, so a Subscription
+        // does not need to know which kind it holds.
+        lifecycle_listeners_.erase(
+            std::remove_if(lifecycle_listeners_.begin(), lifecycle_listeners_.end(),
+                           [id](const LifecycleListener& l){ return l.id == id; }),
+            lifecycle_listeners_.end());
     }
 
     // Allow Subscription to call remove_listener_

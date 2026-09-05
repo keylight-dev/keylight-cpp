@@ -2854,3 +2854,98 @@ TEST_CASE("Client: refreshAfterUpgrade does not spin on a non-positive interval"
     CHECK(client.refreshAfterUpgrade(3000, 0) == false);
     for (uint64_t ms : slept) CHECK(ms > 0);
 }
+
+
+TEST_CASE("Client: onLifecycle fires Restored when a license activates") {
+    // The pure transition table is covered in test_lifecycle.cpp. This covers
+    // the wiring — that set_state_ actually computes and dispatches an event —
+    // which the table tests cannot see.
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    std::vector<LifecycleEvent> events;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+    auto sub = client.onLifecycle([&](LifecycleEvent e){ events.push_back(e); });
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    REQUIRE(events.size() >= 1);
+    CHECK(events.front() == LifecycleEvent::Restored);
+}
+
+TEST_CASE("Client: on(\"restored\") routes to the lifecycle channel") {
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    std::vector<State> seen;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+    auto sub = client.on("restored", [&](State s){ seen.push_back(s); });
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    REQUIRE(seen.size() == 1);
+    CHECK(seen[0] == State::Licensed);
+}
+
+TEST_CASE("Client: an unrecognized event name still subscribes to every change") {
+    // Existing callers pass "change", and some pass anything at all. Routing
+    // only known lifecycle names must not silently drop the rest on the floor.
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    std::vector<State> change_seen, bogus_seen;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+    auto a = client.on("change",       [&](State s){ change_seen.push_back(s); });
+    auto b = client.on("not-an-event", [&](State s){ bogus_seen.push_back(s); });
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    CHECK(change_seen.size() >= 1);
+    CHECK(bogus_seen.size() == change_seen.size());
+}
+
+TEST_CASE("Client: unsubscribing a lifecycle listener stops delivery") {
+    // Both listener kinds draw ids from one counter, so remove_listener_ has
+    // to clear either list. A Subscription does not know which kind it holds.
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    std::vector<LifecycleEvent> events;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+    {
+        auto sub = client.onLifecycle([&](LifecycleEvent e){ events.push_back(e); });
+    }   // RAII unsubscribe
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    CHECK(events.empty());
+}
+
+TEST_CASE("Client: a throwing lifecycle listener costs no other listener its event") {
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    int delivered = 0;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+    auto a = client.onLifecycle([](LifecycleEvent){ throw std::runtime_error("boom"); });
+    auto b = client.onLifecycle([&](LifecycleEvent){ ++delivered; });
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    CHECK(delivered == 1);
+}
