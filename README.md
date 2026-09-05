@@ -43,6 +43,8 @@ Licensing shouldn't mean bolting a heavyweight, phone-home-or-die SDK onto your 
 - [License States](#license-states)
 - [Trials](#trials)
 - [Entitlements](#entitlements)
+- [Upgrade, revalidation and lifecycle](#upgrade-revalidation-and-lifecycle)
+- [Keyless heartbeat](#keyless-heartbeat)
 - [Offline & Security](#offline--security)
   - [Local storage](#local-storage)
 - [Configuration Reference](#configuration-reference)
@@ -60,7 +62,7 @@ include(FetchContent)
 FetchContent_Declare(
   keylight
   GIT_REPOSITORY https://github.com/keylight-dev/keylight-cpp.git
-  GIT_TAG        v0.1.6
+  GIT_TAG        v0.2.0
 )
 FetchContent_MakeAvailable(keylight)
 
@@ -109,7 +111,7 @@ vcpkg install "keylight[httplib-transport]"
 ### Conan
 
 ```bash
-conan install keylight/0.1.6@
+conan install keylight/0.2.0@
 ```
 
 > Conan Center submission is planned for a future release.
@@ -308,12 +310,18 @@ next to the lease; the window is then measured against the local clock with no
 API call at all. (The free-tier / keyless reporting feature is separate — trial
 validity never depends on it.)
 
+**Since 0.2.0 the trial LENGTH is a dashboard setting, not a compiled-in value.**
+`Config::trialDurationDays` is the seed used before this install has ever
+reached the server; once a server value arrives it wins. Resolution order is
+server → seed → 0. Read what is actually in force with
+`effectiveTrialDurationDays()`.
+
 ```cpp
 keylight::Config cfg;
 cfg.tenantId          = "your-tenant";
 cfg.productId         = "your-product";
 cfg.sdkKey            = "sdk_live_...";
-cfg.trialDurationDays = 14;      // 0 (the default) disables trials entirely
+cfg.trialDurationDays = 14;      // SEED only — the dashboard value wins
 
 keylight::Client client(cfg, transport, store);
 
@@ -329,13 +337,22 @@ client.checkOnLaunch();          // → State::Trial (or Expired once elapsed)
 
 Rules the state machine guarantees:
 
-- **`trialDurationDays <= 0` disables trials.** Nothing is persisted and
-  `checkTrial()` stays `NotStarted`.
+- **An effective duration of 0 means no trial is granted** — `checkTrial()`
+  stays `NotStarted` and `trialDaysLeft()` is 0.
+
+  It does **not** mean nothing is written. Since 0.2.0 `startTrial()` records
+  the start timestamp regardless, because a duration of 0 is indistinguishable
+  from "the dashboard value has not arrived yet", and refusing to stamp left no
+  clock for it to measure — which is what made a dashboard-set trial do nothing
+  at all. The stamp grants nothing on its own; it only fixes *when* the window
+  starts if a duration later arrives.
 - **`checkOnLaunch()` never starts a trial.** It only resolves one the user
   already started — important for JUCE plugins, since a DAW may scan or
   instantiate a plugin without the user ever asking for a trial.
 - **`startTrial()` is idempotent.** An existing start timestamp is never
-  overwritten, so an elapsed trial cannot be restarted.
+  overwritten, so an elapsed trial cannot be restarted — and enabling trials in
+  the dashboard later does not retroactively grant one to an install that
+  already started.
 - **A running trial elapses on its own.** `state()` reads a cached snapshot, so
   it never recomputes; `checkOnLaunch()` and `refreshIfNeeded()` re-resolve the
   trial (offline, no request) and notify subscribers, and
@@ -467,6 +484,70 @@ Two operational consequences worth knowing before you ship it:
   `/etc/machine-id` nor the dbus fallback), the key derives from a constant.
   Tamper resistance still holds everywhere; machine binding degrades only there,
   and nobody is locked out.
+
+## Upgrade, revalidation and lifecycle
+
+```cpp
+// Foregrounded the app? Re-check the licence. Debounced to 60s, so calling it
+// on every focus event is fine. Per-session: a relaunch always revalidates.
+client.activeRevalidate();
+
+// After an in-app purchase, poll until the new entitlements land rather than
+// making the user relaunch. Bounded — payment webhooks lag, UIs must not hang.
+client.refreshAfterUpgrade();              // blocking, up to 30s by default
+auto fut = client.refreshAfterUpgradeAsync();
+
+// A link to the customer portal for the stored licence.
+if (auto url = client.upgradeUrl()) openInBrowser(*url);
+
+// Catch an obvious typo before it costs a round trip. Shape only — it knows
+// nothing about whether the key exists. Driven by Config::keyPrefix.
+if (!client.isValidKeyFormat(typed)) showFormatHint();
+
+// What is stored, for display. cachedLease() does NOT re-verify — use state()
+// or hasEntitlement() to decide what to unlock.
+client.hasStoredLicense();
+client.cachedLicenseKey();
+client.cachedLease();
+```
+
+**Lifecycle events** are the subset of transitions worth telling a customer
+about, as opposed to `subscribe()`, which fires on every transition:
+
+```cpp
+auto sub = client.onLifecycle([](keylight::LifecycleEvent e) {
+    switch (e) {
+        case keylight::LifecycleEvent::Renewed:   /* thank them */        break;
+        case keylight::LifecycleEvent::Cancelled: /* offer to resubscribe */ break;
+        case keylight::LifecycleEvent::Expired:   /* paywall */           break;
+        case keylight::LifecycleEvent::Restored:  /* welcome back */      break;
+    }
+});
+```
+
+Same contract as `subscribe()`: delivered with no SDK lock held, a throwing
+callback costs no other listener its event, and you must not destroy the
+`Client` from inside one.
+
+## Keyless heartbeat
+
+A background beacon reports anonymous state (trial / free tier / expired) so the
+conversion funnel reflects devices that change between launches. On by default
+at six hours:
+
+```cpp
+cfg.keylessHeartbeatIntervalMs = 6 * 60 * 60 * 1000;   // default
+cfg.keylessHeartbeatIntervalMs = 0;                    // disable entirely
+```
+
+- **Beacon only.** It never revalidates a licence, and a `Licensed` or
+  `Limited` device never beacons at all — it counts *keyless* devices.
+- **The interval is not the traffic.** The beacon is debounced to one report per
+  24h per state; the interval only decides how promptly a *change* is noticed.
+- **Plugin scanning pays nothing.** The thread is spawned on first state
+  resolution rather than in the constructor, and its first tick is at
+  `+interval`, so a `Client` built and discarded during an AU/VST3 scan is born
+  and joined without ever emitting.
 
 ## Configuration Reference
 

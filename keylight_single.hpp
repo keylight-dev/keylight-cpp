@@ -42,7 +42,7 @@
 // include/keylight/version.hpp
 // ──────────────────────────────────────────────────────────────────────────
 
-#define KEYLIGHT_SDK_VERSION "0.1.6"
+#define KEYLIGHT_SDK_VERSION "0.2.0"
 
 // Identifies this SDK to the backend, sent as `sdk` alongside `platform`.
 // Server cap is 16 characters (zod `z.string().max(16)`).
@@ -5517,7 +5517,20 @@ private:
         std::lock_guard<std::mutex> lock(kh_mutex_);
         if (kh_thread_.joinable()) return;                  // already running
         kh_stop_ = false;
-        kh_thread_ = std::thread([this] { kh_loop_(); });
+        try {
+            kh_thread_ = std::thread([this] { kh_loop_(); });
+        } catch (const std::system_error&) {
+            // std::thread's constructor throws on EAGAIN, which a DAW hosting
+            // many plugin instances near RLIMIT_NPROC can genuinely hit. This
+            // runs from set_state_ — every activate, validate and startTrial —
+            // so letting it escape would turn thread exhaustion into a failed
+            // LICENCE CALL, or a terminate if it unwound through a noexcept
+            // frame. The beacon is best-effort telemetry; licensing is not.
+            //
+            // Degrade silently and stay degraded for this Client: the next
+            // state change retries, and if the machine is still out of threads
+            // it will fail the same harmless way.
+        }
     }
 
     /// Join the heartbeat. Moves the thread out from under the lock before

@@ -1,4 +1,4 @@
-## 0.2.0 (unreleased)
+## [0.2.0] - 2026-09-05
 
 ### Fixed
 
@@ -58,6 +58,47 @@
   want: binds to this machine and imports a pre-0.2.0 plaintext store once.
 - **`legacy_plaintext_path(cfg)`** — the pre-0.2.0 `.lease` location, to hand
   to `migrating()`.
+- **Server-owned trial configuration.** Trial length is now a dashboard field
+  per app, not a value you compile in. `Config::trialDurationDays` is only the
+  pre-first-contact seed; resolution order is server → seed → 0. The settings
+  ride on responses to calls already being made (`validate` for licensed
+  installs, the keyless beacon for the rest), so nothing pays an extra round
+  trip. `Client::fetchConfig()` is there for an explicit refresh.
+  `Client::effectiveTrialDurationDays()` and `effectiveFreeTierEnabled()`
+  report what is actually in force.
+- **The config response is signed, and verified.** `GET /config` was the
+  unsigned soft spot in an otherwise signed protocol: a lease cannot be forged,
+  so a fake server mints no licence — but it could mint an unlimited *trial*,
+  via nothing more than a hosts entry. `Config::requireSignedConfig` (default
+  `false` during the rollout) governs responses carrying no signature; one that
+  is present is always verified, and a bad one always rejected. See
+  `config_payload.hpp` for the payload format and for what this does *not* buy.
+- **`Client::activeRevalidate()`** — force a revalidation when the app is
+  foregrounded, debounced to 60s. The debounce is per-session, so a relaunch
+  always revalidates.
+- **`Client::refreshAfterUpgrade()`** and **`refreshAfterUpgradeAsync()`** — a
+  bounded poll so an in-app upgrade unlocks without a relaunch, rather than
+  waiting out payment-webhook lag.
+- **`Client::upgradeUrl()`** and **`Client::normalizeKey()`**.
+- **`Client::cachedLease()`**, **`hasStoredLicense()`**, **`cachedLicenseKey()`**.
+  `cachedLease()` returns the lease as-is and does not re-verify — it is for
+  displaying what is stored, not for deciding what to unlock.
+- **`Client::isValidKeyFormat()`**, driven by `Config::keyPrefix` — which was
+  declared but never read until now.
+- **Lifecycle events** (`Renewed`, `Cancelled`, `Expired`, `Restored`) via
+  `Client::onLifecycle()`, plus `on("renewed")`-style names. Distinct from
+  `subscribe()`, which fires on every transition; these are the subset worth
+  telling a customer about. `State` moved to the new `keylight/lifecycle.hpp`,
+  which `client.hpp` includes — no change to the enum or its values.
+- **Keyless heartbeat**, on by default at 6h
+  (`Config::keylessHeartbeatIntervalMs`, `0` to disable). Beacon only: it never
+  revalidates a licence, and a `Licensed` or `Limited` device never beacons at
+  all. The thread is spawned lazily on first state resolution and its first
+  tick is at `+interval`, so plugin scanning pays for neither.
+- **`sdk_trial_duration_days`** on activate and validate — the trial length the
+  *build* was compiled with. Diagnostic only, so a dashboard can flag a 30-day
+  build running against a 14-day setting. The server must never gate on it: a
+  patched client sends whatever it likes.
 
 ### Changed
 
@@ -166,6 +207,20 @@
   `FileStore`; `FileStore` remains supported for integrators supplying their
   own storage, and is unchanged.
 
+- **Breaking:** `startTrial()` now records the trial start even when the
+  effective duration is 0, where it previously wrote nothing at all. The
+  duration is a server setting that can arrive after first launch, and bailing
+  out early left no clock for it to measure — which is what made a
+  dashboard-set trial do nothing. A recorded start is honoured as-is: enabling
+  trials later does not retroactively grant one to an install that already
+  started. The anonymous free-tier instance id is minted at the same point, for
+  the same reason, so a trial that later converts can be attributed.
+- **Breaking:** `checkTrial()` and `trialDaysLeft()` measure against the
+  effective duration rather than `Config::trialDurationDays`, and state
+  resolution reads the effective free-tier flag. A dashboard setting now takes
+  effect without shipping an app release — and, in the other direction, turns a
+  seed-enabled trial off.
+
 ### Security
 
 - **The local store is no longer plaintext.** Editing `trialStart` with a text
@@ -187,6 +242,18 @@
   `/etc/machine-id` nor the dbus fallback), the key derives from a constant.
   Tamper resistance still holds; machine binding degrades only there. Nobody is
   locked out.
+- **A fake server can no longer grant an unlimited trial.** The signed `/config`
+  response closes the cheapest attack there was: redirect the API host and
+  answer with a 3650-day trial, no binary patching required. The same rule
+  applies wherever those fields ride — a `validate` body cannot deliver
+  unsigned settings past `requireSignedConfig`, or the check would be one route
+  away from useless.
+- **What that does NOT do, stated plainly.** It does not defeat a patched
+  binary, which can remove the check like any other. It raises the cheapest
+  attack from editing a hosts file to patching and re-signing an app. Stopping
+  the patched case requires the server to refuse — a server-side trial ledger
+  keyed to `machine_hash` — which is tracked separately and is not in this
+  release.
 
 ## [0.1.6] - 2026-09-03
 
