@@ -1,6 +1,9 @@
 #include "doctest.h"
 #include "keylight/store.hpp"
 #include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <string>
 
 namespace fs = std::filesystem;
 using namespace keylight;
@@ -94,4 +97,154 @@ TEST_CASE("default_store_path: produces a non-empty path under HOME") {
     // Should contain the tenantId and productId somewhere
     CHECK(path.find("tenant123") != std::string::npos);
     CHECK(path.find("prod456")   != std::string::npos);
+}
+
+
+// ---------------------------------------------------------------------------
+// EncryptedFileStore — machine-bound, authenticated on-disk store.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("EncryptedFileStore: round-trips a blob") {
+    const std::string path = (std::filesystem::temp_directory_path() /
+                              "kl-enc-roundtrip.bin").string();
+    std::filesystem::remove(path);
+
+    keylight::EncryptedFileStore store(path, "machine-a");
+    REQUIRE(store.save(R"({"trialStart":1781076246})").is_ok());
+
+    auto loaded = store.load();
+    REQUIRE(loaded.is_ok());
+    CHECK(loaded.value() == R"({"trialStart":1781076246})");
+
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("EncryptedFileStore: the blob is not readable on disk") {
+    const std::string path = (std::filesystem::temp_directory_path() /
+                              "kl-enc-opaque.bin").string();
+    std::filesystem::remove(path);
+
+    keylight::EncryptedFileStore store(path, "machine-a");
+    REQUIRE(store.save(R"({"trialStart":1781076246})").is_ok());
+
+    std::ifstream f(path, std::ios::binary);
+    const std::string raw((std::istreambuf_iterator<char>(f)),
+                          std::istreambuf_iterator<char>());
+    // Resetting trialStart with a text editor is the attack this closes.
+    CHECK(raw.find("trialStart") == std::string::npos);
+    CHECK(raw.size() >= 28);   // 12-byte nonce + 16-byte tag minimum
+
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("EncryptedFileStore: a blob from another machine does not open") {
+    const std::string path = (std::filesystem::temp_directory_path() /
+                              "kl-enc-transplant.bin").string();
+    std::filesystem::remove(path);
+
+    {
+        keylight::EncryptedFileStore origin(path, "machine-a");
+        REQUIRE(origin.save(R"({"lease":"..."})").is_ok());
+    }
+
+    // Copying the file to a second machine derives a different key. This is
+    // the whole point of the design: a store this SDK writes is not portable.
+    keylight::EncryptedFileStore elsewhere(path, "machine-b");
+    auto loaded = elsewhere.load();
+    REQUIRE(loaded.is_ok());
+    CHECK(loaded.value().empty());   // undecryptable reads as "no data"
+
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("EncryptedFileStore: a missing file is not an error") {
+    const std::string path = (std::filesystem::temp_directory_path() /
+                              "kl-enc-absent.bin").string();
+    std::filesystem::remove(path);
+
+    keylight::EncryptedFileStore store(path, "machine-a");
+    auto loaded = store.load();
+    REQUIRE(loaded.is_ok());
+    CHECK(loaded.value().empty());
+}
+
+TEST_CASE("EncryptedFileStore: a truncated file is not an error") {
+    const std::string path = (std::filesystem::temp_directory_path() /
+                              "kl-enc-truncated.bin").string();
+    {
+        std::ofstream f(path, std::ios::binary | std::ios::trunc);
+        f << "short";
+    }
+
+    // A half-written file from a crash must degrade to "no data", never crash.
+    keylight::EncryptedFileStore store(path, "machine-a");
+    auto loaded = store.load();
+    REQUIRE(loaded.is_ok());
+    CHECK(loaded.value().empty());
+
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("EncryptedFileStore: two saves of the same data differ on disk") {
+    const std::string path = (std::filesystem::temp_directory_path() /
+                              "kl-enc-nonce.bin").string();
+    std::filesystem::remove(path);
+
+    keylight::EncryptedFileStore store(path, "machine-a");
+    REQUIRE(store.save("same").is_ok());
+    std::string first;
+    { std::ifstream f(path, std::ios::binary);
+      first.assign((std::istreambuf_iterator<char>(f)),
+                   std::istreambuf_iterator<char>()); }
+
+    REQUIRE(store.save("same").is_ok());
+    std::string second;
+    { std::ifstream f(path, std::ios::binary);
+      second.assign((std::istreambuf_iterator<char>(f)),
+                    std::istreambuf_iterator<char>()); }
+
+    // A repeated nonce under one key breaks Poly1305 outright.
+    CHECK(first != second);
+
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("EncryptedFileStore: an absent machine id still encrypts, and binds to a constant") {
+    // read_hardware_id() returns nullopt on a machine with no stable id (a
+    // Linux image with neither /etc/machine-id nor the dbus fallback). The
+    // empty string is hashed like any other id. This pins that choice.
+    const std::string path = (std::filesystem::temp_directory_path() /
+                              "kl-enc-noid.bin").string();
+    std::filesystem::remove(path);
+
+    keylight::EncryptedFileStore store(path, "");
+    REQUIRE(store.save(R"({"trialStart":1781076246})").is_ok());
+
+    // Nobody is locked out: it round-trips like any other store.
+    auto loaded = store.load();
+    REQUIRE(loaded.is_ok());
+    CHECK(loaded.value() == R"({"trialStart":1781076246})");
+
+    // And the tamper protection is unaffected — this is the property that
+    // matters most, and it holds on every machine.
+    std::ifstream f(path, std::ios::binary);
+    const std::string raw((std::istreambuf_iterator<char>(f)),
+                          std::istreambuf_iterator<char>());
+    CHECK(raw.find("trialStart") == std::string::npos);
+
+    // The accepted trade, asserted rather than left implicit: two id-less
+    // machines derive the same key, so a blob IS portable between them.
+    // Binding degrades exactly where the OS gave us nothing to bind to.
+    keylight::EncryptedFileStore other_idless_machine(path, "");
+    auto shared = other_idless_machine.load();
+    REQUIRE(shared.is_ok());
+    CHECK(shared.value() == R"({"trialStart":1781076246})");
+
+    // But it is still not portable to a machine that DOES have an id.
+    keylight::EncryptedFileStore identified(path, "machine-a");
+    auto denied = identified.load();
+    REQUIRE(denied.is_ok());
+    CHECK(denied.value().empty());
+
+    std::filesystem::remove(path);
 }
