@@ -17,6 +17,13 @@ namespace keylight {
 struct HttpResponse {
     int         status = 0;
     std::string body;
+
+    // Response headers, names LOWERCASED so lookup is case-insensitive
+    // without a custom comparator. Appended last on purpose: existing
+    // aggregate initialization `{status, body}` keeps compiling, and a
+    // custom Transport that does not populate this simply loses
+    // Retry-After and falls back to plain exponential backoff.
+    std::map<std::string, std::string> headers;
 };
 
 // ---------------------------------------------------------------------------
