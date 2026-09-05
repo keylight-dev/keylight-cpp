@@ -3,10 +3,17 @@
 **Status:** implemented in `keylight-cpp` 0.2.0 (0.2.1 for the config-field
 ordering fix in 3.3). Not yet in any other SDK.
 
-**Who this is for:** a session working in `keylight-rust`, `keylight-swift`,
-`keylight-js` or `keylight-dotnet`. Ownership is split by repo, so each of those
-is a separate piece of work; this document is the shared contract so four
+**Who this is for:** a session working in `keylight-rust`, `keylight-js`,
+`keylight-dotnet`, or on the Swift SDK. Ownership is split by repo, so each of
+those is a separate piece of work; this document is the shared contract so four
 independent ports do not drift.
+
+**Where the Swift SDK actually lives:** `Sources/KeylightSDK` in the `keylight`
+monorepo, built into an xcframework by `scripts/build-xcframework.sh` and
+published to `keylight-binaries`. The `keylight-swift` repo is only the SwiftPM
+distribution shim — a `Package.swift` carrying a `binaryTarget` URL and
+checksum, with no source in it. A session sent to `keylight-swift` to make this
+change finds four files and nothing to edit.
 
 **Reference implementation:** `keylight-cpp`, `include/keylight/client.hpp` and
 `include/keylight/config_payload.hpp`. Every symbol named below exists there and
@@ -236,10 +243,46 @@ fixtures agree across repos.
 ## 7. Open items that are not client work
 
 - **The worker must sign `/config`** before any SDK's "require signed" default
-  can flip. Additive, so it can ship before or after any client.
+  can flip. Additive, so it can ship before or after any client. Two
+  implementation notes that will otherwise bite: use a generous `expires_at`
+  window (24h or more), and keep `/config` off the CDN. The client rejects a
+  response outside its validity window, so an edge-cached response minted hours
+  ago fails verification on a short window. Sign, let it soak, and only flip
+  `requireSignedConfig` defaults once no stale clients remain.
 - **A server-side trial ledger** — recording trial start against `machine_hash`
   and answering "already used". This is the only thing that stops a patched
   client, it needs no client changes (`machine_hash` is already on the wire),
-  and it protects every SDK at once. It needs a grace policy decided first: a
-  device whose `machine_hash` changes looks new and gets a second trial, and a
-  legitimate reinstall looks old and gets none.
+  and it protects every SDK at once. It needs a grace policy, because a device
+  whose `machine_hash` changes looks new and gets a second trial, while a
+  legitimate reinstall looks old and gets none. See 7.1.
+
+### 7.1 Grace policy — recommended, not yet ratified
+
+**Do not build against this without confirming it first.** What follows is the
+recommendation from the C++ session, recorded so the worker session starts from
+a considered position instead of inventing one under time pressure. It has not
+been signed off.
+
+The shape of it: **fail open, and expire entries.** The cost is asymmetric. A
+wrongly-granted second trial costs one trial's usage. A wrongly-denied trial
+costs a customer who never converts, plus a support ticket, plus a review saying
+the app is broken — and the denial cases hit legitimate users in bulk, not
+attackers.
+
+- **Key on `(tenant, product, machine_hash)`** — not `machine_hash` alone, or
+  trialling product A denies a trial for product B.
+- **TTL each entry at ~18 months.** This is the whole fix for "a legitimate
+  reinstall gets none": someone who evaluated two years ago and came back is a
+  new prospect, not a cheat. It also bounds storage.
+- **Missing `machine_hash` ⇒ grant.** The client omits the field rather than
+  faking one, so absence is honest. Denying on absence punishes exactly the
+  platforms that expose nothing.
+- **Collision ⇒ grant and alert, never deny.** This is the one that would hurt
+  most. Cloned VM images and imaged laptop fleets share `/etc/machine-id`, so a
+  company rolling 500 machines from one image would leave 499 users with no
+  trial. An implausible number of distinct installs behind a single hash is an
+  alert for you, not a lockout for them.
+
+The ledger's job is to make casual trial farming stop working — specifically,
+"delete the store and get a fresh trial". Anyone determined will spin a VM
+regardless. Airtightness is not what this buys.
