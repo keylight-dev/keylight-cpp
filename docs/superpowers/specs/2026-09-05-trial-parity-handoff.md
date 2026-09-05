@@ -252,16 +252,20 @@ fixtures agree across repos.
 - **A server-side trial ledger** — recording trial start against `machine_hash`
   and answering "already used". This is the only thing that stops a patched
   client, it needs no client changes (`machine_hash` is already on the wire),
-  and it protects every SDK at once. It needs a grace policy, because a device
-  whose `machine_hash` changes looks new and gets a second trial, while a
-  legitimate reinstall looks old and gets none. See 7.1.
+  and it protects every SDK at once. Its grace policy is ratified — see 7.1 —
+  because a device whose `machine_hash` changes looks new and gets a second
+  trial, while a legitimate reinstall looks old and gets none.
 
-### 7.1 Grace policy — recommended, not yet ratified
+### 7.1 Grace policy — RATIFIED 2026-09-06
 
-**Do not build against this without confirming it first.** What follows is the
-recommendation from the C++ session, recorded so the worker session starts from
-a considered position instead of inventing one under time pressure. It has not
-been signed off.
+**Decided. Build against this.** Nicolas signed off the recommendation below as
+written, unchanged, on 2026-09-06. It was drafted by the C++ session so the
+worker session would start from a considered position instead of inventing one
+under time pressure; it is no longer provisional.
+
+The four rules below are the contract. A ledger implementation that denies a
+trial in any case other than "this exact `(tenant, product, machine_hash)` has a
+live entry" is not implementing this policy.
 
 The shape of it: **fail open, and expire entries.** The cost is asymmetric. A
 wrongly-granted second trial costs one trial's usage. A wrongly-denied trial
