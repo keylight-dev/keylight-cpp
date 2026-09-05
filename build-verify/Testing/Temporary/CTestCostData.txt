@@ -1,3 +1,0 @@
-keylight_tests 1 1.04767
-test_amalgamation 1 0.367089
----

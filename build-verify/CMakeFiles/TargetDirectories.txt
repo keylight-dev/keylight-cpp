@@ -1,6 +1,0 @@
-/Users/halloweed/Coding/Projects/keylight-cpp/build-verify/CMakeFiles/keylight_tests.dir
-/Users/halloweed/Coding/Projects/keylight-cpp/build-verify/CMakeFiles/keylight_amalgamate.dir
-/Users/halloweed/Coding/Projects/keylight-cpp/build-verify/CMakeFiles/test_amalgamation.dir
-/Users/halloweed/Coding/Projects/keylight-cpp/build-verify/CMakeFiles/test.dir
-/Users/halloweed/Coding/Projects/keylight-cpp/build-verify/CMakeFiles/edit_cache.dir
-/Users/halloweed/Coding/Projects/keylight-cpp/build-verify/CMakeFiles/rebuild_cache.dir

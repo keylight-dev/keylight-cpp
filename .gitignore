@@ -1,3 +1,12 @@
-build/
-build-ssl/
-build-demo/
+# Build directories.
+#
+# Matched by prefix, not by name. Listing them individually is what let
+# build-httplib/ and build-verify/ get committed in the 0.1.6 release — 202
+# files, including a CMakeCache.txt carrying absolute local paths, in a public
+# repo. A new build dir must not be one forgotten .gitignore edit away from
+# the same thing.
+build*/
+
+# CMake leftovers, wherever they land.
+CMakeCache.txt
+CMakeFiles/
