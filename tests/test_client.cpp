@@ -2638,3 +2638,68 @@ TEST_CASE("Client: cachedLease is returned as-is, not re-verified") {
     REQUIRE(client.cachedLease().has_value());
     CHECK(client.cachedLease()->status == "active");
 }
+
+
+TEST_CASE("Client: normalizeKey matches the worker's normalization") {
+    CHECK(Client::normalizeKey("xxxx-yyyy-zzzz-0001") == "XXXXYYYYZZZZ0001");
+    CHECK(Client::normalizeKey("  XXXX YYYY  ")       == "XXXXYYYY");
+    CHECK(Client::normalizeKey("")                    == "");
+}
+
+TEST_CASE("Client: upgradeUrl targets the authenticated portal route") {
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+    // No key stored, nothing to link to.
+    CHECK(client.upgradeUrl().has_value() == false);
+
+    transport.next_status = 200;
+    transport.next_body   = ACTIVATE_RESPONSE;
+    REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+    REQUIRE(client.upgradeUrl().has_value());
+    // The standalone /p/{tenant}/upgrade/{product} form is retired; the portal
+    // path segment IS the normalized key.
+    CHECK(*client.upgradeUrl() ==
+          "https://portal.keylight.dev/t/tenant1/license/XXXXYYYYZZZZ0001/upgrade");
+}
+
+TEST_CASE("Client: key format validation uses the configured prefix") {
+    auto cfg = make_config();
+    cfg.keyPrefix = "KL";
+
+    FakeTransport transport;
+    MemoryStore   store;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+
+    CHECK(client.isValidKeyFormat("KL-AAAA-BBBB") == true);
+    CHECK(client.isValidKeyFormat("kl-aaaa-bbbb") == true);   // case-insensitive
+    CHECK(client.isValidKeyFormat("XX-AAAA-BBBB") == false);
+    CHECK(client.isValidKeyFormat("")             == false);
+}
+
+TEST_CASE("Client: an unset prefix accepts any non-empty key") {
+    auto cfg = make_config();   // keyPrefix left empty
+    FakeTransport transport;
+    MemoryStore   store;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+
+    // Rejecting everything when no prefix is configured would break every
+    // integrator who never set the field.
+    CHECK(client.isValidKeyFormat("anything") == true);
+    CHECK(client.isValidKeyFormat("")         == false);
+}
+
+TEST_CASE("Client: a key of only separators is not a valid format") {
+    // normalizeKey strips these to nothing, so the empty-check has to run on
+    // the NORMALIZED string or "---" reads as a plausible key.
+    auto cfg = make_config();
+    FakeTransport transport;
+    MemoryStore   store;
+    Client client(cfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+
+    CHECK(client.isValidKeyFormat("---")   == false);
+    CHECK(client.isValidKeyFormat("   ")   == false);
+}

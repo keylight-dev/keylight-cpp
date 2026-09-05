@@ -3937,6 +3937,53 @@ public:
         return cached_license_key_;
     }
 
+    /// Normalize a license key the way the API does: strip whitespace and
+    /// hyphens, uppercase. Mirrors the worker's normalizeKey, so a key typed
+    /// with the wrong spacing still resolves to the same license.
+    static std::string normalizeKey(const std::string& key) {
+        std::string out;
+        out.reserve(key.size());
+        for (char c : key) {
+            unsigned char u = static_cast<unsigned char>(c);
+            if (c == '-' || std::isspace(u)) continue;
+            out += static_cast<char>(std::toupper(u));
+        }
+        return out;
+    }
+
+    /// Hosted upgrade page for the cached license.
+    ///
+    /// The customer portal's license id path segment IS the normalized key, so
+    /// this needs no server round-trip. The page requires a signed-in portal
+    /// session, so an unauthenticated customer lands on the sign-in wall — that
+    /// is the intended flow; the standalone unauthenticated upgrade form was
+    /// retired.
+    std::optional<std::string> upgradeUrl() const {
+        auto key = cachedLicenseKey();
+        if (!key.has_value()) return std::nullopt;
+        return "https://portal.keylight.dev/t/" + cfg_.tenantId +
+               "/license/" + normalizeKey(*key) + "/upgrade";
+    }
+
+    /// Cheap client-side shape check, so an obvious typo is caught before it
+    /// costs a network round-trip and a rate-limit token. Never a substitute
+    /// for server validation — it knows nothing about whether the key exists.
+    ///
+    /// The emptiness test runs on the NORMALIZED string, so a key of nothing
+    /// but separators ("---") is rejected rather than passing as plausible.
+    ///
+    /// With no keyPrefix configured this only rejects the empty string:
+    /// rejecting everything would break every integrator who never set it.
+    bool isValidKeyFormat(const std::string& key) const {
+        const std::string normalized = normalizeKey(key);
+        if (normalized.empty()) return false;
+        if (cfg_.keyPrefix.empty()) return true;
+
+        const std::string prefix = normalizeKey(cfg_.keyPrefix);
+        return normalized.size() >= prefix.size() &&
+               normalized.compare(0, prefix.size(), prefix) == 0;
+    }
+
 private:
     // ── Clock trust ───────────────────────────────────────────────────────
 
