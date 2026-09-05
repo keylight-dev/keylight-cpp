@@ -2398,6 +2398,15 @@ private:
 class Client {
 public:
     // Production constructor — clock defaults to real wall clock.
+    // The real sleep used for retry backoff unless a caller injects its own.
+    // A static factory rather than a default argument so every delegating
+    // constructor names the same thing.
+    static std::function<void(uint64_t)> default_sleep_fn_() {
+        return [](uint64_t ms) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        };
+    }
+
     Client(Config cfg, Transport& transport, LicenseStore& store)
         : Client(std::move(cfg), transport, store,
                  []{ return static_cast<int64_t>(std::time(nullptr)); },
@@ -2424,11 +2433,42 @@ public:
            LicenseStore&                               store,
            std::function<int64_t()>                    now_fn,
            std::function<std::optional<std::string>()> hardware_id_fn)
+        : Client(std::move(cfg), transport, store, std::move(now_fn),
+                 std::move(hardware_id_fn), default_sleep_fn_())
+    {}
+
+    // Testable constructor — inject a deterministic clock AND the retry sleep,
+    // so backoff is asserted without spending it.
+    //
+    // This takes the same five positions as the overload above, differing only
+    // in the last parameter's signature. That is not ambiguous, and does not
+    // become so: std::function's converting constructor is SFINAE-constrained
+    // on being callable with the given signature, so a `[]{...}` nullary lambda
+    // only ever matches hardware_id_fn and a `[](uint64_t){...}` one only ever
+    // matches sleep_fn. Adding a third five-argument overload whose last
+    // parameter accepted either shape WOULD make all of them ambiguous.
+    Client(Config                        cfg,
+           Transport&                    transport,
+           LicenseStore&                 store,
+           std::function<int64_t()>      now_fn,
+           std::function<void(uint64_t)> sleep_fn)
+        : Client(std::move(cfg), transport, store, std::move(now_fn),
+                 []{ return detail::read_hardware_id(); }, std::move(sleep_fn))
+    {}
+
+    // Designated constructor — every other one delegates here.
+    Client(Config                                      cfg,
+           Transport&                                  transport,
+           LicenseStore&                               store,
+           std::function<int64_t()>                    now_fn,
+           std::function<std::optional<std::string>()> hardware_id_fn,
+           std::function<void(uint64_t)>               sleep_fn)
         : cfg_(std::move(cfg))
         , transport_(transport)
         , store_(store)
         , now_fn_(std::move(now_fn))
         , hardware_id_fn_(std::move(hardware_id_fn))
+        , sleep_fn_(std::move(sleep_fn))
         , verifier_(cfg_.trustedKeys)
         , state_(State::Invalid)
     {
@@ -2515,7 +2555,7 @@ public:
         std::string body = build_json_(std::move(fields), true /*telemetry*/);
 
         std::string url = api_url_("activate");
-        auto hr = transport_.request("POST", url, json_headers_(), body);
+        auto hr = request_with_retry_("POST", url, json_headers_(), body);
         if (!hr.is_ok()) {
             return Result<State>::err(hr.error());
         }
@@ -2606,7 +2646,7 @@ public:
         std::string body = build_json_(std::move(fields), true /*telemetry*/);
 
         std::string url = api_url_("validate");
-        auto hr = transport_.request("POST", url, json_headers_(), body);
+        auto hr = request_with_retry_("POST", url, json_headers_(), body);
         if (!hr.is_ok()) {
             // Network failure: keep existing state
             return report_(state_.load());
@@ -2688,7 +2728,7 @@ public:
                 {"instance_id", json_str(instance_id)},
             }, false);
             std::string url = api_url_("deactivate");
-            auto hr = transport_.request("POST", url, json_headers_(), body);
+            auto hr = request_with_retry_("POST", url, json_headers_(), body);
             if (!hr.is_ok()) {
                 server_error = hr.error();
             } else if (hr.value().status != 200) {
@@ -2803,7 +2843,7 @@ public:
             fields.push_back({"machine_hash", json_str(*hash)});
         }
 
-        auto hr = transport_.request("POST", api_url_("keyless"),
+        auto hr = request_with_retry_("POST", api_url_("keyless"),
                                      json_headers_(),
                                      build_json_(std::move(fields), true));
         // Arm the debounce ONLY on a real 200.  A failed beacon must not
@@ -3250,6 +3290,10 @@ private:
     LicenseStore&            store_;
     std::function<int64_t()> now_fn_;
     std::function<std::optional<std::string>()> hardware_id_fn_;
+
+    // Injected so retry backoff is tested without sleeping. Defaults to a real
+    // sleep; tests record the requested delays instead.
+    std::function<void(uint64_t)> sleep_fn_;
     Verifier                 verifier_;
 
     // ── State ─────────────────────────────────────────────────────────────
@@ -3363,6 +3407,50 @@ private:
         }
         headers["X-Keylight-Request-Id"] = detail::random_request_id();
         return headers;
+    }
+
+    // Every outbound request goes through here. A transient failure (408, 429,
+    // 5xx, or a transport-level error) is retried up to RETRY_MAX_ATTEMPTS with
+    // exponential backoff, honoring Retry-After on a 429. A definitive
+    // rejection is returned immediately — retrying "License key not found"
+    // only wastes the user's time and the tenant's quota.
+    //
+    // Blocking: this can now park the calling thread for the sum of the
+    // backoffs before it returns. Every caller was already a blocking network
+    // call on a background thread, so the thread affinity rules do not change,
+    // but the worst-case duration does.
+    Result<HttpResponse> request_with_retry_(
+        const std::string&                        method,
+        const std::string&                        url,
+        const std::map<std::string, std::string>& headers,
+        const std::string&                        body)
+    {
+        Result<HttpResponse> last = Result<HttpResponse>::err(
+            {ErrorCode::Network, "no attempt made"});
+
+        for (uint32_t attempt = 1; attempt <= RETRY_MAX_ATTEMPTS; ++attempt) {
+            last = transport_.request(method, url, headers, body);
+
+            // A transport-level failure has no status; treat it as a 503 for
+            // policy purposes so a flaky network gets the same backoff.
+            const int status = last.is_ok() ? last.value().status : 503;
+            if (last.is_ok() && !status_retryable(status)) {
+                return last;
+            }
+
+            std::optional<uint64_t> retry_after;
+            if (last.is_ok()) {
+                auto it = last.value().headers.find("retry-after");
+                if (it != last.value().headers.end()) {
+                    retry_after = parse_retry_after(it->second);
+                }
+            }
+
+            const RetryDecision d = retry_decide(status, attempt, retry_after);
+            if (!d.retry) break;
+            sleep_fn_(d.delay_ms);
+        }
+        return last;
     }
 
     // The worker's human-readable rejection reason, e.g. "License key not
@@ -3999,7 +4087,7 @@ private:
         int64_t last_lvo = load_last_validated_online_();
 
         // Attempt network refresh via validate()
-        auto hr = transport_.request("POST", api_url_("validate"),
+        auto hr = request_with_retry_("POST", api_url_("validate"),
                                      json_headers_(),
                                      build_validate_body_());
         if (!hr.is_ok()) {

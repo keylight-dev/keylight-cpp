@@ -12,6 +12,8 @@
 #include "keylight/store.hpp"
 #include "keylight/transport.hpp"
 
+#include <cstdint>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
@@ -20,6 +22,12 @@
 using namespace keylight;
 
 namespace {
+
+// Retry backoff is real wall-clock time. A test driving a transport that
+// returns a retryable failure injects this instead of the default sleep, so
+// the suite exercises the retry policy without spending ~1.5s per request.
+static const std::function<void(uint64_t)> NO_SLEEP = [](uint64_t){};
+
 
 // ---------------------------------------------------------------------------
 // RecordingTransport — captures every request (headers included) and replays a
@@ -204,7 +212,7 @@ TEST_CASE("FreeTier: disabled by default — no license resolves Invalid") {
     MemStore           store;
     int64_t now = T0;
 
-    Client client(cfg, transport, store, [&]{ return now; });
+    Client client(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
     CHECK(client.checkOnLaunch().value() == State::Invalid);
 }
 
@@ -215,7 +223,7 @@ TEST_CASE("FreeTier: enabled and no trial resolves FreeTier offline") {
     transport.fail = true;             // any request would fail — there must be none
     int64_t now = T0;
 
-    Client client(cfg, transport, store, [&]{ return now; });
+    Client client(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
     auto r = client.checkOnLaunch();
     REQUIRE(r.is_ok());
     CHECK(r.value()      == State::FreeTier);
@@ -230,7 +238,7 @@ TEST_CASE("FreeTier: an active trial still outranks the free tier") {
     MemStore           store;
     int64_t now = T0;
 
-    Client client(cfg, transport, store, [&]{ return now; });
+    Client client(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
     REQUIRE(client.startTrial().is_ok());
     CHECK(client.state() == State::Trial);
 }
@@ -246,7 +254,7 @@ TEST_CASE("FreeTier: an ELAPSED trial drops to FreeTier, not Expired") {
     int64_t now = T0;
 
     {
-        Client client(cfg, transport, store, [&]{ return now; });
+        Client client(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
         REQUIRE(client.startTrial().is_ok());
     }
 
@@ -266,7 +274,7 @@ TEST_CASE("FreeTier: a paid license still wins") {
     transport.next_body = ACTIVATE_OK;
     int64_t now = T0;
 
-    Client client(cfg, transport, store, [&]{ return now; });
+    Client client(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
     REQUIRE(client.activate("KL-TEST-KEY").is_ok());
     CHECK(client.state() == State::Licensed);
 }
@@ -278,7 +286,7 @@ TEST_CASE("FreeTier: deactivate lands on FreeTier rather than the paywall") {
     transport.next_body = ACTIVATE_OK;
     int64_t now = T0;
 
-    Client client(cfg, transport, store, [&]{ return now; });
+    Client client(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
     REQUIRE(client.activate("KL-TEST-KEY").is_ok());
     REQUIRE(client.state() == State::Licensed);
 
@@ -297,7 +305,7 @@ TEST_CASE("Instance id: minted once and stable across calls") {
     MemStore           store;
     int64_t now = T0;
 
-    Client client(cfg, transport, store, [&]{ return now; });
+    Client client(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
     const std::string a = client.freeTierInstanceId();
     const std::string b = client.freeTierInstanceId();
 
@@ -314,7 +322,7 @@ TEST_CASE("Instance id: restored by a new Client on the same store") {
 
     std::string first;
     {
-        Client client(cfg, transport, store, [&]{ return now; });
+        Client client(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
         first = client.freeTierInstanceId();
     }
     Client relaunched(cfg, transport, store, [&]{ return now; });
@@ -329,7 +337,7 @@ TEST_CASE("Instance id: startTrial mints one for conversion attribution") {
     MemStore           store;
     int64_t now = T0;
 
-    Client client(cfg, transport, store, [&]{ return now; });
+    Client client(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
     REQUIRE(client.startTrial().is_ok());
 
     CHECK(store.has_field("trialStart"));
@@ -342,7 +350,7 @@ TEST_CASE("Instance id: trials disabled means startTrial mints nothing") {
     MemStore           store;
     int64_t now = T0;
 
-    Client client(cfg, transport, store, [&]{ return now; });
+    Client client(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
     REQUIRE(client.startTrial().is_ok());
     CHECK_FALSE(store.has_field("freeTierInstanceId"));
 }
@@ -354,7 +362,7 @@ TEST_CASE("Instance id: survives activate and validate") {
     transport.next_body = ACTIVATE_OK;
     int64_t now = T0;
 
-    Client client(cfg, transport, store, [&]{ return now; });
+    Client client(cfg, transport, store, [&]{ return now; }, NO_SLEEP);
     const std::string id = client.freeTierInstanceId();
 
     REQUIRE(client.activate("KL-TEST-KEY").is_ok());
@@ -400,7 +408,7 @@ TEST_CASE("Hardware id: machine_hash omitted entirely when none is available") {
     int64_t now = T0;
     auto none = []() -> std::optional<std::string> { return std::nullopt; };
 
-    Client client(cfg, transport, store, [&]{ return now; }, none);
+    Client client(cfg, transport, store, [&]{ return now; }, none, NO_SLEEP);
     client.reportKeylessState(KeylessState::FreeTier);
 
     const auto* call = transport.last_call_for("keyless");
@@ -452,7 +460,7 @@ TEST_CASE("Beacon: debounced — same state inside 24h sends nothing") {
     int64_t now = T0;
     auto none = []() -> std::optional<std::string> { return std::nullopt; };
 
-    Client client(cfg, transport, store, [&]{ return now; }, none);
+    Client client(cfg, transport, store, [&]{ return now; }, none, NO_SLEEP);
     client.reportKeylessState(KeylessState::FreeTier);
     REQUIRE(transport.calls.size() == 1);
 
@@ -468,7 +476,7 @@ TEST_CASE("Beacon: a changed state defeats the debounce immediately") {
     int64_t now = T0;
     auto none = []() -> std::optional<std::string> { return std::nullopt; };
 
-    Client client(cfg, transport, store, [&]{ return now; }, none);
+    Client client(cfg, transport, store, [&]{ return now; }, none, NO_SLEEP);
     client.reportKeylessState(KeylessState::Trial);
     REQUIRE(transport.calls.size() == 1);
 
@@ -484,7 +492,7 @@ TEST_CASE("Beacon: the same state sends again once 24h have passed") {
     int64_t now = T0;
     auto none = []() -> std::optional<std::string> { return std::nullopt; };
 
-    Client client(cfg, transport, store, [&]{ return now; }, none);
+    Client client(cfg, transport, store, [&]{ return now; }, none, NO_SLEEP);
     client.reportKeylessState(KeylessState::FreeTier);
     REQUIRE(transport.calls.size() == 1);
 
@@ -503,15 +511,20 @@ TEST_CASE("Beacon: a non-200 response does NOT arm the debounce") {
     int64_t now = T0;
     auto none = []() -> std::optional<std::string> { return std::nullopt; };
 
-    Client client(cfg, transport, store, [&]{ return now; }, none);
+    // A 500 is transient, so the beacon is retried to the ceiling before it
+    // gives up. The no-op sleep keeps that from costing real time. What this
+    // case is about is the debounce, not the attempt count: a beacon that
+    // never got a 200 must not suppress reporting for a day.
+    Client client(cfg, transport, store, [&]{ return now; }, none,
+                  NO_SLEEP);
     client.reportKeylessState(KeylessState::FreeTier);
-    REQUIRE(transport.calls.size() == 1);
+    REQUIRE(transport.calls.size() == RETRY_MAX_ATTEMPTS);
     CHECK_FALSE(store.has_field("keylessLastState"));
 
     now = T0 + 60;
     transport.next_status = 200;
     client.reportKeylessState(KeylessState::FreeTier);
-    CHECK(transport.calls.size() == 2);
+    CHECK(transport.calls.size() == RETRY_MAX_ATTEMPTS + 1);
     CHECK(store.str_field("keylessLastState") == "free_tier");
     CHECK(store.int_field("lastKeylessPingAt") == now);
 }
@@ -524,7 +537,7 @@ TEST_CASE("Beacon: a network error is swallowed and leaves the debounce unarmed"
     int64_t now = T0;
     auto none = []() -> std::optional<std::string> { return std::nullopt; };
 
-    Client client(cfg, transport, store, [&]{ return now; }, none);
+    Client client(cfg, transport, store, [&]{ return now; }, none, NO_SLEEP);
     client.reportKeylessState(KeylessState::FreeTier);   // must not throw
     CHECK_FALSE(store.has_field("keylessLastState"));
 }
@@ -537,7 +550,7 @@ TEST_CASE("Beacon: the debounce survives a relaunch") {
     auto none = []() -> std::optional<std::string> { return std::nullopt; };
 
     {
-        Client client(cfg, transport, store, [&]{ return now; }, none);
+        Client client(cfg, transport, store, [&]{ return now; }, none, NO_SLEEP);
         client.reportKeylessState(KeylessState::FreeTier);
     }
     REQUIRE(transport.calls.size() == 1);
@@ -555,7 +568,7 @@ TEST_CASE("Beacon: reporting never changes the resolved state") {
     int64_t now = T0;
     auto none = []() -> std::optional<std::string> { return std::nullopt; };
 
-    Client client(cfg, transport, store, [&]{ return now; }, none);
+    Client client(cfg, transport, store, [&]{ return now; }, none, NO_SLEEP);
     REQUIRE(client.checkOnLaunch().value() == State::FreeTier);
     client.reportKeylessState(KeylessState::FreeTier);
     CHECK(client.state() == State::FreeTier);
@@ -591,7 +604,7 @@ TEST_CASE("Attribution: activate omits free_tier_instance_id when none was minte
     int64_t now = T0;
     auto none = []() -> std::optional<std::string> { return std::nullopt; };
 
-    Client client(cfg, transport, store, [&]{ return now; }, none);
+    Client client(cfg, transport, store, [&]{ return now; }, none, NO_SLEEP);
     REQUIRE(client.activate("KL-TEST-KEY").is_ok());
 
     const auto* call = transport.last_call_for("activate");
