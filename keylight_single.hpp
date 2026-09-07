@@ -42,7 +42,7 @@
 // include/keylight/version.hpp
 // ──────────────────────────────────────────────────────────────────────────
 
-#define KEYLIGHT_SDK_VERSION "0.2.1"
+#define KEYLIGHT_SDK_VERSION "0.2.2"
 
 // Identifies this SDK to the backend, sent as `sdk` alongside `platform`.
 // Server cap is 16 characters (zod `z.string().max(16)`).
@@ -440,7 +440,7 @@ struct Config {
     // refreshIfNeeded(); 1 ms is still a bad interval, but it is a rate.
     int autoValidationIntervalMs = 1'800'000; // 30 min
 
-    // ── Fields below were added after 1.0 of this struct's shape ──────────
+    // ── Fields below were added in 0.2.0, after the struct's shape shipped ─
     //
     // APPENDED, never inserted. Positional aggregate initialisation —
     // `Config cfg{"tenant", "product", ...}` — binds by position, so slotting
@@ -448,16 +448,23 @@ struct Config {
     // fails to compile. Same rule the State enum documents twice for the same
     // reason. Add new fields HERE, at the end.
 
-    // Reject a GET /config response that carries no signature at all.
+    // Require the server-owned product settings (trial_duration_days,
+    // free_tier_enabled) to arrive Ed25519-signed, on every route that
+    // carries them: GET /config, validate and the keyless beacon.
     //
-    // A signature that is PRESENT is always verified, and a bad one is always
-    // rejected, regardless of this flag. This only decides what to do with a
-    // response that has none.
+    //   false (default): the fields are applied as sent and the signature
+    //                    fields, if present, are not consulted at all.
+    //   true:            a body must carry both fields, a kid in trustedKeys
+    //                    and a signature that verifies, inside its validity
+    //                    window. Unsigned, partial or bad-signature bodies
+    //                    are dropped (and fetchConfig() reports an error).
     //
-    // Defaults to false for 0.2.0 because the worker does not sign /config
-    // yet; defaulting to true would silently break every tenant's dashboard
-    // trial setting on upgrade. Set it to true once your server signs — and
-    // expect the default to flip in a later release.
+    // Same rule as the Swift, JS, C# and Rust SDKs. The worker signs on all
+    // three routes since 2026-09-06, but ONLY for products with a trial length
+    // configured in the dashboard — so leave this off unless you know your
+    // product is signed, or every install stops learning its settings.
+    // Enabling it also freezes the settings on old builds when the signing
+    // key rotates, because trustedKeys are compiled in.
     bool        requireSignedConfig = false;
 
     // Interval between anonymous keyless-beacon heartbeats (milliseconds).
@@ -909,14 +916,32 @@ struct Parser {
 
         if (eof() || *p < '0' || *p > '9') return false;
 
-        int64_t ival = 0;
+        // Accumulate as int64 while it fits. The moment the next digit would
+        // overflow, promote to double and keep going: `ival * 10 + digit`
+        // past INT64_MAX is signed-overflow UB, and a body such as
+        // {"expires_at": 99999999999999999999999} is exactly what a hostile
+        // or merely broken server can send. Lenient parsers (nlohmann, V8)
+        // do the same promotion; the value still round-trips through as_int()
+        // as a saturated int64 rather than as garbage.
+        int64_t ival     = 0;
+        double  big      = 0.0;
+        bool    overflow = false;
         while (!eof() && *p >= '0' && *p <= '9') {
-            ival = ival * 10 + (*p - '0');
+            const int digit = *p - '0';
+            if (!overflow) {
+                if (ival > (INT64_MAX - digit) / 10) {
+                    overflow = true;
+                    big      = static_cast<double>(ival);
+                } else {
+                    ival = ival * 10 + digit;
+                }
+            }
+            if (overflow) big = big * 10.0 + digit;
             ++p;
         }
 
-        bool is_float = false;
-        double dval = static_cast<double>(ival);
+        bool   is_float = overflow;
+        double dval     = overflow ? big : static_cast<double>(ival);
 
         // Fractional part
         if (!eof() && *p == '.') {
@@ -1127,8 +1152,18 @@ public:
     }
 
     int64_t as_int() const {
-        if (val_->type == json_detail::JType::Int)    return val_->i;
-        if (val_->type == json_detail::JType::Double) return static_cast<int64_t>(val_->d);
+        if (val_->type == json_detail::JType::Int) return val_->i;
+        if (val_->type == json_detail::JType::Double) {
+            // static_cast<int64_t> of a double outside int64's range is UB,
+            // not a saturation. Clamp explicitly; NaN maps to 0 like any
+            // other non-number.
+            const double d = val_->d;
+            if (d != d) return 0;
+            // 2^63 is exactly representable; INT64_MAX itself is not.
+            if (d >= 9223372036854775808.0)  return INT64_MAX;
+            if (d <  -9223372036854775808.0) return INT64_MIN;
+            return static_cast<int64_t>(d);
+        }
         return 0;
     }
 
@@ -1403,13 +1438,19 @@ static const kl_gf kBY = {
     0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666};
 
 // Carry propagation: normalize limbs to approximately [0, 2^16).
+//
+// Upstream TweetNaCl writes the last line as `o[i] -= c << 16`. The carry
+// can be negative, and left-shifting a negative signed value is undefined
+// behaviour in C++17 (well-defined only from C++20). The multiply is the
+// same arithmetic on every value the shift was defined for, and defined on
+// the rest; UBSan-clean without changing a single output bit.
 static void gf_car(kl_gf o) {
     kl_i64 c;
     for (int i = 0; i < 16; ++i) {
         o[i] += (kl_i64)1 << 16;
         c = o[i] >> 16;
         o[(i+1) * (i<15)] += c - 1 + 37*(c-1)*(i==15);
-        o[i] -= c << 16;
+        o[i] -= c * 65536;
     }
 }
 
@@ -3506,15 +3547,14 @@ public:
         }
         const Json& j = jr.value();
 
-        const int   trial_days = static_cast<int>(j["trial_duration_days"].as_int());
-        const bool  free_tier  = j["free_tier_enabled"].as_bool();
-
         // Authenticate before caching. Nothing below writes to the cache until
         // this returns ok, so a rejected config leaves the last good value —
         // or the Config seed — in force rather than adopting what a fake
         // server claimed. Reported as an error too, because the caller asked
-        // for a refresh and a forged config is worth surfacing.
-        auto vr = verify_config_(j, trial_days, free_tier);
+        // for a refresh and a forged config is worth surfacing. A no-op when
+        // requireSignedConfig is off: the signature fields are then not
+        // consulted at all, matching the other Keylight SDKs.
+        auto vr = verify_config_(j);
         if (!vr.is_ok()) return vr;
 
         // One parser for all three carriers.
@@ -3612,8 +3652,9 @@ public:
         // The beacon reply is how an UNLICENSED install learns the server's
         // settings — validate covers the licensed ones. The body used to be
         // discarded entirely.
+        bool absorbed = false;
         if (auto jr = Json::parse(hr.value().body); jr.is_ok()) {
-            apply_config_fields_(jr.value());
+            absorbed = apply_config_fields_(jr.value());
         }
 
         {
@@ -3622,6 +3663,16 @@ public:
             cached_last_keyless_ping_at_ = now_fn_();
         }
         (void)save_cache_();
+
+        // A new trial length or free-tier flag can change what this device IS
+        // — a 14-day trial cut to 1 by the dashboard is over right now, not at
+        // the next tick. fetchConfig() re-resolves after absorbing; this path
+        // must too, or state() reports a stale Trial until something else
+        // happens to touch it. Only when something was actually absorbed: a
+        // reply without the fields must not change the resolved state.
+        if (absorbed) {
+            set_state_(resolve_current_state_());
+        }
     }
 
     Result<State> startTrial() {
@@ -4267,6 +4318,11 @@ private:
     // the source of truth for persistence; this is written alongside it.
     std::atomic<int64_t>     last_validated_online_atomic_{0};
 
+    // Serialises store_.save() — see save_cache_(). Never held while waiting
+    // on anything but cache_mutex_, and never taken from a thread that already
+    // holds cache_mutex_.
+    std::mutex                       save_mutex_;
+
     // Mutex-guarded cache of the decoded lease + extras
     mutable std::mutex               cache_mutex_;
     std::optional<Lease>             cached_lease_;
@@ -4359,6 +4415,14 @@ private:
     mutable std::mutex      kh_mutex_;
     std::condition_variable kh_cv_;
     bool                    kh_stop_ = false;
+    // Latched by stop_heartbeat_(), i.e. by ~Client(). Once set, nothing can
+    // spawn the heartbeat again: set_state_() runs on the auto-validation
+    // worker (which the destructor joins AFTER stopping the heartbeat) and,
+    // via reportKeylessState(), on the heartbeat thread itself — either one
+    // calling start_heartbeat_() after the thread was moved out for joining
+    // would spawn a fresh thread that nobody joins, and a joinable
+    // std::thread at destruction is std::terminate.
+    bool                    kh_shutdown_ = false;
     std::thread             kh_thread_;
 
     // The worker running the CURRENT epoch. A joinable thread here is the
@@ -4411,29 +4475,31 @@ private:
     /// or a route that does not include them, must not wipe a value we already
     /// learned.
     ///
-    /// AUTHENTICATION IS THE SAME WHEREVER THEY RIDE. A signed envelope is
-    /// verified; an unsigned one is accepted only when requireSignedConfig is
-    /// false. Applying these fields unsigned here while /config verified them
-    /// would defeat that check completely — a fake server would simply deliver
-    /// the long trial on a validate body instead of on /config.
-    void apply_config_fields_(const Json& j) {
+    /// AUTHENTICATION IS THE SAME WHEREVER THEY RIDE, and it is decided by
+    /// Config::requireSignedConfig alone — the same rule as the Swift, JS, C#
+    /// and Rust SDKs:
+    ///
+    ///   - flag OFF: the fields are applied as sent. The signature fields, if
+    ///     any, are not looked at. This is the default, because the worker
+    ///     only signs for products with a trial length set in the dashboard.
+    ///   - flag ON:  the fields are applied only from a complete envelope
+    ///     (both fields, kid, signature) that verifies against trustedKeys
+    ///     and is inside its validity window. Unsigned, partial or bad-
+    ///     signature bodies are dropped.
+    ///
+    /// Applying these fields unsigned here while /config verified them would
+    /// defeat the flag completely — a fake server would simply deliver the
+    /// long trial on a validate body instead of on /config.
+    ///
+    /// Returns true when at least one field was applied, so a caller that
+    /// resolves state from these fields knows whether there is anything to
+    /// re-resolve.
+    bool apply_config_fields_(const Json& j) {
         const bool has_trial = json_has_(j, "trial_duration_days");
         const bool has_ft    = json_has_(j, "free_tier_enabled");
-        if (!has_trial && !has_ft) return;
+        if (!has_trial && !has_ft) return false;
 
-        const bool signed_envelope =
-            !j["kid"].as_string().empty() && !j["signature"].as_string().empty();
-
-        if (signed_envelope) {
-            // A signed envelope covers BOTH fields, so a partial one is
-            // malformed rather than something to verify against a guess.
-            if (!has_trial || !has_ft) return;
-            const int  trial = static_cast<int>(j["trial_duration_days"].as_int());
-            const bool ft    = j["free_tier_enabled"].as_bool();
-            if (!verify_config_(j, trial, ft).is_ok()) return;
-        } else if (cfg_.requireSignedConfig) {
-            return;
-        }
+        if (!verify_config_(j).is_ok()) return false;
 
         {
             std::lock_guard<std::mutex> lock(cache_mutex_);
@@ -4446,30 +4512,42 @@ private:
             }
         }
         (void)save_cache_();
+        return true;
     }
 
-    /// Authenticate a GET /config body. See config_payload.hpp for why this
-    /// exists and, just as importantly, what it does not buy.
+    /// Authenticate the server-owned product settings in a body — /config,
+    /// validate or keyless alike. See config_payload.hpp for why this exists
+    /// and, just as importantly, what it does not buy.
+    ///
+    /// With requireSignedConfig OFF this returns ok without reading the
+    /// signature fields at all (see apply_config_fields_). With it ON the body
+    /// must carry BOTH fields, a kid we trust, a signature over the canonical
+    /// payload, and be inside its validity window.
     ///
     /// Returns an error rather than silently ignoring a bad config: the caller
     /// asked for a refresh and deserves to know it was refused, and a forged
     /// config is worth surfacing. The failure is non-fatal either way, because
     /// fetchConfig() never touches the cache unless this returns ok.
-    Result<void> verify_config_(const Json&  j,
-                                int          trial_days,
-                                bool         free_tier) const
+    Result<void> verify_config_(const Json& j) const
     {
+        if (!cfg_.requireSignedConfig) return Result<void>::ok();
+
+        // A signed envelope covers BOTH fields, so a partial one is malformed
+        // rather than something to verify against a guess.
+        if (!json_has_(j, "trial_duration_days") ||
+            !json_has_(j, "free_tier_enabled")) {
+            return Result<void>::err({ErrorCode::BadResponse,
+                "config: signed response is missing a covered field"});
+        }
+        const int  trial_days = static_cast<int>(j["trial_duration_days"].as_int());
+        const bool free_tier  = j["free_tier_enabled"].as_bool();
+
         const std::string kid = j["kid"].as_string();
         const std::string sig = j["signature"].as_string();
 
         if (kid.empty() || sig.empty()) {
-            // No signature at all. A signature that is PRESENT is always
-            // checked below; this branch only decides the rollout question.
-            if (cfg_.requireSignedConfig) {
-                return Result<void>::err({ErrorCode::BadResponse,
-                    "config: unsigned response rejected (requireSignedConfig)"});
-            }
-            return Result<void>::ok();
+            return Result<void>::err({ErrorCode::BadResponse,
+                "config: unsigned response rejected (requireSignedConfig)"});
         }
 
         auto key_it = cfg_.trustedKeys.find(kid);
@@ -4487,9 +4565,12 @@ private:
         // see effectiveTrialDurationDays(); it was verified once and sits in
         // the machine-bound store, and expiring it would cut an offline user's
         // trial short to punish an attack they are not committing.
+        // The skew is added to OUR clock, never to the wire value: expires_at
+        // arrives saturated at INT64_MAX from an absurd body, and adding to it
+        // would overflow.
         const int64_t now  = now_fn_();
         const int64_t skew = 300;
-        if (expires_at != 0 && now > expires_at + skew) {
+        if (expires_at != 0 && now - skew > expires_at) {
             return Result<void>::err({ErrorCode::BadResponse,
                 "config: signed response has expired"});
         }
@@ -5170,7 +5251,15 @@ private:
     }
 
     /// Serialize the current cache and hand it to the store.
+    ///
+    /// save_mutex_ is held from snapshot to write, so two concurrent savers —
+    /// the auto-validation worker and the keyless heartbeat both end up here —
+    /// cannot interleave inside store_.save(), and an older snapshot cannot
+    /// land after a newer one. It is a separate mutex from cache_mutex_ so
+    /// that no reader is blocked behind disk I/O; the lock order is
+    /// save_mutex_ then cache_mutex_, and nothing takes cache_mutex_ first.
     Result<void> save_cache_() {
+        std::lock_guard<std::mutex> save_lock(save_mutex_);
         std::string blob;
         {
             std::lock_guard<std::mutex> lock(cache_mutex_);
@@ -5523,6 +5612,7 @@ private:
     void start_heartbeat_() {
         if (cfg_.keylessHeartbeatIntervalMs <= 0) return;   // disabled
         std::lock_guard<std::mutex> lock(kh_mutex_);
+        if (kh_shutdown_) return;                           // destructor has begun
         if (kh_thread_.joinable()) return;                  // already running
         kh_stop_ = false;
         try {
@@ -5541,13 +5631,15 @@ private:
         }
     }
 
-    /// Join the heartbeat. Moves the thread out from under the lock before
-    /// joining, because the worker re-acquires kh_mutex_ on its way out.
+    /// Join the heartbeat, and latch it off for good — see kh_shutdown_.
+    /// Moves the thread out from under the lock before joining, because the
+    /// worker re-acquires kh_mutex_ on its way out.
     void stop_heartbeat_() {
         std::thread victim;
         {
             std::lock_guard<std::mutex> lock(kh_mutex_);
-            kh_stop_ = true;
+            kh_stop_     = true;
+            kh_shutdown_ = true;
             kh_cv_.notify_all();
             victim = std::move(kh_thread_);
         }

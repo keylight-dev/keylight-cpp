@@ -27,3 +27,26 @@ TEST_CASE("malformed json returns error Result") {
     auto r = Json::parse(R"({"key": "unterminated)");
     CHECK_FALSE(r.is_ok());
 }
+
+TEST_CASE("an integer that overflows int64 is promoted, not UB") {
+    // `ival * 10 + digit` past INT64_MAX is signed-overflow UB. The parser
+    // promotes to double instead; as_int() then saturates rather than
+    // casting an out-of-range double (also UB).
+    auto r = Json::parse(R"({"big":99999999999999999999999,"neg":-99999999999999999999999,)"
+                         R"("max":9223372036854775807,"min":-9223372036854775808})");
+    REQUIRE(r.is_ok());
+    Json j = r.value();
+    CHECK(j["big"].as_int() == INT64_MAX);
+    CHECK(j["neg"].as_int() == INT64_MIN);
+    CHECK(j["max"].as_int() == INT64_MAX);      // still an exact int64
+    CHECK(j["min"].as_int() == INT64_MIN);      // -(2^63) overflows on the way in; saturates
+}
+
+TEST_CASE("as_int saturates an out-of-range double") {
+    auto r = Json::parse(R"({"huge":1e300,"tiny":-1e300,"ok":42.9})");
+    REQUIRE(r.is_ok());
+    Json j = r.value();
+    CHECK(j["huge"].as_int() == INT64_MAX);
+    CHECK(j["tiny"].as_int() == INT64_MIN);
+    CHECK(j["ok"].as_int()   == 42);
+}

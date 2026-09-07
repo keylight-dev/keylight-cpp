@@ -615,15 +615,14 @@ public:
         }
         const Json& j = jr.value();
 
-        const int   trial_days = static_cast<int>(j["trial_duration_days"].as_int());
-        const bool  free_tier  = j["free_tier_enabled"].as_bool();
-
         // Authenticate before caching. Nothing below writes to the cache until
         // this returns ok, so a rejected config leaves the last good value —
         // or the Config seed — in force rather than adopting what a fake
         // server claimed. Reported as an error too, because the caller asked
-        // for a refresh and a forged config is worth surfacing.
-        auto vr = verify_config_(j, trial_days, free_tier);
+        // for a refresh and a forged config is worth surfacing. A no-op when
+        // requireSignedConfig is off: the signature fields are then not
+        // consulted at all, matching the other Keylight SDKs.
+        auto vr = verify_config_(j);
         if (!vr.is_ok()) return vr;
 
         // One parser for all three carriers.
@@ -721,8 +720,9 @@ public:
         // The beacon reply is how an UNLICENSED install learns the server's
         // settings — validate covers the licensed ones. The body used to be
         // discarded entirely.
+        bool absorbed = false;
         if (auto jr = Json::parse(hr.value().body); jr.is_ok()) {
-            apply_config_fields_(jr.value());
+            absorbed = apply_config_fields_(jr.value());
         }
 
         {
@@ -731,6 +731,16 @@ public:
             cached_last_keyless_ping_at_ = now_fn_();
         }
         (void)save_cache_();
+
+        // A new trial length or free-tier flag can change what this device IS
+        // — a 14-day trial cut to 1 by the dashboard is over right now, not at
+        // the next tick. fetchConfig() re-resolves after absorbing; this path
+        // must too, or state() reports a stale Trial until something else
+        // happens to touch it. Only when something was actually absorbed: a
+        // reply without the fields must not change the resolved state.
+        if (absorbed) {
+            set_state_(resolve_current_state_());
+        }
     }
 
     Result<State> startTrial() {
@@ -1376,6 +1386,11 @@ private:
     // the source of truth for persistence; this is written alongside it.
     std::atomic<int64_t>     last_validated_online_atomic_{0};
 
+    // Serialises store_.save() — see save_cache_(). Never held while waiting
+    // on anything but cache_mutex_, and never taken from a thread that already
+    // holds cache_mutex_.
+    std::mutex                       save_mutex_;
+
     // Mutex-guarded cache of the decoded lease + extras
     mutable std::mutex               cache_mutex_;
     std::optional<Lease>             cached_lease_;
@@ -1468,6 +1483,14 @@ private:
     mutable std::mutex      kh_mutex_;
     std::condition_variable kh_cv_;
     bool                    kh_stop_ = false;
+    // Latched by stop_heartbeat_(), i.e. by ~Client(). Once set, nothing can
+    // spawn the heartbeat again: set_state_() runs on the auto-validation
+    // worker (which the destructor joins AFTER stopping the heartbeat) and,
+    // via reportKeylessState(), on the heartbeat thread itself — either one
+    // calling start_heartbeat_() after the thread was moved out for joining
+    // would spawn a fresh thread that nobody joins, and a joinable
+    // std::thread at destruction is std::terminate.
+    bool                    kh_shutdown_ = false;
     std::thread             kh_thread_;
 
     // The worker running the CURRENT epoch. A joinable thread here is the
@@ -1520,29 +1543,31 @@ private:
     /// or a route that does not include them, must not wipe a value we already
     /// learned.
     ///
-    /// AUTHENTICATION IS THE SAME WHEREVER THEY RIDE. A signed envelope is
-    /// verified; an unsigned one is accepted only when requireSignedConfig is
-    /// false. Applying these fields unsigned here while /config verified them
-    /// would defeat that check completely — a fake server would simply deliver
-    /// the long trial on a validate body instead of on /config.
-    void apply_config_fields_(const Json& j) {
+    /// AUTHENTICATION IS THE SAME WHEREVER THEY RIDE, and it is decided by
+    /// Config::requireSignedConfig alone — the same rule as the Swift, JS, C#
+    /// and Rust SDKs:
+    ///
+    ///   - flag OFF: the fields are applied as sent. The signature fields, if
+    ///     any, are not looked at. This is the default, because the worker
+    ///     only signs for products with a trial length set in the dashboard.
+    ///   - flag ON:  the fields are applied only from a complete envelope
+    ///     (both fields, kid, signature) that verifies against trustedKeys
+    ///     and is inside its validity window. Unsigned, partial or bad-
+    ///     signature bodies are dropped.
+    ///
+    /// Applying these fields unsigned here while /config verified them would
+    /// defeat the flag completely — a fake server would simply deliver the
+    /// long trial on a validate body instead of on /config.
+    ///
+    /// Returns true when at least one field was applied, so a caller that
+    /// resolves state from these fields knows whether there is anything to
+    /// re-resolve.
+    bool apply_config_fields_(const Json& j) {
         const bool has_trial = json_has_(j, "trial_duration_days");
         const bool has_ft    = json_has_(j, "free_tier_enabled");
-        if (!has_trial && !has_ft) return;
+        if (!has_trial && !has_ft) return false;
 
-        const bool signed_envelope =
-            !j["kid"].as_string().empty() && !j["signature"].as_string().empty();
-
-        if (signed_envelope) {
-            // A signed envelope covers BOTH fields, so a partial one is
-            // malformed rather than something to verify against a guess.
-            if (!has_trial || !has_ft) return;
-            const int  trial = static_cast<int>(j["trial_duration_days"].as_int());
-            const bool ft    = j["free_tier_enabled"].as_bool();
-            if (!verify_config_(j, trial, ft).is_ok()) return;
-        } else if (cfg_.requireSignedConfig) {
-            return;
-        }
+        if (!verify_config_(j).is_ok()) return false;
 
         {
             std::lock_guard<std::mutex> lock(cache_mutex_);
@@ -1555,30 +1580,42 @@ private:
             }
         }
         (void)save_cache_();
+        return true;
     }
 
-    /// Authenticate a GET /config body. See config_payload.hpp for why this
-    /// exists and, just as importantly, what it does not buy.
+    /// Authenticate the server-owned product settings in a body — /config,
+    /// validate or keyless alike. See config_payload.hpp for why this exists
+    /// and, just as importantly, what it does not buy.
+    ///
+    /// With requireSignedConfig OFF this returns ok without reading the
+    /// signature fields at all (see apply_config_fields_). With it ON the body
+    /// must carry BOTH fields, a kid we trust, a signature over the canonical
+    /// payload, and be inside its validity window.
     ///
     /// Returns an error rather than silently ignoring a bad config: the caller
     /// asked for a refresh and deserves to know it was refused, and a forged
     /// config is worth surfacing. The failure is non-fatal either way, because
     /// fetchConfig() never touches the cache unless this returns ok.
-    Result<void> verify_config_(const Json&  j,
-                                int          trial_days,
-                                bool         free_tier) const
+    Result<void> verify_config_(const Json& j) const
     {
+        if (!cfg_.requireSignedConfig) return Result<void>::ok();
+
+        // A signed envelope covers BOTH fields, so a partial one is malformed
+        // rather than something to verify against a guess.
+        if (!json_has_(j, "trial_duration_days") ||
+            !json_has_(j, "free_tier_enabled")) {
+            return Result<void>::err({ErrorCode::BadResponse,
+                "config: signed response is missing a covered field"});
+        }
+        const int  trial_days = static_cast<int>(j["trial_duration_days"].as_int());
+        const bool free_tier  = j["free_tier_enabled"].as_bool();
+
         const std::string kid = j["kid"].as_string();
         const std::string sig = j["signature"].as_string();
 
         if (kid.empty() || sig.empty()) {
-            // No signature at all. A signature that is PRESENT is always
-            // checked below; this branch only decides the rollout question.
-            if (cfg_.requireSignedConfig) {
-                return Result<void>::err({ErrorCode::BadResponse,
-                    "config: unsigned response rejected (requireSignedConfig)"});
-            }
-            return Result<void>::ok();
+            return Result<void>::err({ErrorCode::BadResponse,
+                "config: unsigned response rejected (requireSignedConfig)"});
         }
 
         auto key_it = cfg_.trustedKeys.find(kid);
@@ -1596,9 +1633,12 @@ private:
         // see effectiveTrialDurationDays(); it was verified once and sits in
         // the machine-bound store, and expiring it would cut an offline user's
         // trial short to punish an attack they are not committing.
+        // The skew is added to OUR clock, never to the wire value: expires_at
+        // arrives saturated at INT64_MAX from an absurd body, and adding to it
+        // would overflow.
         const int64_t now  = now_fn_();
         const int64_t skew = 300;
-        if (expires_at != 0 && now > expires_at + skew) {
+        if (expires_at != 0 && now - skew > expires_at) {
             return Result<void>::err({ErrorCode::BadResponse,
                 "config: signed response has expired"});
         }
@@ -2279,7 +2319,15 @@ private:
     }
 
     /// Serialize the current cache and hand it to the store.
+    ///
+    /// save_mutex_ is held from snapshot to write, so two concurrent savers —
+    /// the auto-validation worker and the keyless heartbeat both end up here —
+    /// cannot interleave inside store_.save(), and an older snapshot cannot
+    /// land after a newer one. It is a separate mutex from cache_mutex_ so
+    /// that no reader is blocked behind disk I/O; the lock order is
+    /// save_mutex_ then cache_mutex_, and nothing takes cache_mutex_ first.
     Result<void> save_cache_() {
+        std::lock_guard<std::mutex> save_lock(save_mutex_);
         std::string blob;
         {
             std::lock_guard<std::mutex> lock(cache_mutex_);
@@ -2632,6 +2680,7 @@ private:
     void start_heartbeat_() {
         if (cfg_.keylessHeartbeatIntervalMs <= 0) return;   // disabled
         std::lock_guard<std::mutex> lock(kh_mutex_);
+        if (kh_shutdown_) return;                           // destructor has begun
         if (kh_thread_.joinable()) return;                  // already running
         kh_stop_ = false;
         try {
@@ -2650,13 +2699,15 @@ private:
         }
     }
 
-    /// Join the heartbeat. Moves the thread out from under the lock before
-    /// joining, because the worker re-acquires kh_mutex_ on its way out.
+    /// Join the heartbeat, and latch it off for good — see kh_shutdown_.
+    /// Moves the thread out from under the lock before joining, because the
+    /// worker re-acquires kh_mutex_ on its way out.
     void stop_heartbeat_() {
         std::thread victim;
         {
             std::lock_guard<std::mutex> lock(kh_mutex_);
-            kh_stop_ = true;
+            kh_stop_     = true;
+            kh_shutdown_ = true;
             kh_cv_.notify_all();
             victim = std::move(kh_thread_);
         }

@@ -157,14 +157,32 @@ struct Parser {
 
         if (eof() || *p < '0' || *p > '9') return false;
 
-        int64_t ival = 0;
+        // Accumulate as int64 while it fits. The moment the next digit would
+        // overflow, promote to double and keep going: `ival * 10 + digit`
+        // past INT64_MAX is signed-overflow UB, and a body such as
+        // {"expires_at": 99999999999999999999999} is exactly what a hostile
+        // or merely broken server can send. Lenient parsers (nlohmann, V8)
+        // do the same promotion; the value still round-trips through as_int()
+        // as a saturated int64 rather than as garbage.
+        int64_t ival     = 0;
+        double  big      = 0.0;
+        bool    overflow = false;
         while (!eof() && *p >= '0' && *p <= '9') {
-            ival = ival * 10 + (*p - '0');
+            const int digit = *p - '0';
+            if (!overflow) {
+                if (ival > (INT64_MAX - digit) / 10) {
+                    overflow = true;
+                    big      = static_cast<double>(ival);
+                } else {
+                    ival = ival * 10 + digit;
+                }
+            }
+            if (overflow) big = big * 10.0 + digit;
             ++p;
         }
 
-        bool is_float = false;
-        double dval = static_cast<double>(ival);
+        bool   is_float = overflow;
+        double dval     = overflow ? big : static_cast<double>(ival);
 
         // Fractional part
         if (!eof() && *p == '.') {
@@ -375,8 +393,18 @@ public:
     }
 
     int64_t as_int() const {
-        if (val_->type == json_detail::JType::Int)    return val_->i;
-        if (val_->type == json_detail::JType::Double) return static_cast<int64_t>(val_->d);
+        if (val_->type == json_detail::JType::Int) return val_->i;
+        if (val_->type == json_detail::JType::Double) {
+            // static_cast<int64_t> of a double outside int64's range is UB,
+            // not a saturation. Clamp explicitly; NaN maps to 0 like any
+            // other non-number.
+            const double d = val_->d;
+            if (d != d) return 0;
+            // 2^63 is exactly representable; INT64_MAX itself is not.
+            if (d >= 9223372036854775808.0)  return INT64_MAX;
+            if (d <  -9223372036854775808.0) return INT64_MIN;
+            return static_cast<int64_t>(d);
+        }
         return 0;
     }
 

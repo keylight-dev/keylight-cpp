@@ -62,7 +62,7 @@ include(FetchContent)
 FetchContent_Declare(
   keylight
   GIT_REPOSITORY https://github.com/keylight-dev/keylight-cpp.git
-  GIT_TAG        v0.2.1
+  GIT_TAG        v0.2.2
 )
 FetchContent_MakeAvailable(keylight)
 
@@ -111,7 +111,7 @@ vcpkg install "keylight[httplib-transport]"
 ### Conan
 
 ```bash
-conan install keylight/0.2.1@
+conan install keylight/0.2.2@
 ```
 
 > Conan Center submission is planned for a future release.
@@ -257,6 +257,9 @@ Compiles against JUCE 7 and JUCE 8 with zero extra dependencies beyond `juce_cor
 | `startTrial() → Result<State>` | Explicitly begins the local trial (idempotent; never restarts one). No network call. |
 | `checkTrial() → TrialStatus` | `NotStarted` / `Active` / `Expired` for the local trial. |
 | `trialDaysLeft() → int` | Whole days left in the local trial (0 when disabled, not started, or elapsed). |
+| `fetchConfig() → Result<void>` | Explicitly refreshes the server-owned product settings (trial length, free tier) from `GET /config` and re-resolves state. Never called automatically — the same fields already ride on validate and keyless responses. |
+| `effectiveTrialDurationDays() → int` | Trial length actually in force: cached server value, else the `Config` seed, else 0. |
+| `effectiveFreeTierEnabled() → bool` | Free tier as the server sees it, falling back to the `Config` seed. |
 
 ## License States
 
@@ -444,6 +447,32 @@ against the tenant's trusted keyset, applying a **300-second clock-skew** tolera
   verification without the tenant's private key. At-rest encryption (below) is a second layer,
   not the boundary.
 
+### Signed server config
+
+The server-owned product settings (`trial_duration_days`, `free_tier_enabled`) arrive on
+`GET /config`, on validate responses and on keyless-beacon replies. Without a signature a
+hosts-file redirect can mint an unlimited *trial* even though it cannot mint a licence, so the
+worker Ed25519-signs them over the canonical payload
+`cfg1|{kid}|{tenant}|{product}|{issued_at}|{expires_at}|{days}|{free_tier}` — the same bytes
+every Keylight SDK verifies.
+
+```cpp
+cfg.trustedKeys["k1"]   = "base64-public-key";   // compiled in
+cfg.requireSignedConfig = true;                   // OFF by default
+```
+
+- **Off by default, and it is the only switch.** With it off the settings are applied as sent
+  and the signature fields are not consulted at all — the same rule as the Swift, JS, C# and
+  Rust SDKs. With it on, a body must carry both fields, a `kid` in `trustedKeys` and a
+  signature that verifies inside its `issued_at`/`expires_at` window (300 s skew); anything
+  else is dropped, and `fetchConfig()` returns an error.
+- **Only enable it when you know your product is signed.** The worker signs for products
+  that have a trial length configured in the dashboard. Enable it for a product that is not
+  signed and every install silently stops learning its settings.
+- **Keys are compiled in, so rotation freezes old builds.** A build that only trusts a rotated-
+  out `kid` keeps the settings it last verified (the cache deliberately outlives its window)
+  and learns nothing new until it ships with the new key.
+
 ### Local storage
 
 Since 0.2.0 the default store is **`EncryptedFileStore`**: ChaCha20-Poly1305
@@ -559,13 +588,15 @@ Populate a `keylight::Config` struct:
 | `productId` | `std::string` | — | Your product (required). |
 | `sdkKey` | `std::string` | — | Tenant SDK key, sent as `X-Keylight-SDK-Key` on every API call. Required — the API answers `401` without it. |
 | `trustedKeys` | `map<string,string>` | empty | Trusted Ed25519 public keys (`kid → base64`) for offline verification. |
-| `maxOfflineDays` | `int` | `7` | Offline grace window since last online validation. Set `0` to run offline as long as the lease itself is current. |
+| `maxOfflineDays` | `int` | `15` | Offline grace window since last online validation. Set `0` to run offline as long as the lease itself is current. |
 | `keyPrefix` | `std::string` | — | Client-side key-format check (e.g. `"PROD"`). |
 | `trialDurationDays` | `int` | `0` | Local trial length in days (0 = trials disabled). See [Trials](#trials). |
 | `freeTierEnabled` | `bool` | `false` | Resolve `State::FreeTier` instead of `Invalid`/`Expired` when there is no license and no active trial. See [Free Tier](#free-tier). |
 | `apiBaseUrl` | `std::string` | `https://api.keylight.dev` | Keylight API base URL. |
 | `appVersion` | `std::string` | — | Reported in activation/validation telemetry. |
 | `autoValidationIntervalMs` | `int` | `1800000` | Background auto-validation interval (ms); used only when `startAutoValidation()` is called. A non-positive value is clamped to 1 ms rather than busy-spinning. |
+| `requireSignedConfig` | `bool` | `false` | Require the server-owned settings (trial length, free tier) to arrive signed by a key in `trustedKeys`, on every route that carries them. Off: the signature fields are ignored. Only enable when your product is signed. See [Signed server config](#signed-server-config). |
+| `keylessHeartbeatIntervalMs` | `int` | `21600000` | Keyless-beacon heartbeat interval (ms), 6 h. `0` disables it. Traffic is debounced to one report per 24 h per state regardless. See [Keyless heartbeat](#keyless-heartbeat). |
 
 ## Cross-SDK Conformance Vectors
 

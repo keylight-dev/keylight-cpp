@@ -170,13 +170,19 @@ static const kl_gf kBY = {
     0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666};
 
 // Carry propagation: normalize limbs to approximately [0, 2^16).
+//
+// Upstream TweetNaCl writes the last line as `o[i] -= c << 16`. The carry
+// can be negative, and left-shifting a negative signed value is undefined
+// behaviour in C++17 (well-defined only from C++20). The multiply is the
+// same arithmetic on every value the shift was defined for, and defined on
+// the rest; UBSan-clean without changing a single output bit.
 static void gf_car(kl_gf o) {
     kl_i64 c;
     for (int i = 0; i < 16; ++i) {
         o[i] += (kl_i64)1 << 16;
         c = o[i] >> 16;
         o[(i+1) * (i<15)] += c - 1 + 37*(c-1)*(i==15);
-        o[i] -= c << 16;
+        o[i] -= c * 65536;
     }
 }
 

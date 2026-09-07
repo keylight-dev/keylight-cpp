@@ -620,6 +620,38 @@ TEST_CASE("Beacon: reporting never changes the resolved state") {
     CHECK(client.state() == State::FreeTier);
 }
 
+TEST_CASE("Beacon: settings absorbed from the reply re-resolve the state") {
+    // The reply is how an UNLICENSED install learns its trial length. The
+    // fields used to be cached but state() kept reporting the stale Trial
+    // until the next tick — fetchConfig() re-resolves after absorbing, and
+    // the beacon path must do the same.
+    auto cfg = make_config(14);
+    cfg.freeTierEnabled = true;
+    RecordingTransport transport;
+    MemStore           store;
+    int64_t now = T0;
+    auto none = []() -> std::optional<std::string> { return std::nullopt; };
+
+    Client client(cfg, transport, store, [&]{ return now; }, none, NO_SLEEP);
+    REQUIRE(client.startTrial().value() == State::Trial);
+
+    now = T0 + 5 * DAY;                       // day 5 of a 14-day trial
+    REQUIRE(client.state() == State::Trial);
+
+    // The dashboard has since cut the trial to one day.
+    transport.next_body = R"({"trial_duration_days":1,"free_tier_enabled":true})";
+    client.reportKeylessState(KeylessState::Trial);
+
+    CHECK(client.effectiveTrialDurationDays() == 1);
+    CHECK(client.state() == State::FreeTier);   // not a stale Trial
+
+    // A reply without the fields leaves the state alone (see above).
+    now += 60;
+    transport.next_body = "{}";
+    client.reportKeylessState(KeylessState::FreeTier);
+    CHECK(client.state() == State::FreeTier);
+}
+
 // ===========================================================================
 // Conversion attribution on activate / validate
 // ===========================================================================

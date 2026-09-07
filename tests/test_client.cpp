@@ -2479,6 +2479,10 @@ static Config config_signing_cfg() {
     cfg.productId = "testapp";
     cfg.trialDurationDays   = 7;       // the seed a rejected config falls back to
     cfg.trustedKeys["kcfg"] = CFG_PUBKEY;
+    // The flag is what turns verification on. With it off the signature
+    // fields are not read at all (parity with the other SDKs) — see the
+    // "flag off" cases below, which flip it back.
+    cfg.requireSignedConfig = true;
     return cfg;
 }
 
@@ -2572,7 +2576,8 @@ TEST_CASE("Config signature: unsigned is tolerated by default, rejected when req
         R"({"trial_duration_days":14,"free_tier_enabled":true})";
 
     SUBCASE("default accepts unsigned during the signing rollout") {
-        REQUIRE(cfg.requireSignedConfig == false);
+        REQUIRE(Config{}.requireSignedConfig == false);   // the shipped default
+        cfg.requireSignedConfig = false;
         FakeTransport transport;
         MemoryStore   store;
         transport.next_status = 200;
@@ -2619,6 +2624,263 @@ TEST_CASE("config_canonical_payload matches the documented format") {
     CHECK(config_canonical_payload("kcfg", "testco", "testapp",
                                    1781076246LL, 1781680000LL, 0, false)
           == "cfg1|kcfg|testco|testapp|1781076246|1781680000|0|false");
+}
+
+TEST_CASE("Config signature: with the flag OFF the signature fields are not consulted") {
+    // Parity with the Swift, JS, C# and Rust SDKs: requireSignedConfig is the
+    // only switch. Off means the fields are applied as sent — a signature
+    // that happens to be present is neither verified nor able to reject.
+    // (This SDK used to verify any signature it saw regardless of the flag,
+    // which made it the one SDK that could refuse a config the others took.)
+    auto cfg = config_signing_cfg();
+    cfg.requireSignedConfig = false;
+
+    SUBCASE("a body whose signature does not cover it is still applied") {
+        FakeTransport transport;
+        MemoryStore   store;
+        transport.next_status = 200;
+        transport.next_body   = signed_config_body(CFG_SIG_VALID, 3650);
+
+        Client client(cfg, transport, store, []{ return CFG_NOW; }, NO_SLEEP);
+        REQUIRE(client.fetchConfig().is_ok());
+        CHECK(client.effectiveTrialDurationDays() == 3650);
+    }
+
+    SUBCASE("an unknown kid is not an error") {
+        cfg.trustedKeys.erase("kcfg");
+        FakeTransport transport;
+        MemoryStore   store;
+        transport.next_status = 200;
+        transport.next_body   = signed_config_body(CFG_SIG_VALID);
+
+        Client client(cfg, transport, store, []{ return CFG_NOW; }, NO_SLEEP);
+        REQUIRE(client.fetchConfig().is_ok());
+        CHECK(client.effectiveTrialDurationDays() == 14);
+    }
+
+    SUBCASE("an expired window is not an error") {
+        FakeTransport transport;
+        MemoryStore   store;
+        transport.next_status = 200;
+        transport.next_body   =
+            signed_config_body(CFG_SIG_EXPIRED, 30, 1700000000LL, 1700600000LL);
+
+        Client client(cfg, transport, store, []{ return CFG_NOW; }, NO_SLEEP);
+        REQUIRE(client.fetchConfig().is_ok());
+        CHECK(client.effectiveTrialDurationDays() == 30);
+    }
+
+    SUBCASE("a validate body is applied the same way") {
+        // The three carriers share one rule; the flag being off on /config
+        // and on for validate would be a fourth SDK behaviour, not parity.
+        auto lcfg = make_config();
+        lcfg.trialDurationDays   = 7;
+        lcfg.requireSignedConfig = false;
+        FakeTransport transport;
+        MemoryStore   store;
+        transport.next_status = 200;
+        transport.next_body   = ACTIVATE_RESPONSE;
+        Client client(lcfg, transport, store, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+        REQUIRE(client.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+
+        // Config fields plus a top-level envelope that could never verify.
+        std::string body = VALIDATE_RESPONSE_WITH_CONFIG;
+        const std::string anchor = "\"valid\": true,";
+        const auto at = body.find(anchor);
+        REQUIRE(at != std::string::npos);
+        body.insert(at + anchor.size(), " \"kid\": \"k1\", \"signature\": \"AAAA\",");
+        transport.next_body = body;
+        REQUIRE(client.validate().is_ok());
+        CHECK(client.effectiveTrialDurationDays() == 14);
+    }
+}
+
+TEST_CASE("Config signature: with the flag ON a partial envelope is rejected") {
+    auto cfg = config_signing_cfg();
+    REQUIRE(cfg.requireSignedConfig);
+
+    SUBCASE("signature present, kid missing") {
+        FakeTransport transport;
+        MemoryStore   store;
+        transport.next_status = 200;
+        transport.next_body   =
+            std::string(R"({"trial_duration_days":14,"free_tier_enabled":true,)") +
+            R"("issued_at":1781076246,"expires_at":1781680000,"signature":")" +
+            CFG_SIG_VALID + R"("})";
+
+        Client client(cfg, transport, store, []{ return CFG_NOW; }, NO_SLEEP);
+        CHECK(!client.fetchConfig().is_ok());
+        CHECK(client.effectiveTrialDurationDays() == 7);
+    }
+
+    SUBCASE("kid present, signature missing") {
+        FakeTransport transport;
+        MemoryStore   store;
+        transport.next_status = 200;
+        transport.next_body   =
+            R"({"trial_duration_days":14,"free_tier_enabled":true,)"
+            R"("issued_at":1781076246,"expires_at":1781680000,"kid":"kcfg"})";
+
+        Client client(cfg, transport, store, []{ return CFG_NOW; }, NO_SLEEP);
+        CHECK(!client.fetchConfig().is_ok());
+        CHECK(client.effectiveTrialDurationDays() == 7);
+    }
+
+    SUBCASE("a covered field is missing from the body") {
+        // The signature covers BOTH fields; a body carrying only one cannot
+        // be verified against a guess for the other.
+        FakeTransport transport;
+        MemoryStore   store;
+        transport.next_status = 200;
+        transport.next_body   =
+            std::string(R"({"trial_duration_days":14,)") +
+            R"("issued_at":1781076246,"expires_at":1781680000,)" +
+            R"("kid":"kcfg","signature":")" + CFG_SIG_VALID + R"("})";
+
+        Client client(cfg, transport, store, []{ return CFG_NOW; }, NO_SLEEP);
+        CHECK(!client.fetchConfig().is_ok());
+        CHECK(client.effectiveTrialDurationDays() == 7);
+    }
+}
+
+TEST_CASE("Config signature: an absurd integer in the body is rejected, not UB") {
+    // {"expires_at": 99999999999999999999999} overflows int64 by ten decimal
+    // digits. It used to be accumulated with `ival * 10 + digit`, which is
+    // signed-overflow UB; the parser now promotes to double and as_int()
+    // saturates, and the signature (which covers expires_at) no longer
+    // verifies. The UBSan build is what proves the "not UB" half.
+    auto cfg = config_signing_cfg();
+    FakeTransport transport;
+    MemoryStore   store;
+    transport.next_status = 200;
+    transport.next_body   =
+        std::string(R"({"trial_duration_days":14,"free_tier_enabled":true,)") +
+        R"("issued_at":1781076246,"expires_at":99999999999999999999999,)" +
+        R"("kid":"kcfg","signature":")" + CFG_SIG_VALID + R"("})";
+
+    Client client(cfg, transport, store, []{ return CFG_NOW; }, NO_SLEEP);
+    CHECK(!client.fetchConfig().is_ok());
+    CHECK(client.effectiveTrialDurationDays() == 7);
+
+    // The same absurdity on a validate body — the flag-on path drops the
+    // fields and the validate itself is unaffected.
+    transport.next_body = ACTIVATE_RESPONSE;
+    auto cfg2 = make_config();
+    cfg2.trialDurationDays   = 7;
+    cfg2.requireSignedConfig = true;
+    MemoryStore store2;
+    Client licensed(cfg2, transport, store2, []{ return VALID_ACTIVE_NOW; }, NO_SLEEP);
+    REQUIRE(licensed.activate("XXXX-YYYY-ZZZZ-0001").is_ok());
+    transport.next_body =
+        R"({"valid":true,"trial_duration_days":99999999999999999999999,)"
+        R"("free_tier_enabled":true,"license_expires_at":1781681046})";
+    REQUIRE(licensed.validate().is_ok());
+    CHECK(licensed.effectiveTrialDurationDays() == 7);
+}
+
+// ---------------------------------------------------------------------------
+// Golden vector: the LIVE production signature.
+//
+// Captured 2026-09-06 from worker 717cfb7c; the same vector Swift, C#, JS and
+// Rust pin. The fixtures above prove the SDK agrees with itself; this one
+// proves it agrees with the server and the other four SDKs about real bytes.
+// If it fails after a change to config_canonical_payload(), the change is a
+// protocol break, not a refactor.
+// ---------------------------------------------------------------------------
+
+static const char* LIVE_CFG_PUBKEY =
+    "wPOiRNiP2hbc0O4UCAuO6FRRLKp4YvGtf8V27xnPzNY=";
+// cfg1|k1|anotheragence|getbarry|1788695996|1788782396|1|true
+static const char* LIVE_CFG_SIG =
+    "WbyLOjmB7jtA3Ny9Qon/uJtXpZx61/Vx+U7OsQpSD17xkem5QrYwvSQOmRLw7J6Ozhgr8r2bptQ/UhiDRUZ7DA==";
+static const int64_t LIVE_CFG_ISSUED  = 1788695996LL;
+static const int64_t LIVE_CFG_EXPIRES = 1788782396LL;
+static const int64_t LIVE_CFG_NOW     = 1788700000LL;   // inside the window
+
+static Config live_config_signing_cfg() {
+    auto cfg = make_config();
+    cfg.tenantId            = "anotheragence";
+    cfg.productId           = "getbarry";
+    cfg.trialDurationDays   = 7;          // seed; must NOT be what wins
+    cfg.freeTierEnabled     = false;      // seed; must NOT be what wins
+    cfg.trustedKeys.clear();
+    cfg.trustedKeys["k1"]   = LIVE_CFG_PUBKEY;
+    cfg.requireSignedConfig = true;
+    return cfg;
+}
+
+static std::string live_config_body(int trial_days) {
+    return std::string(R"({"trial_duration_days":)") + std::to_string(trial_days) +
+           R"(,"free_tier_enabled":true,"issued_at":)" + std::to_string(LIVE_CFG_ISSUED) +
+           R"(,"expires_at":)" + std::to_string(LIVE_CFG_EXPIRES) +
+           R"(,"kid":"k1","signature":")" + LIVE_CFG_SIG + R"("})";
+}
+
+TEST_CASE("Golden vector: the live production config signature verifies") {
+    CHECK(config_canonical_payload("k1", "anotheragence", "getbarry",
+                                   LIVE_CFG_ISSUED, LIVE_CFG_EXPIRES, 1, true)
+          == "cfg1|k1|anotheragence|getbarry|1788695996|1788782396|1|true");
+
+    auto cfg = live_config_signing_cfg();
+    FakeTransport transport;
+    MemoryStore   store;
+    transport.next_status = 200;
+    transport.next_body   = live_config_body(1);
+
+    Client client(cfg, transport, store, []{ return LIVE_CFG_NOW; }, NO_SLEEP);
+    REQUIRE(client.fetchConfig().is_ok());
+    CHECK(client.effectiveTrialDurationDays() == 1);
+    CHECK(client.effectiveFreeTierEnabled()   == true);
+}
+
+TEST_CASE("Golden vector: a tampered trial length fails against the live signature") {
+    auto cfg = live_config_signing_cfg();
+    FakeTransport transport;
+    MemoryStore   store;
+    transport.next_status = 200;
+    transport.next_body   = live_config_body(2);
+
+    Client client(cfg, transport, store, []{ return LIVE_CFG_NOW; }, NO_SLEEP);
+    CHECK(!client.fetchConfig().is_ok());
+    CHECK(client.effectiveTrialDurationDays() == 7);
+    CHECK(client.effectiveFreeTierEnabled()   == false);
+}
+
+TEST_CASE("Golden vector: the live signature is rejected outside its window") {
+    auto cfg = live_config_signing_cfg();
+
+    SUBCASE("after expires_at + skew") {
+        FakeTransport transport;
+        MemoryStore   store;
+        transport.next_status = 200;
+        transport.next_body   = live_config_body(1);
+        Client client(cfg, transport, store,
+                      []{ return LIVE_CFG_EXPIRES + 301; }, NO_SLEEP);
+        CHECK(!client.fetchConfig().is_ok());
+        CHECK(client.effectiveTrialDurationDays() == 7);
+    }
+
+    SUBCASE("still inside the skew after expires_at") {
+        FakeTransport transport;
+        MemoryStore   store;
+        transport.next_status = 200;
+        transport.next_body   = live_config_body(1);
+        Client client(cfg, transport, store,
+                      []{ return LIVE_CFG_EXPIRES + 299; }, NO_SLEEP);
+        REQUIRE(client.fetchConfig().is_ok());
+        CHECK(client.effectiveTrialDurationDays() == 1);
+    }
+
+    SUBCASE("before issued_at - skew") {
+        FakeTransport transport;
+        MemoryStore   store;
+        transport.next_status = 200;
+        transport.next_body   = live_config_body(1);
+        Client client(cfg, transport, store,
+                      []{ return LIVE_CFG_ISSUED - 301; }, NO_SLEEP);
+        CHECK(!client.fetchConfig().is_ok());
+        CHECK(client.effectiveTrialDurationDays() == 7);
+    }
 }
 
 

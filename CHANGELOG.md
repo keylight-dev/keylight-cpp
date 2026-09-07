@@ -1,3 +1,72 @@
+## [0.2.2] - 2026-09-07
+
+### Fixed
+
+- **Undefined behaviour on an absurd integer in a server body.** The JSON
+  parser accumulated digits with `ival * 10 + digit` and no bound, so a body
+  such as `{"expires_at": 99999999999999999999999}` was signed-integer
+  overflow — UB, reproduced under UBSan. Digits past `INT64_MAX` now promote
+  the number to a double, and `as_int()` saturates instead of casting an
+  out-of-range double (also UB). The config-signature window check adds the
+  skew to our clock rather than to the wire value for the same reason. A
+  signed config carrying such a value is rejected, cleanly.
+- **Undefined behaviour in the vendored Ed25519 carry.** TweetNaCl's `gf_car`
+  left-shifts a possibly-negative carry (`c << 16`), which is UB in C++17.
+  Replaced with the equivalent multiply; not a single output bit changes,
+  and the existing lease and config verification vectors prove it. The
+  sanitizer build (`-fsanitize=undefined,address`) now passes the suite.
+- **The keyless beacon left `state()` stale.** Settings absorbed from the
+  beacon reply were cached but the state was not re-resolved, unlike
+  `fetchConfig()`, so a trial cut short by the dashboard kept reporting
+  `Trial` until the next tick. The beacon path now re-resolves after a
+  successful absorb.
+- **Concurrent cache saves could interleave.** `store_.save()` was called
+  outside every lock, and the auto-validation worker and the keyless
+  heartbeat can both reach it. A dedicated save mutex now serialises the
+  snapshot-and-write, held for the I/O so an older snapshot can never land
+  after a newer one; `cache_mutex_` is still never held across the disk.
+- **The heartbeat could be respawned during destruction.** `~Client()` stops
+  the keyless heartbeat before it joins the auto-validation worker, and every
+  state resolution (re)starts the heartbeat — so a worker finishing a
+  round trip inside the destructor could spawn a fresh heartbeat thread that
+  nothing joined, which is `std::terminate` on the way out. Seen as an
+  intermittent abort of the threaded tests under the sanitizer build. The
+  stop is now a latch: once the destructor has begun, `start_heartbeat_()`
+  is a no-op from any thread.
+
+### Changed
+
+- **With `requireSignedConfig` off, the config signature is no longer looked
+  at.** This SDK used to verify any signature that happened to be present and
+  reject the body when it did not verify, even with the flag off. Every other
+  Keylight SDK (Swift, JS, C#, Rust) ignores the signature fields entirely
+  until the flag is on — so a config the others accepted, this one could
+  refuse, and a key rotation could freeze settings on a C++ build that had
+  never opted in. C++ now matches: flag off, the fields are applied as sent;
+  flag on, a body must carry both fields, a trusted `kid` and a signature
+  that verifies inside its window, and anything less is dropped.
+
+  If you rely on the flag being off, the only visible change is that a
+  present-but-bad signature no longer rejects a body. If you want rejection,
+  set `requireSignedConfig = true` — and only once you know your product is
+  signed. The worker signs on all three routes since 2026-09-06, but only for
+  products with a trial length configured in the dashboard. `Config`'s
+  comments and the README say so now; the old "the worker does not sign
+  /config yet" note was stale.
+
+### Added
+
+- **Golden vector for the live config signature.** The suite pins the
+  production signature captured 2026-09-06 from worker `717cfb7c` — the same
+  vector Swift, C#, JS and Rust pin — and proves it verifies, that a tampered
+  trial length fails, and that it is refused outside its window. Any change
+  to `config_canonical_payload()` that breaks it is a protocol break.
+- README: `fetchConfig()`, `effectiveTrialDurationDays()` and
+  `effectiveFreeTierEnabled()` in the method table; a "Signed server config"
+  section covering `requireSignedConfig` and `trustedKeys`; rows for
+  `requireSignedConfig` and `keylessHeartbeatIntervalMs` in the Configuration
+  Reference, and `maxOfflineDays`'s default corrected to `15` (it said `7`).
+
 ## [0.2.1] - 2026-09-05
 
 ### Fixed
